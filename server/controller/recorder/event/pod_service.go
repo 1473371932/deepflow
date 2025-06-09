@@ -17,36 +17,37 @@
 package event
 
 import (
-	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
-	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/recorder/event/config"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 	"github.com/deepflowio/deepflow/server/libs/eventapi"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 )
 
 type PodService struct {
-	EventManagerBase
+	ManagerComponent
+	CUDSubscriberComponent
+	cfg        config.Config
 	deviceType int
 }
 
-func NewPodService(toolDS *tool.DataSet, eq *queue.OverwriteQueue) *PodService {
+func NewPodService(cfg config.Config, q *queue.OverwriteQueue) *PodService {
 	mng := &PodService{
-		EventManagerBase{
-			resourceType: ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN,
-			ToolDataSet:  toolDS,
-			Queue:        eq,
-		},
+		newManagerComponent(ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN, q),
+		newCUDSubscriberComponent(ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN, SubTopic(pubsub.TopicResourceUpdatedFields)),
+		cfg,
 		ctrlrcommon.VIF_DEVICE_TYPE_POD_SERVICE,
 	}
+	mng.SetSubscriberSelf(mng)
 	return mng
 }
 
-func (p *PodService) ProduceByAdd(items []*mysql.PodService) {
-	for _, item := range items {
+func (p *PodService) OnResourceBatchAdded(md *message.Metadata, msg interface{}) {
+	for _, item := range msg.([]*metadbmodel.PodService) {
 		var opts []eventapi.TagFieldOption
-		info, err := p.ToolDataSet.GetPodServiceInfoByID(item.ID)
+		info, err := md.GetToolDataSet().GetPodServiceInfoByID(item.ID)
 		if err != nil {
 			log.Error(err)
 		} else {
@@ -64,7 +65,7 @@ func (p *PodService) ProduceByAdd(items []*mysql.PodService) {
 			eventapi.TagPodNSID(item.PodNamespaceID),
 		}...)
 
-		p.createAndEnqueue(
+		p.createInstanceAndEnqueue(md,
 			item.Lcuuid,
 			eventapi.RESOURCE_EVENT_TYPE_CREATE,
 			item.Name,
@@ -75,24 +76,33 @@ func (p *PodService) ProduceByAdd(items []*mysql.PodService) {
 	}
 }
 
-func (p *PodService) ProduceByUpdate(cloudItem *cloudmodel.PodService, diffBase *diffbase.PodService) {
+func (c *PodService) OnResourceUpdated(md *message.Metadata, msg interface{}) {
+	fields := msg.(*message.PodServiceFieldsUpdate)
+	if !fields.Metadata.IsDifferent() && !fields.Spec.IsDifferent() {
+		return
+	}
+	eventType := eventapi.RESOURCE_EVENT_TYPE_UPDATE_CONFIG
+	var opts []eventapi.TagFieldOption
+
+	old := fields.Metadata.GetOld() + "\n" + fields.Spec.GetOld()
+	new := fields.Metadata.GetNew() + "\n" + fields.Spec.GetNew()
+	if old == "\n" || new == "\n" {
+		return
+	} else {
+		diff := CompareConfig(old, new, int(c.cfg.ConfigDiffContext))
+
+		opts = []eventapi.TagFieldOption{
+			eventapi.TagPodServiceID(fields.GetID()),
+			eventapi.TagAttributes(
+				[]string{eventapi.AttributeNameConfig, eventapi.AttributeNameConfigDiff},
+				[]string{new, diff}),
+		}
+	}
+	c.createAndEnqueue(md, fields.GetLcuuid(), eventType, opts...)
 }
 
-func (p *PodService) ProduceByDelete(lcuuids []string) {
-	for _, lcuuid := range lcuuids {
-		var id int
-		var name string
-		id, ok := p.ToolDataSet.GetPodServiceIDByLcuuid(lcuuid)
-		if ok {
-			var err error
-			name, err = p.ToolDataSet.GetPodServiceNameByID(id)
-			if err != nil {
-				log.Errorf("%v, %v", idByLcuuidNotFound(p.resourceType, lcuuid), err)
-			}
-		} else {
-			log.Error(nameByIDNotFound(p.resourceType, id))
-		}
-
-		p.createAndEnqueue(lcuuid, eventapi.RESOURCE_EVENT_TYPE_DELETE, name, p.deviceType, id)
+func (p *PodService) OnResourceBatchDeleted(md *message.Metadata, msg interface{}) {
+	for _, item := range msg.([]*metadbmodel.PodService) {
+		p.createInstanceAndEnqueue(md, item.Lcuuid, eventapi.RESOURCE_EVENT_TYPE_DELETE, item.Name, p.deviceType, item.ID)
 	}
 }

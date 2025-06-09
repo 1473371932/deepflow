@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-use std::str::Utf8Error;
+use std::{borrow::Cow, str::Utf8Error};
 
+use public::l7_protocol::L7Protocol;
 use thiserror::Error;
 
 use super::MetaAppProto;
@@ -28,9 +29,7 @@ pub enum Error {
     InvalidPacketTimestamp,
     #[error("tcp retransmission packet")]
     RetransPacket,
-    // call LayerFlowPerf::parse return Error(Layer7 mismatch_response_count)
-    #[error("layer7 request not found")]
-    L7ReqNotFound(u64),
+
     #[error("zero payload len")]
     ZeroPayloadLen,
     #[error("invalid ip protocol")]
@@ -48,26 +47,28 @@ pub enum Error {
     #[error("mqtt perf parse failed")]
     MqttPerfParseFailed,
     #[error("openwire log parse failed")]
-    OpenwireLogParseFailed,
+    OpenWireLogParseFailed,
     // openwire log parse unimplemented is acceptable
     #[error("openwire log parse unimplemented")]
-    OpenwireLogParseUnimplemented,
-    #[error("openwire perf parse failed")]
-    OpenwirePerfParseFailed,
+    OpenWireLogParseUnimplemented,
+    #[error("openwire log parse EOF")]
+    OpenWireLogParseEOF,
+    #[error("zmtp log parse failed")]
+    ZmtpLogParseFailed,
+    #[error("zmtp log parse EOF")]
+    ZmtpLogParseEOF,
+    #[error("zmtp perf parse failed")]
+    ZmtpPerfParseFailed,
+    #[error("rocketmq log parse failed")]
+    RocketmqLogParseFailed,
     #[error("redis log parse failed")]
     RedisLogParseFailed,
     #[error("redis perf parse failed")]
+    RedisLogParsePartial,
+    #[error("redis perf parse partial result")]
     RedisPerfParseFailed,
-    #[error("mysql log parse failed")]
-    MysqlLogParseFailed,
-    #[error("mysql perf parse failed")]
-    MysqlPerfParseFailed,
     #[error("mongodb log parse failed")]
     MongoDBLogParseFailed,
-    #[error("{0}")]
-    DNSLogParseFailed(String),
-    #[error("{0}")]
-    DNSPerfParseFailed(&'static str),
     #[error("{0}")]
     TlsLogParseFailed(String),
     #[error("{0}")]
@@ -96,6 +97,17 @@ pub enum Error {
     SoReturnUnexpectVal,
     #[error("so plugin parse fail")]
     SoParseFail,
+    #[error("{proto:?} log parse failed: {reason}")]
+    L7LogParseFailed {
+        proto: L7Protocol,
+        reason: Cow<'static, str>,
+    },
+    #[error("insufficient payload length")]
+    InsufficientPayloadLength,
+    #[error("unsupported SOME/IP message type")]
+    SomeIpUnsupportedMessageType,
+    #[error("ping header parse failed")]
+    PingHeaderParseFailed,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

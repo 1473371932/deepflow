@@ -17,76 +17,108 @@
 package tagrecorder
 
 import (
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql/query"
+	"slices"
+
+	"gorm.io/gorm/clause"
+
+	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type ChGProcess struct {
-	UpdaterBase[mysql.ChGProcess, IDKey]
+	SubscriberComponent[
+		*message.ProcessAdd,
+		message.ProcessAdd,
+		*message.ProcessFieldsUpdate,
+		message.ProcessFieldsUpdate,
+		*message.ProcessDelete,
+		message.ProcessDelete,
+		metadbmodel.Process,
+		metadbmodel.ChGProcess,
+		IDKey,
+	]
 	resourceTypeToIconID map[IconKey]int
 }
 
 func NewChGProcess(resourceTypeToIconID map[IconKey]int) *ChGProcess {
-	updater := &ChGProcess{
-		UpdaterBase[mysql.ChGProcess, IDKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_GPROCESS,
-		},
+	mng := &ChGProcess{
+		newSubscriberComponent[
+			*message.ProcessAdd,
+			message.ProcessAdd,
+			*message.ProcessFieldsUpdate,
+			message.ProcessFieldsUpdate,
+			*message.ProcessDelete,
+			message.ProcessDelete,
+			metadbmodel.Process,
+			metadbmodel.ChGProcess,
+			IDKey,
+		](
+			common.RESOURCE_TYPE_PROCESS_EN, RESOURCE_TYPE_CH_GPROCESS,
+		),
 		resourceTypeToIconID,
 	}
-	updater.dataGenerator = updater
-	return updater
+	mng.subscriberDG = mng
+	mng.hookers[hookerDeletePage] = mng
+	return mng
 }
 
-func (p *ChGProcess) generateNewData() (map[IDKey]mysql.ChGProcess, bool) {
-	processes, err := query.FindInBatches[mysql.Process](mysql.Db.Unscoped())
-	if err != nil {
-		log.Errorf(dbQueryResourceFailed(p.resourceTypeName, err))
-		return nil, false
+// sourceToTarget implements SubscriberDataGenerator
+func (c *ChGProcess) sourceToTarget(md *message.Metadata, source *metadbmodel.Process) (keys []IDKey, targets []metadbmodel.ChGProcess) {
+	iconID := c.resourceTypeToIconID[IconKey{
+		NodeType: RESOURCE_TYPE_GPROCESS,
+	}]
+	sourceName := source.Name
+	if source.DeletedAt.Valid {
+		sourceName += " (deleted)"
 	}
+	gid := int(source.GID)
+	keys = append(keys, IDKey{ID: gid})
+	targets = append(targets, metadbmodel.ChGProcess{
+		ChIDBase:    metadbmodel.ChIDBase{ID: gid},
+		Name:        sourceName,
+		CHostID:     source.VMID,
+		L3EPCID:     source.VPCID,
+		IconID:      iconID,
+		TeamID:      md.TeamID,
+		DomainID:    md.DomainID,
+		SubDomainID: md.SubDomainID,
+	})
+	return
+}
 
-	keyToItem := make(map[IDKey]mysql.ChGProcess)
-	for _, process := range processes {
-		if process.DeletedAt.Valid {
-			keyToItem[IDKey{ID: process.ID}] = mysql.ChGProcess{
-				ID:      process.ID,
-				Name:    process.Name + " (deleted)",
-				IconID:  p.resourceTypeToIconID[IconKey{NodeType: RESOURCE_TYPE_GPROCESS}],
-				CHostID: process.VMID,
-				L3EPCID: process.VPCID,
-			}
-		} else {
-			keyToItem[IDKey{ID: process.ID}] = mysql.ChGProcess{
-				ID:      process.ID,
-				Name:    process.Name,
-				IconID:  p.resourceTypeToIconID[IconKey{NodeType: RESOURCE_TYPE_GPROCESS}],
-				CHostID: process.VMID,
-				L3EPCID: process.VPCID,
-			}
+// onResourceUpdated implements SubscriberDataGenerator
+func (c *ChGProcess) onResourceUpdated(sourceID int, fieldsUpdate *message.ProcessFieldsUpdate, db *metadb.DB) {
+	updateInfo := make(map[string]interface{})
+
+	if fieldsUpdate.Name.IsDifferent() {
+		updateInfo["name"] = fieldsUpdate.Name.GetNew()
+	}
+	if fieldsUpdate.VMID.IsDifferent() {
+		updateInfo["chost_id"] = fieldsUpdate.VMID.GetNew()
+	}
+	if fieldsUpdate.VPCID.IsDifferent() {
+		updateInfo["l3_epc_id"] = fieldsUpdate.VPCID.GetNew()
+	}
+	c.updateOrSync(db, IDKey{ID: int(fieldsUpdate.GID.GetNew())}, updateInfo)
+}
+
+// softDeletedTargetsUpdated implements SubscriberDataGenerator
+func (c *ChGProcess) softDeletedTargetsUpdated(targets []metadbmodel.ChGProcess, db *metadb.DB) {
+	db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"name"}),
+	}).Create(&targets)
+}
+
+func (c *ChGProcess) beforeDeletePage(dbData []*metadbmodel.Process, msg *message.ProcessDelete) []*metadbmodel.Process {
+	gids := msg.GetAddition().(*message.ProcessDeleteAddition).DeletedGIDs
+	newDatas := []*metadbmodel.Process{}
+	for _, item := range dbData {
+		if slices.Contains(gids, item.GID) {
+			newDatas = append(newDatas, item)
 		}
 	}
-	return keyToItem, true
-}
-
-func (p *ChGProcess) generateKey(dbItem mysql.ChGProcess) IDKey {
-	return IDKey{ID: dbItem.ID}
-}
-
-func (p *ChGProcess) generateUpdateInfo(oldItem, newItem mysql.ChGProcess) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
-	if oldItem.Name != newItem.Name {
-		updateInfo["name"] = newItem.Name
-	}
-	if oldItem.IconID != newItem.IconID {
-		updateInfo["icon_id"] = newItem.IconID
-	}
-	if oldItem.CHostID != newItem.CHostID {
-		updateInfo["chost_id"] = newItem.CHostID
-	}
-	if oldItem.L3EPCID != newItem.L3EPCID {
-		updateInfo["l3_epc_id"] = newItem.L3EPCID
-	}
-	if len(updateInfo) > 0 {
-		return updateInfo, true
-	}
-	return nil, false
+	return newDatas
 }

@@ -19,25 +19,55 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type PeerConnection struct {
-	UpdaterBase[cloudmodel.PeerConnection, mysql.PeerConnection, *diffbase.PeerConnection]
+	UpdaterBase[
+		cloudmodel.PeerConnection,
+		*diffbase.PeerConnection,
+		*metadbmodel.PeerConnection,
+		metadbmodel.PeerConnection,
+		*message.PeerConnectionAdd,
+		message.PeerConnectionAdd,
+		message.AddNoneAddition,
+		*message.PeerConnectionUpdate,
+		message.PeerConnectionUpdate,
+		*message.PeerConnectionFieldsUpdate,
+		message.PeerConnectionFieldsUpdate,
+		*message.PeerConnectionDelete,
+		message.PeerConnectionDelete,
+		message.DeleteNoneAddition]
 }
 
 func NewPeerConnection(wholeCache *cache.Cache, cloudData []cloudmodel.PeerConnection) *PeerConnection {
 	updater := &PeerConnection{
-		UpdaterBase[cloudmodel.PeerConnection, mysql.PeerConnection, *diffbase.PeerConnection]{
-			resourceType: ctrlrcommon.RESOURCE_TYPE_PEER_CONNECTION_EN,
-			cache:        wholeCache,
-			dbOperator:   db.NewPeerConnection(),
-			diffBaseData: wholeCache.DiffBaseDataSet.PeerConnections,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.PeerConnection,
+			*diffbase.PeerConnection,
+			*metadbmodel.PeerConnection,
+			metadbmodel.PeerConnection,
+			*message.PeerConnectionAdd,
+			message.PeerConnectionAdd,
+			message.AddNoneAddition,
+			*message.PeerConnectionUpdate,
+			message.PeerConnectionUpdate,
+			*message.PeerConnectionFieldsUpdate,
+			message.PeerConnectionFieldsUpdate,
+			*message.PeerConnectionDelete,
+			message.PeerConnectionDelete,
+			message.DeleteNoneAddition,
+		](
+			ctrlrcommon.RESOURCE_TYPE_PEER_CONNECTION_EN,
+			wholeCache,
+			db.NewPeerConnection().SetMetadata(wholeCache.GetMetadata()),
+			wholeCache.DiffBaseDataSet.PeerConnections,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
@@ -48,82 +78,45 @@ func (c *PeerConnection) getDiffBaseByCloudItem(cloudItem *cloudmodel.PeerConnec
 	return
 }
 
-func (c *PeerConnection) generateDBItemToAdd(cloudItem *cloudmodel.PeerConnection) (*mysql.PeerConnection, bool) {
+func (c *PeerConnection) generateDBItemToAdd(cloudItem *cloudmodel.PeerConnection) (*metadbmodel.PeerConnection, bool) {
 	remoteVPCID, exists := c.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.RemoteVPCLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_VPC_EN, cloudItem.RemoteVPCLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_PEER_CONNECTION_EN, cloudItem.Lcuuid,
-		))
+		), c.metadata.LogPrefixes)
 		return nil, false
 	}
 	localVPCID, exists := c.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.LocalVPCLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_VPC_EN, cloudItem.LocalVPCLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_PEER_CONNECTION_EN, cloudItem.Lcuuid,
-		))
+		), c.metadata.LogPrefixes)
 		return nil, false
 	}
-	remoteRegionID, exists := c.cache.ToolDataSet.GetRegionIDByLcuuid(cloudItem.RemoteRegionLcuuid)
-	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
-			ctrlrcommon.RESOURCE_TYPE_REGION_EN, cloudItem.RemoteRegionLcuuid,
-			ctrlrcommon.RESOURCE_TYPE_PEER_CONNECTION_EN, cloudItem.Lcuuid,
-		))
-		return nil, false
-	}
-	localRegionID, exists := c.cache.ToolDataSet.GetRegionIDByLcuuid(cloudItem.LocalRegionLcuuid)
-	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
-			ctrlrcommon.RESOURCE_TYPE_REGION_EN, cloudItem.LocalRegionLcuuid,
-			ctrlrcommon.RESOURCE_TYPE_PEER_CONNECTION_EN, cloudItem.Lcuuid,
-		))
-		return nil, false
-	}
-	dbItem := &mysql.PeerConnection{
-		Name:           cloudItem.Name,
-		Label:          cloudItem.Label,
-		Domain:         c.cache.DomainLcuuid,
-		RemoteVPCID:    remoteVPCID,
-		LocalVPCID:     localVPCID,
-		RemoteRegionID: remoteRegionID,
-		LocalRegionID:  localRegionID,
+
+	dbItem := &metadbmodel.PeerConnection{
+		Name:         cloudItem.Name,
+		Label:        cloudItem.Label,
+		TeamID:       c.msgMetadata.TeamID,
+		Domain:       c.metadata.Domain.Lcuuid,
+		RemoteVPCID:  &remoteVPCID,
+		LocalVPCID:   &localVPCID,
+		RemoteDomain: c.metadata.Domain.Lcuuid,
+		LocalDomain:  c.metadata.Domain.Lcuuid,
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	return dbItem, true
 }
 
-func (c *PeerConnection) generateUpdateInfo(diffBase *diffbase.PeerConnection, cloudItem *cloudmodel.PeerConnection) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (c *PeerConnection) generateUpdateInfo(diffBase *diffbase.PeerConnection, cloudItem *cloudmodel.PeerConnection) (*message.PeerConnectionFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.PeerConnectionFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
-		updateInfo["name"] = cloudItem.Name
-	}
-	if diffBase.RemoteRegionLcuuid != cloudItem.RemoteRegionLcuuid {
-		remoteRegionID, exists := c.cache.ToolDataSet.GetRegionIDByLcuuid(cloudItem.RemoteRegionLcuuid)
-		if !exists {
-			log.Errorf(resourceAForResourceBNotFound(
-				ctrlrcommon.RESOURCE_TYPE_REGION_EN, cloudItem.RemoteRegionLcuuid,
-				ctrlrcommon.RESOURCE_TYPE_PEER_CONNECTION_EN, cloudItem.Lcuuid,
-			))
-			return nil, false
-		}
-		updateInfo["remote_region_id"] = remoteRegionID
-	}
-	if diffBase.LocalRegionLcuuid != cloudItem.LocalRegionLcuuid {
-		localRegionID, exists := c.cache.ToolDataSet.GetRegionIDByLcuuid(cloudItem.LocalRegionLcuuid)
-		if !exists {
-			log.Errorf(resourceAForResourceBNotFound(
-				ctrlrcommon.RESOURCE_TYPE_REGION_EN, cloudItem.LocalRegionLcuuid,
-				ctrlrcommon.RESOURCE_TYPE_PEER_CONNECTION_EN, cloudItem.Lcuuid,
-			))
-			return nil, false
-		}
-		updateInfo["local_region_id"] = localRegionID
+		mapInfo["name"] = cloudItem.Name
+		structInfo.Name.Set(diffBase.Name, cloudItem.Name)
 	}
 
-	if len(updateInfo) > 0 {
-		return updateInfo, true
-	}
-	return nil, false
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

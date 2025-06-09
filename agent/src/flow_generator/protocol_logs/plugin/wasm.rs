@@ -22,7 +22,10 @@ use crate::{
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
         l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
     },
-    flow_generator::{protocol_logs::L7ResponseStatus, Error, Result},
+    flow_generator::{
+        protocol_logs::{set_captured_byte, L7ResponseStatus, LogMessageType},
+        Error, Result,
+    },
 };
 
 #[derive(Default)]
@@ -73,11 +76,22 @@ impl L7ProtocolParserInterface for WasmLog {
                     }
 
                     i.msg_type = param.direction.into();
+                    set_captured_byte!(i, param);
+
+                    let endpoint = if i.req.endpoint.is_empty() {
+                        None
+                    } else {
+                        Some(i.req.endpoint.clone())
+                    };
 
                     if i.need_merge() {
-                        i.cal_rrt_for_multi_merge_log(param).map(|rrt| {
-                            i.rrt = rrt;
-                        });
+                        i.cal_rrt_for_multi_merge_log(param, &endpoint)
+                            .map(|(rrt, endpoint)| {
+                                i.rrt = rrt;
+                                if i.msg_type == LogMessageType::Response {
+                                    i.req.endpoint = endpoint.unwrap_or_default();
+                                }
+                            });
                         if i.is_req_end || i.is_resp_end {
                             self.perf_stats.as_mut().map(|p| p.update_rrt(i.rrt));
 
@@ -100,8 +114,11 @@ impl L7ProtocolParserInterface for WasmLog {
                             }
                         }
 
-                        i.cal_rrt(param, None).map(|rrt| {
+                        i.cal_rrt(param, &endpoint).map(|(rrt, endpoint)| {
                             i.rrt = rrt;
+                            if i.msg_type == LogMessageType::Response {
+                                i.req.endpoint = endpoint.unwrap_or_default();
+                            }
                             self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
                         });
                     }

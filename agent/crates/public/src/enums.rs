@@ -143,12 +143,12 @@ impl From<IpProtocol> for L4Protocol {
 
 // Translate the string value of otel l4_protocol into a L4Protocol enumeration value
 // According to https://opentelemetry.io/docs/reference/specification/trace/semantic_conventions/span-general/#network-transport-attributes
-impl From<String> for L4Protocol {
-    fn from(l4_protocol_str: String) -> Self {
-        let l4_protocol_str = l4_protocol_str.to_lowercase();
-        if l4_protocol_str.eq("ip_tcp") {
+impl<T: AsRef<str>> From<T> for L4Protocol {
+    fn from(s: T) -> Self {
+        let s = s.as_ref();
+        if s.eq_ignore_ascii_case("ip_tcp") {
             Self::Tcp
-        } else if l4_protocol_str.eq("ip_udp") {
+        } else if s.eq_ignore_ascii_case("ip_udp") {
             Self::Udp
         } else {
             Self::Unknown
@@ -163,7 +163,7 @@ impl Default for L4Protocol {
 }
 
 #[derive(Serialize, Debug, Clone, Copy, Hash, PartialEq, Eq, Ord)]
-pub enum TapType {
+pub enum CaptureNetworkType {
     Any,
     Idc(u8),
     Cloud,
@@ -171,51 +171,51 @@ pub enum TapType {
     Unknown,
 }
 
-impl PartialOrd for TapType {
+impl PartialOrd for CaptureNetworkType {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         u16::from(*self).partial_cmp(&u16::from(*other))
     }
 }
 
-impl TryFrom<u16> for TapType {
+impl TryFrom<u16> for CaptureNetworkType {
     type Error = &'static str;
-    fn try_from(t: u16) -> Result<TapType, Self::Error> {
+    fn try_from(t: u16) -> Result<CaptureNetworkType, Self::Error> {
         match t {
-            0 => Ok(TapType::Any),
-            3 => Ok(TapType::Cloud),
-            0xffff => Ok(TapType::Unknown),
-            v if v < 256 => Ok(TapType::Idc(v as u8)),
-            _ => Err("TapType not in [0, 256)"),
+            0 => Ok(CaptureNetworkType::Any),
+            3 => Ok(CaptureNetworkType::Cloud),
+            0xffff => Ok(CaptureNetworkType::Unknown),
+            v if v < 256 => Ok(CaptureNetworkType::Idc(v as u8)),
+            _ => Err("CaptureNetworkType not in [0, 256)"),
         }
     }
 }
 
-impl From<TapType> for u16 {
-    fn from(t: TapType) -> u16 {
+impl From<CaptureNetworkType> for u16 {
+    fn from(t: CaptureNetworkType) -> u16 {
         match t {
-            TapType::Any => 0,
-            TapType::Idc(v) => v as u16,
-            TapType::Cloud => 3,
-            TapType::Max => 256,
-            TapType::Unknown => 0xffff,
+            CaptureNetworkType::Any => 0,
+            CaptureNetworkType::Idc(v) => v as u16,
+            CaptureNetworkType::Cloud => 3,
+            CaptureNetworkType::Max => 256,
+            CaptureNetworkType::Unknown => 0xffff,
         }
     }
 }
 
-impl Default for TapType {
-    fn default() -> TapType {
-        TapType::Any
+impl Default for CaptureNetworkType {
+    fn default() -> CaptureNetworkType {
+        CaptureNetworkType::Any
     }
 }
 
-impl fmt::Display for TapType {
+impl fmt::Display for CaptureNetworkType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TapType::Any => write!(f, "any"),
-            TapType::Idc(n) => write!(f, "isp{}", n),
-            TapType::Cloud => write!(f, "tor"),
-            TapType::Max => write!(f, "max"),
-            TapType::Unknown => write!(f, "unknown"),
+            CaptureNetworkType::Any => write!(f, "any"),
+            CaptureNetworkType::Idc(n) => write!(f, "isp{}", n),
+            CaptureNetworkType::Cloud => write!(f, "tor"),
+            CaptureNetworkType::Max => write!(f, "max"),
+            CaptureNetworkType::Unknown => write!(f, "unknown"),
         }
     }
 }
@@ -401,6 +401,6 @@ mod tests {
     fn check_type_sizes() {
         assert_eq!(size_of::<EthernetType>(), 2);
         assert_eq!(size_of::<IpProtocol>(), 1);
-        assert_eq!(size_of::<TapType>(), 2);
+        assert_eq!(size_of::<CaptureNetworkType>(), 2);
     }
 }

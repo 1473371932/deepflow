@@ -23,17 +23,18 @@ const AMQPVERSION: &[u8] = b"v0.9.1";
 use crate::{
     common::{
         enums::IpProtocol,
-        flow::{L7PerfStats, L7Protocol, PacketDirection},
+        flow::{L7PerfStats, L7Protocol},
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
         l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
         meta_packet::EbpfFlags,
     },
+    config::handler::LogParserConfig,
     flow_generator::{
         error::Result,
         protocol_logs::{
             decode_base64_to_string,
             pb_adapter::{L7ProtocolSendLog, L7Request, L7Response, TraceInfo},
-            AppProtoHead, LogMessageType,
+            set_captured_byte, AppProtoHead, LogMessageType,
         },
     },
     utils::bytes::{read_u16_be, read_u32_be, read_u64_be},
@@ -249,6 +250,10 @@ pub struct AmqpInfo {
 
     rtt: u64,
 
+    vhost: Option<String>,
+
+    is_protcol_header: bool,
+
     #[serde(rename = "type")]
     frame_type: FrameType,
     #[serde(rename = "channel")]
@@ -261,6 +266,9 @@ pub struct AmqpInfo {
     class_id: ClassType,
     #[serde(rename = "method_id")]
     method_id: MethodType,
+
+    #[serde(skip)]
+    raw_method_id: Option<u16>,
 
     // Header Frame
     // class_id: ClassType, // same as method frame
@@ -279,8 +287,19 @@ pub struct AmqpInfo {
     #[serde(rename = "span_id", skip_serializing_if = "Option::is_none")]
     span_id: Option<String>,
 
+    captured_request_byte: u32,
+    captured_response_byte: u32,
+
     req_len: Option<u32>,
     resp_len: Option<u32>,
+    resp_code: Option<i32>,
+
+    #[serde(skip)]
+    req_type: Option<String>,
+    #[serde(skip)]
+    endpoint: Option<String>,
+    #[serde(skip)]
+    is_on_blacklist: bool,
 }
 
 fn slice_to_string(slice: &[u8]) -> String {
@@ -405,13 +424,113 @@ fn read_table(payload: &[u8]) -> Option<(&[u8], Value)> {
 }
 
 impl AmqpInfo {
+    fn generate_endpoint(&self) -> Option<String> {
+        let (exchange, exchange_len) = self
+            .exchange
+            .as_ref()
+            .map(|r| (r.as_str(), r.len()))
+            .unwrap_or(("", 0));
+        let (routing_key, routing_key_len) = self
+            .routing_key
+            .as_ref()
+            .map(|r| (r.as_str(), r.len()))
+            .unwrap_or(("", 0));
+        if exchange_len + routing_key_len == 0 {
+            return self.queue.clone();
+        }
+        Some(format!("{}.{}", exchange, routing_key))
+    }
+
     fn get_packet_type(&self) -> String {
+        if self.is_protcol_header {
+            return "Protocol-Header".to_string();
+        }
         match self.frame_type {
             FrameType::Method => format!("{:?}.{:?}", self.class_id, self.method_id),
             FrameType::Header => "Content-Header".to_string(),
             FrameType::Body => "Content-Body".to_string(),
             FrameType::Heartbeat => "Heartbeat".to_string(),
             FrameType::Unknown => "Unknown".to_string(),
+        }
+    }
+
+    fn get_log_message_type(&self) -> LogMessageType {
+        if self.is_protcol_header {
+            return LogMessageType::Session;
+        }
+        match self.frame_type {
+            FrameType::Method => {}
+            FrameType::Header => return LogMessageType::Session,
+            FrameType::Body => return LogMessageType::Session,
+            FrameType::Heartbeat => return LogMessageType::Session,
+            FrameType::Unknown => return LogMessageType::Other,
+        }
+        match (self.class_id, self.method_id) {
+            (ClassType::Connection, MethodType::Blocked)
+            | (ClassType::Connection, MethodType::Unblocked)
+            | (ClassType::Basic, MethodType::Publish)
+            | (ClassType::Basic, MethodType::Return)
+            | (ClassType::Basic, MethodType::Deliver)
+            | (ClassType::Basic, MethodType::Ack)
+            | (ClassType::Basic, MethodType::Reject)
+            | (ClassType::Basic, MethodType::RecoverAsync)
+            | (ClassType::Basic, MethodType::Nack) => LogMessageType::Session,
+            (ClassType::Connection, MethodType::Start)
+            | (ClassType::Connection, MethodType::Secure)
+            | (ClassType::Connection, MethodType::Tune)
+            | (ClassType::Connection, MethodType::Open)
+            | (ClassType::Connection, MethodType::Close)
+            | (ClassType::Connection, MethodType::UpdateSecret)
+            | (ClassType::Channel, MethodType::Open)
+            | (ClassType::Channel, MethodType::Flow)
+            | (ClassType::Channel, MethodType::Close)
+            | (ClassType::Exchange, MethodType::Declare)
+            | (ClassType::Exchange, MethodType::Delete)
+            | (ClassType::Exchange, MethodType::Bind)
+            | (ClassType::Exchange, MethodType::Unbind)
+            | (ClassType::Queue, MethodType::Declare)
+            | (ClassType::Queue, MethodType::Bind)
+            | (ClassType::Queue, MethodType::Purge)
+            | (ClassType::Queue, MethodType::Delete)
+            | (ClassType::Queue, MethodType::Unbind)
+            | (ClassType::Basic, MethodType::Qos)
+            | (ClassType::Basic, MethodType::Consume)
+            | (ClassType::Basic, MethodType::Cancel)
+            | (ClassType::Basic, MethodType::Get)
+            | (ClassType::Basic, MethodType::Recover)
+            | (ClassType::Tx, MethodType::Select)
+            | (ClassType::Tx, MethodType::Commit)
+            | (ClassType::Tx, MethodType::Rollback)
+            | (ClassType::Confirm, MethodType::Select) => LogMessageType::Request,
+            (ClassType::Connection, MethodType::StartOk)
+            | (ClassType::Connection, MethodType::SecureOk)
+            | (ClassType::Connection, MethodType::TuneOk)
+            | (ClassType::Connection, MethodType::OpenOk)
+            | (ClassType::Connection, MethodType::CloseOk)
+            | (ClassType::Connection, MethodType::UpdateSecretOk)
+            | (ClassType::Channel, MethodType::OpenOk)
+            | (ClassType::Channel, MethodType::FlowOk)
+            | (ClassType::Channel, MethodType::CloseOk)
+            | (ClassType::Exchange, MethodType::DeclareOk)
+            | (ClassType::Exchange, MethodType::DeleteOk)
+            | (ClassType::Exchange, MethodType::BindOk)
+            | (ClassType::Exchange, MethodType::UnbindOk)
+            | (ClassType::Queue, MethodType::DeclareOk)
+            | (ClassType::Queue, MethodType::BindOk)
+            | (ClassType::Queue, MethodType::PurgeOk)
+            | (ClassType::Queue, MethodType::DeleteOk)
+            | (ClassType::Queue, MethodType::UnbindOk)
+            | (ClassType::Basic, MethodType::QosOk)
+            | (ClassType::Basic, MethodType::ConsumeOk)
+            | (ClassType::Basic, MethodType::CancelOk)
+            | (ClassType::Basic, MethodType::GetOk)
+            | (ClassType::Basic, MethodType::GetEmpty)
+            | (ClassType::Basic, MethodType::RecoverOk)
+            | (ClassType::Tx, MethodType::SelectOk)
+            | (ClassType::Tx, MethodType::CommitOk)
+            | (ClassType::Tx, MethodType::RollbackOk)
+            | (ClassType::Confirm, MethodType::SelectOk) => LogMessageType::Response,
+            _ => LogMessageType::Other,
         }
     }
 
@@ -588,11 +707,33 @@ impl AmqpInfo {
         };
         Some(slice_to_string(routing_key))
     }
+
+    fn set_is_on_blacklist(&mut self, config: &LogParserConfig) {
+        if let Some(t) = config.l7_log_blacklist_trie.get(&L7Protocol::AMQP) {
+            self.is_on_blacklist = self
+                .req_type
+                .as_ref()
+                .map(|p| t.request_type.is_on_blacklist(p))
+                .unwrap_or_default()
+                || self
+                    .vhost
+                    .as_ref()
+                    .map(|p| t.request_domain.is_on_blacklist(p))
+                    .unwrap_or_default()
+                || self
+                    .endpoint
+                    .as_ref()
+                    .map(|p| t.endpoint.is_on_blacklist(p) || t.request_resource.is_on_blacklist(p))
+                    .unwrap_or_default();
+        }
+    }
 }
 
 #[derive(Default)]
 pub struct AmqpLog {
     perf_stats: Option<L7PerfStats>,
+    vhost: Option<String>,
+    last_is_on_blacklist: bool,
 }
 
 impl From<AmqpInfo> for L7ProtocolSendLog {
@@ -602,18 +743,21 @@ impl From<AmqpInfo> for L7ProtocolSendLog {
             false => EbpfFlags::NONE.bits(),
         };
         let log = L7ProtocolSendLog {
+            captured_request_byte: info.captured_request_byte,
+            captured_response_byte: info.captured_response_byte,
             version: Some(std::str::from_utf8(AMQPVERSION).unwrap().to_string()),
             flags,
             req_len: info.req_len,
             resp_len: info.resp_len,
             req: L7Request {
-                req_type: info.get_packet_type(),
-                endpoint: info.queue.unwrap_or_default(),
-                domain: info.exchange.unwrap_or_default(),
-                resource: info.routing_key.unwrap_or_default(),
+                req_type: info.req_type.unwrap_or_default(),
+                domain: info.vhost.unwrap_or_default(),
+                resource: info.endpoint.clone().unwrap_or_default(),
+                endpoint: info.endpoint.unwrap_or_default(),
                 ..Default::default()
             },
             resp: L7Response {
+                code: info.resp_code,
                 ..Default::default()
             },
             trace_info: Some(TraceInfo {
@@ -641,6 +785,28 @@ impl L7ProtocolInfoInterface for AmqpInfo {
             if req.resp_len.is_none() {
                 req.resp_len = rsp.resp_len;
             }
+            if req.resp_code.is_none() {
+                req.resp_code = rsp.raw_method_id.map(|x| x as i32);
+            }
+            if req.routing_key.as_ref().map_or(0, |r| r.len()) == 0 {
+                req.routing_key = rsp.routing_key.clone();
+            }
+            if req.queue.as_ref().map_or(0, |r| r.len()) == 0 {
+                req.queue = rsp.queue.clone();
+            }
+            if req.exchange.as_ref().map_or(0, |r| r.len()) == 0 {
+                req.exchange = rsp.exchange.clone();
+            }
+            if req.req_type.is_none() {
+                req.resp_code = rsp.raw_method_id.map(|x| x as i32);
+            }
+            if req.endpoint.is_none() {
+                req.resp_code = rsp.raw_method_id.map(|x| x as i32);
+            }
+            if rsp.is_on_blacklist {
+                req.is_on_blacklist = rsp.is_on_blacklist;
+            }
+            req.captured_response_byte = rsp.captured_response_byte;
         }
         Ok(())
     }
@@ -651,6 +817,18 @@ impl L7ProtocolInfoInterface for AmqpInfo {
             msg_type: self.msg_type,
             rrt: self.rtt,
         })
+    }
+
+    fn get_request_domain(&self) -> String {
+        self.vhost.clone().unwrap_or_default()
+    }
+
+    fn get_endpoint(&self) -> Option<String> {
+        self.endpoint.clone()
+    }
+
+    fn is_on_blacklist(&self) -> bool {
+        self.is_on_blacklist
     }
 }
 
@@ -671,10 +849,19 @@ impl L7ProtocolParserInterface for AmqpLog {
         };
 
         let mut offset = 0;
+        let mut vec = Vec::new();
         if payload.starts_with(AMQPHEADER) {
             offset += AMQPHEADER.len();
+            let mut info = AmqpInfo::default();
+            info.is_protcol_header = true;
+            info.is_tls = param.is_tls();
+            info.msg_type = info.get_log_message_type();
+            if info.msg_type == LogMessageType::Request {
+                info.req_type = Some(info.get_packet_type());
+                info.endpoint = info.generate_endpoint();
+            }
+            vec.push(L7ProtocolInfo::AmqpInfo(info));
         }
-        let mut vec = Vec::new();
         loop {
             let offset_begin = offset;
             let mut info = AmqpInfo::default();
@@ -704,13 +891,12 @@ impl L7ProtocolParserInterface for AmqpLog {
                         ClassType::Unknown => break,
                         x => x,
                     };
-                    info.method_id = match MethodType::from((
-                        info.class_id,
-                        read_u16_be(&payload[offset + 2..offset + 4]),
-                    )) {
-                        MethodType::Unknown => break,
-                        x => x,
-                    };
+                    info.raw_method_id = Some(read_u16_be(&payload[offset + 2..offset + 4]));
+                    info.method_id =
+                        match MethodType::from((info.class_id, info.raw_method_id.unwrap())) {
+                            MethodType::Unknown => break,
+                            x => x,
+                        };
                     info.queue = info.parse_queue(&payload[offset + 4..]);
                     info.exchange = info.parse_exchange(&payload[offset + 4..]);
                     info.routing_key = info.parse_routing_key(&payload[offset + 4..]);
@@ -740,40 +926,70 @@ impl L7ProtocolParserInterface for AmqpLog {
                 FrameType::Heartbeat => {}
                 FrameType::Unknown => unreachable!(),
             }
+
+            if info.class_id == ClassType::Connection {
+                if info.method_id == MethodType::Open {
+                    if let Some((_, vhost)) = read_short_str(&payload[offset + 4..]) {
+                        self.vhost = Some(slice_to_string(vhost));
+                    }
+                }
+            }
+            info.vhost = self.vhost.clone();
+            if info.class_id == ClassType::Connection {
+                if info.method_id == MethodType::CloseOk {
+                    self.vhost = None;
+                }
+            }
+
             offset += info.payload_size as usize;
             if payload.get(offset) != Some(&b'\xCE') {
                 break;
             }
             offset += 1;
 
-            match param.direction {
-                PacketDirection::ClientToServer => {
-                    info.req_len = Some((offset - offset_begin) as u32)
+            info.msg_type = info.get_log_message_type();
+
+            match info.msg_type {
+                LogMessageType::Request => {
+                    info.req_len = Some((offset - offset_begin) as u32);
+                    info.req_type = Some(info.get_packet_type());
+                    info.endpoint = info.generate_endpoint();
                 }
-                PacketDirection::ServerToClient => {
-                    info.resp_len = Some((offset - offset_begin) as u32)
-                }
+                LogMessageType::Response => info.resp_len = Some((offset - offset_begin) as u32),
+                _ => {}
             }
             vec.push(L7ProtocolInfo::AmqpInfo(info));
         }
         for info in &mut vec {
             if let L7ProtocolInfo::AmqpInfo(info) = info {
-                info.cal_rrt(param, None).map(|rtt| {
-                    info.rtt = rtt;
-                    self.perf_stats.as_mut().map(|p| p.update_rrt(rtt));
-                });
                 info.is_tls = param.is_tls();
-
-                match param.direction {
-                    PacketDirection::ClientToServer => {
-                        info.msg_type = LogMessageType::Request;
+                set_captured_byte!(info, param);
+                if let Some(config) = param.parse_config {
+                    info.set_is_on_blacklist(config);
+                }
+                if !info.is_on_blacklist && !self.last_is_on_blacklist {
+                    if info.msg_type == LogMessageType::Request {
                         self.perf_stats.as_mut().map(|p| p.inc_req());
-                    }
-                    PacketDirection::ServerToClient => {
-                        info.msg_type = LogMessageType::Response;
+                        info.endpoint = info.generate_endpoint();
+                        info.cal_rrt(param, &info.endpoint).map(|(rtt, endpoint)| {
+                            info.rtt = rtt;
+                            if info.msg_type == LogMessageType::Response {
+                                info.endpoint = endpoint;
+                            }
+                            self.perf_stats.as_mut().map(|p| p.update_rrt(rtt));
+                        });
+                    } else if info.msg_type == LogMessageType::Response {
                         self.perf_stats.as_mut().map(|p| p.inc_resp());
+                        info.cal_rrt(param, &info.endpoint).map(|(rtt, endpoint)| {
+                            info.rtt = rtt;
+                            if info.msg_type == LogMessageType::Response {
+                                info.endpoint = endpoint;
+                            }
+                            self.perf_stats.as_mut().map(|p| p.update_rrt(rtt));
+                        });
                     }
                 }
+                self.last_is_on_blacklist = info.is_on_blacklist;
             }
         }
         if !param.parse_log {
@@ -785,6 +1001,14 @@ impl L7ProtocolParserInterface for AmqpLog {
         } else {
             Ok(L7ParseResult::None)
         }
+    }
+
+    fn reset(&mut self) {
+        let mut s = Self::default();
+        s.last_is_on_blacklist = self.last_is_on_blacklist;
+        s.vhost = self.vhost.take();
+        s.perf_stats = self.perf_stats.take();
+        *self = s;
     }
 
     fn perf_stats(&mut self) -> Option<L7PerfStats> {
@@ -817,15 +1041,16 @@ mod tests {
     const FILE_DIR: &str = "resources/test/flow_generator/amqp";
 
     fn run(name: &str) -> String {
-        let capture = Capture::load_pcap(Path::new(FILE_DIR).join(name), None);
+        let capture = Capture::load_pcap(Path::new(FILE_DIR).join(name));
         let log_cache = Rc::new(RefCell::new(L7PerfCache::new(L7_RRT_CACHE_CAPACITY)));
-        let mut packets = capture.as_meta_packets();
+        let mut packets = capture.collect::<Vec<_>>();
         if packets.is_empty() {
             return "".to_string();
         }
 
         let mut output: String = String::new();
         let mut first_packet = true;
+        let mut amqp = AmqpLog::default();
         let first_dst_port = packets[0].lookup_key.dst_port;
         for packet in packets.iter_mut() {
             packet.lookup_key.direction = if packet.lookup_key.dst_port == first_dst_port {
@@ -837,8 +1062,7 @@ mod tests {
                 Some(p) => p,
                 None => continue,
             };
-            let mut amqp = AmqpLog::default();
-            let param = &ParseParam::new(
+            let param = &mut ParseParam::new(
                 packet as &MetaPacket,
                 log_cache.clone(),
                 Default::default(),
@@ -847,16 +1071,11 @@ mod tests {
                 true,
                 true,
             );
-
+            param.set_captured_byte(payload.len());
             if first_packet {
                 first_packet = false;
                 if !amqp.check_payload(payload, param) {
-                    output.push_str("not amqp\r\n");
-                    break;
-                }
-                if let Ok(L7ParseResult::None) = amqp.parse_payload(payload, param) {
-                } else {
-                    output.push_str("parse error\r\n");
+                    output.push_str("not amqp\n");
                     break;
                 }
             }
@@ -865,19 +1084,19 @@ mod tests {
             if let Ok(info) = info {
                 match info {
                     L7ParseResult::Single(s) => {
-                        output.push_str(&format!("{:?}\r\n", s));
+                        output.push_str(&format!("{:?}\n", s));
                     }
                     L7ParseResult::Multi(m) => {
                         for i in m {
-                            output.push_str(&format!("{:?}\r\n", i));
+                            output.push_str(&format!("{:?}\n", i));
                         }
                     }
                     L7ParseResult::None => {
-                        output.push_str("None\r\n");
+                        output.push_str("None\n");
                     }
                 }
             } else {
-                output.push_str(&format!("{:?}\r\n", AmqpInfo::default()));
+                output.push_str(&format!("{:?}\n", AmqpInfo::default()));
             }
         }
         output

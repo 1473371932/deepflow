@@ -27,9 +27,8 @@ import (
 
 	"github.com/deepflowio/deepflow/message/trident"
 	. "github.com/deepflowio/deepflow/server/controller/common"
-	models "github.com/deepflowio/deepflow/server/controller/db/mysql"
+	models "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	. "github.com/deepflowio/deepflow/server/controller/trisolaris/common"
-	"github.com/deepflowio/deepflow/server/controller/trisolaris/utils"
 	. "github.com/deepflowio/deepflow/server/controller/trisolaris/utils"
 )
 
@@ -57,17 +56,21 @@ type PlatformDataOP struct {
 	*Segment
 
 	podIPs *atomic.Value // []*trident.PodIp
+
+	notifyIngesterDataChanged func()
+
+	ORGID
 }
 
 func newPlatformDataOP(db *gorm.DB, metaData *MetaData) *PlatformDataOP {
 	rawData := &atomic.Value{}
-	rawData.Store(NewPlatformRawData())
+	rawData.Store(NewPlatformRawData(metaData.ORGID))
 
 	domainInterfaceProto := &atomic.Value{}
-	domainInterfaceProto.Store(NewDomainInterfaceProto())
+	domainInterfaceProto.Store(NewDomainInterfaceProto(metaData.ORGID))
 
 	domainPeerConnProto := &atomic.Value{}
-	domainPeerConnProto.Store(NewDomainPeerConnProto(0))
+	domainPeerConnProto.Store(NewDomainPeerConnProto())
 
 	domainCIDRProto := &atomic.Value{}
 	domainCIDRProto.Store(newDomainCIDRProto(0))
@@ -88,16 +91,21 @@ func newPlatformDataOP(db *gorm.DB, metaData *MetaData) *PlatformDataOP {
 		DomainToPlatformData:       newDomainToPlatformData(),
 		db:                         db,
 		chDataChanged:              make(chan struct{}, 1),
-		Segment:                    newSegment(),
+		Segment:                    newSegment(metaData.ORGID),
 		metaData:                   metaData,
 		podIPs:                     &atomic.Value{},
+		ORGID:                      metaData.ORGID,
 	}
+}
+
+func (p *PlatformDataOP) RegisteNotifyIngesterDatachanged(notify func()) {
+	p.notifyIngesterDataChanged = notify
 }
 
 // 有依赖 需要按顺序convert
 func (p *PlatformDataOP) generateRawData() {
 	dbDataCache := p.metaData.GetDBDataCache()
-	r := NewPlatformRawData()
+	r := NewPlatformRawData(p.metaData.ORGID)
 	r.ConvertDBCache(dbDataCache)
 	p.updateRawData(r)
 }
@@ -140,7 +148,7 @@ func (p *PlatformDataOP) generateVInterfaces() {
 	sInterfaces := make([]*trident.Interface, 0, length)
 	aInterfaces := make([]*trident.Interface, 0, length)
 	rawData := p.GetRawData()
-	dipData := NewDomainInterfaceProto()
+	dipData := NewDomainInterfaceProto(p.metaData.ORGID)
 	vifPubIps := []string{}
 	platformVips := p.metaData.GetPlatformVips()
 	for index, _ := range vifs {
@@ -151,20 +159,23 @@ func (p *PlatformDataOP) generateVInterfaces() {
 		}
 		device, ok := rawData.typeIDToDevice[typeIDKey]
 		if ok == false {
-			log.Warningf("vif (lcuuid:%s, domain:%s) not found device(device_type:%d, device_id:%d)",
-				vif.Lcuuid, vif.Domain, vif.DeviceType, vif.DeviceID)
+			log.Warningf(p.Logf("vif (lcuuid:%s, domain:%s) not found device(device_type:%d, device_id:%d)",
+				vif.Lcuuid, vif.Domain, vif.DeviceType, vif.DeviceID))
 			continue
 		}
 		var ipResourceData *IpResourceData
 		ipResourceData, vifPubIps = rawData.generateIpResoureceData(vif, vifPubIps, platformVips)
 		interfaceProto, err := rawData.vInterfaceToProto(vif, device, ipResourceData)
 		if err != nil {
-			log.Error(err)
+			log.Error(p.Log(err.Error()))
 			continue
+		}
+		if p.metaData.config.GetNoIPOverlapping() {
+			interfaceProto.sInterface.IfType = proto.Uint32(uint32(VIF_TYPE_WAN))
 		}
 		err = rawData.modifyInterfaceProto(vif, interfaceProto, device)
 		if err != nil {
-			log.Error(err)
+			log.Error(p.Log(err.Error()))
 		}
 		sInterfaces = append(sInterfaces, interfaceProto.sInterface)
 		aInterfaces = append(aInterfaces, interfaceProto.aInterface)
@@ -224,22 +235,58 @@ func (p *PlatformDataOP) GetNoDomainPeerConns() TPeerConnections {
 func (p *PlatformDataOP) generatePeerConnections() {
 	dbDataCache := p.metaData.GetDBDataCache()
 	peerConns := dbDataCache.GetPeerConnections()
-	dpcData := NewDomainPeerConnProto(len(peerConns))
+
+	rawData := p.GetRawData()
+	dpcData := NewDomainPeerConnProto()
 	for _, pc := range peerConns {
-		data := &trident.PeerConnection{
-			Id:          proto.Uint32(uint32(pc.ID)),
-			LocalEpcId:  proto.Uint32(uint32(pc.LocalVPCID)),
-			RemoteEpcId: proto.Uint32(uint32(pc.RemoteVPCID)),
+		localVPCID := pc.GetLocalVPCID()
+		remoteVPCID := pc.GetRemoteVPCID()
+		if pc.LocalDomain == pc.RemoteDomain && localVPCID != 0 && remoteVPCID != 0 {
+			proto := &trident.PeerConnection{
+				Id:          proto.Uint32(uint32(pc.ID)),
+				LocalEpcId:  proto.Uint32(uint32(localVPCID)),
+				RemoteEpcId: proto.Uint32(uint32(remoteVPCID)),
+			}
+			dpcData.addData(proto)
+			dpcData.addDomainData(pc.LocalDomain, proto)
+			continue
 		}
-		dpcData.addData(pc.Domain, data)
+
+		localVPCIDs := make([]int, 0)
+		if localVPCID == 0 {
+			localVPCIDs = rawData.domainUUIDToVPCIDs[pc.LocalDomain]
+		} else {
+			localVPCIDs = append(localVPCIDs, localVPCID)
+		}
+		remoteVPCIDs := make([]int, 0)
+		if remoteVPCID == 0 {
+			remoteVPCIDs = rawData.domainUUIDToVPCIDs[pc.RemoteDomain]
+		} else {
+			remoteVPCIDs = append(remoteVPCIDs, remoteVPCID)
+		}
+		for _, localVPCID := range localVPCIDs {
+			for _, remoteVPCID := range remoteVPCIDs {
+				if localVPCID == remoteVPCID {
+					continue
+				}
+				proto := &trident.PeerConnection{
+					Id:          proto.Uint32(uint32(pc.ID)),
+					LocalEpcId:  proto.Uint32(uint32(localVPCID)),
+					RemoteEpcId: proto.Uint32(uint32(remoteVPCID)),
+				}
+				dpcData.addData(proto)
+				dpcData.addDomainData(pc.LocalDomain, proto)
+				dpcData.addDomainData(pc.RemoteDomain, proto)
+			}
+		}
 	}
 
 	// Add CEN(Cloud Enterprise Network) data to peer connection.
 	// Associate cen.vpc_ids in pairs in one direction.
 	for _, cen := range dbDataCache.GetCENs() {
-		epcIDs, err := utils.ConvertStrToU32List(cen.VPCIDs)
+		epcIDs, err := ConvertStrToU32List(cen.VPCIDs)
 		if err != nil {
-			log.Error(err)
+			log.Error(p.Log(err.Error()))
 			continue
 		}
 		for i := 0; i < len(epcIDs); i++ {
@@ -249,7 +296,8 @@ func (p *PlatformDataOP) generatePeerConnections() {
 					LocalEpcId:  proto.Uint32(uint32(epcIDs[i])),
 					RemoteEpcId: proto.Uint32(uint32(epcIDs[j])),
 				}
-				dpcData.addData(cen.Domain, data)
+				dpcData.addData(data)
+				dpcData.addDomainData(cen.Domain, data)
 			}
 		}
 	}
@@ -295,6 +343,10 @@ func (p *PlatformDataOP) generateCIDRs() {
 			if network.IsVIP != 0 {
 				isVip = true
 			}
+			simplecidrType := trident.CidrType_LAN
+			if p.metaData.config.GetNoIPOverlapping() || network.NetType == NETWORK_TYPE_WAN {
+				simplecidrType = trident.CidrType_WAN
+			}
 			cidrType := trident.CidrType_LAN
 			if network.NetType == NETWORK_TYPE_WAN {
 				cidrType = trident.CidrType_WAN
@@ -311,7 +363,7 @@ func (p *PlatformDataOP) generateCIDRs() {
 			}
 			simplecidr := &trident.Cidr{
 				Prefix:   proto.String(prefix),
-				Type:     &cidrType,
+				Type:     &simplecidrType,
 				EpcId:    proto.Int32(int32(network.VPCID)),
 				RegionId: proto.Uint32(uint32(regionID)),
 				TunnelId: proto.Uint32(uint32(tunnelID)),
@@ -354,6 +406,10 @@ func (p *PlatformDataOP) generateCIDRs() {
 				tunnelID = vpc.TunnelID
 			}
 		}
+		simplecidrType := trident.CidrType_LAN
+		if p.metaData.config.GetNoIPOverlapping() || network.NetType == NETWORK_TYPE_WAN {
+			simplecidrType = trident.CidrType_WAN
+		}
 		cidrType := trident.CidrType_LAN
 		if network.NetType == NETWORK_TYPE_WAN {
 			cidrType = trident.CidrType_WAN
@@ -370,7 +426,7 @@ func (p *PlatformDataOP) generateCIDRs() {
 		}
 		simplecidr := &trident.Cidr{
 			Prefix:   proto.String(prefix),
-			Type:     &cidrType,
+			Type:     &simplecidrType,
 			EpcId:    proto.Int32(int32(network.VPCID)),
 			RegionId: proto.Uint32(uint32(regionID)),
 			TunnelId: proto.Uint32(uint32(tunnelID)),
@@ -391,7 +447,7 @@ func (p *PlatformDataOP) generateGProcessInfo() {
 	for _, process := range processes {
 		podId := rawData.containerIdToPodId[process.ContainerID]
 		p := &trident.GProcessInfo{
-			GprocessId: proto.Uint32(uint32(process.ID)),
+			GprocessId: proto.Uint32(process.GID),
 			VtapId:     proto.Uint32(uint32(process.VTapID)),
 			PodId:      proto.Uint32(uint32(podId)),
 			Pid:        proto.Uint32(uint32(process.PID)),
@@ -413,7 +469,7 @@ func (p *PlatformDataOP) generateIngesterPlatformData() {
 		domainPeerConnProto.peerConns, domainCIDRProto.cidrs, gprocessInfo)
 	oldIngesterPlatformData := p.GetAllPlatformDataForIngester()
 	if oldIngesterPlatformData.GetVersion() == 0 {
-		newIngesterPlatformData.setVersion(uint64(time.Now().Unix()))
+		newIngesterPlatformData.setVersion(uint64(p.metaData.GetStartTime()))
 		p.updateAllPlatformDataForIngester(newIngesterPlatformData)
 	} else if !newIngesterPlatformData.equal(oldIngesterPlatformData) {
 		newIngesterPlatformData.setVersion(oldIngesterPlatformData.GetVersion() + 1)
@@ -444,7 +500,7 @@ func (p *PlatformDataOP) generateIngesterPlatformData() {
 		regionData.setPlatformData(interfaces, nil, nil, nil)
 		regionToData[region.Lcuuid] = regionData
 	}
-	if !p.GetRegionToPlatformDataOnlyPod().checkVersion(regionToData) {
+	if !p.GetRegionToPlatformDataOnlyPod().checkVersion(regionToData, int(p.ORGID)) {
 		p.updateRegionToPlatformDataOnlyPod(regionToData)
 	}
 
@@ -456,13 +512,13 @@ func (p *PlatformDataOP) generateIngesterPlatformData() {
 		azData.setPlatformData(interfaces, nil, nil, nil)
 		azToData[az.Lcuuid] = azData
 	}
-	if !p.GetAZToPlatformDataOnlyPod().checkVersion(azToData) {
+	if !p.GetAZToPlatformDataOnlyPod().checkVersion(azToData, int(p.ORGID)) {
 		p.updateAZToPlatformDataOnlyPod(azToData)
 	}
 
-	log.Debug(p.GetRegionToPlatformDataOnlyPod())
-	log.Debug(p.GetAllPlatformDataForIngester())
-	log.Debug(p.GetAZToPlatformDataOnlyPod())
+	log.Debug(p.Logf("%s", p.GetRegionToPlatformDataOnlyPod()))
+	log.Debug(p.Logf("%s", p.GetAllPlatformDataForIngester()))
+	log.Debug(p.Logf("%s", p.GetAZToPlatformDataOnlyPod()))
 }
 
 func (p *PlatformDataOP) generateAllSimplePlatformData() {
@@ -485,7 +541,7 @@ func (p *PlatformDataOP) generateAllSimplePlatformData() {
 		aSPData.setVersion(pASPData.GetVersion() + 1)
 		p.updateAllsimpleplatformdata(aSPData)
 	}
-	log.Info(p.allSimplePlatformData)
+	log.Info(p.Logf("%s", p.allSimplePlatformData))
 
 	// 生成简化数据，不包括pod
 	aSPDExceptPod := NewPlatformData("", "", 0, ALL_SIMPLE_PLATFORM_DATA_EXCEPT_POD)
@@ -503,7 +559,7 @@ func (p *PlatformDataOP) generateAllSimplePlatformData() {
 		p.updateAllSimplePlatformDataExceptPod(aSPDExceptPod)
 	}
 
-	log.Info(p.allSimplePlatformDataExceptPod)
+	log.Info(p.Logf("%s", p.allSimplePlatformDataExceptPod))
 }
 
 func (p *PlatformDataOP) generateDomainPlatformData() {
@@ -563,13 +619,13 @@ func (p *PlatformDataOP) generateDomainPlatformData() {
 		p.updateNoDomainPlatformData(noDomainData)
 	}
 
-	if !p.GetDomainToAllPlatformData().checkVersion(dToAPData) {
+	if !p.GetDomainToAllPlatformData().checkVersion(dToAPData, int(p.ORGID)) {
 		p.updateDomainToAllPlatformData(dToAPData)
 	}
-	if !p.GetDomainToPlatformDataExceptPod().checkVersion(dToPDExceptPod) {
+	if !p.GetDomainToPlatformDataExceptPod().checkVersion(dToPDExceptPod, int(p.ORGID)) {
 		p.updateDomainToPlatformDataExceptPod(dToPDExceptPod)
 	}
-	if !p.GetDomainToPlatformDataOnlyPod().checkVersion(dToPDOnlyPod) {
+	if !p.GetDomainToPlatformDataOnlyPod().checkVersion(dToPDOnlyPod, int(p.ORGID)) {
 		p.updateDomainToPlatformDataOnlyPod(dToPDOnlyPod)
 	}
 }
@@ -690,7 +746,7 @@ func (p *PlatformDataOP) generateBasePlatformData() {
 	p.generateDomainPlatformData()
 	p.generatePodIPS()
 	elapsed := time.Since(start)
-	log.Info("generate platform data cost:", elapsed)
+	log.Info(p.Logf("generate platform data cost: %s", elapsed))
 }
 
 func (p *PlatformDataOP) initData() {
@@ -719,5 +775,8 @@ func (p *PlatformDataOP) GeneratePlatformData() {
 		p.generateBasePlatformData()
 		p.generateBaseSegments(newRawData)
 		p.putPlatformDataChange()
+		if p.notifyIngesterDataChanged != nil {
+			p.notifyIngesterDataChanged()
+		}
 	}
 }

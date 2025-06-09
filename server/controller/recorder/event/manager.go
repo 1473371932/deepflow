@@ -19,56 +19,67 @@ package event
 import (
 	"encoding/json"
 	"reflect"
+	"slices"
 	"time"
 
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
-	. "github.com/deepflowio/deepflow/server/controller/recorder/common"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/recorder/common"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 	"github.com/deepflowio/deepflow/server/libs/eventapi"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 )
 
-type EventManagerBase struct {
+type ManagerComponent struct {
 	resourceType string
-	ToolDataSet  *tool.DataSet
 	Queue        *queue.OverwriteQueue
 }
 
-type ResourceEventToMySQL struct {
-	eventapi.ResourceEvent
+func newManagerComponent(rt string, q *queue.OverwriteQueue) ManagerComponent {
+	return ManagerComponent{
+		resourceType: rt,
+		Queue:        q,
+	}
 }
 
-func (e *EventManagerBase) createAndEnqueue(
+// TODO remove
+func (e *ManagerComponent) createInstanceAndEnqueue(
+	md *message.Metadata,
 	resourceLcuuid, eventType, instanceName string, instanceType, instanceID int, options ...eventapi.TagFieldOption) {
+	options = append(
+		options,
+		eventapi.TagInstanceType(uint32(instanceType)),
+		eventapi.TagInstanceID(uint32(instanceID)),
+		eventapi.TagInstanceName(instanceName))
+
+	e.createAndEnqueue(md, resourceLcuuid, eventType, options...)
+}
+
+func (e *ManagerComponent) createAndEnqueue(
+	md *message.Metadata, resourceLcuuid, eventType string, options ...eventapi.TagFieldOption) {
 	// use interface in eventapi to create ResourceEvent instance which will be enqueued, because we need to manually free instance memory
 	event := eventapi.AcquireResourceEvent()
-	e.fillEvent(event, eventType, instanceName, instanceType, instanceID, options...)
-	e.enqueue(resourceLcuuid, event)
+	e.fillEvent(md, event, eventType, options...)
+	e.enqueue(md, resourceLcuuid, event)
 }
 
-func (e *EventManagerBase) createProcessAndEnqueue(
-	resourceLcuuid, eventType, instanceName string, instanceType, instanceID int, options ...eventapi.TagFieldOption) {
-	// use interface in eventapi to create ResourceEvent instance which will be enqueued, because we need to manually free instance memory
-	event := eventapi.AcquireResourceEvent()
-	e.fillEvent(event, eventType, instanceName, instanceType, instanceID, options...)
-	// add process info
-	event.GProcessID = uint32(instanceID)
-	event.GProcessName = instanceName
-	e.enqueue(resourceLcuuid, event)
-}
-
-func (e EventManagerBase) fillEvent(
+func (e ManagerComponent) fillEvent(
+	md *message.Metadata,
 	event *eventapi.ResourceEvent,
-	eventType, instanceName string, instanceType, instanceID int, options ...eventapi.TagFieldOption,
+	eventType string, options ...eventapi.TagFieldOption,
 ) {
+	event.ORGID = uint16(md.GetORGID())
+	event.TeamID = uint16(md.GetTeamID())
 	event.Time = time.Now().Unix()
 	event.TimeMilli = time.Now().UnixMilli()
 	event.Type = eventType
-	event.InstanceType = uint32(instanceType)
-	event.InstanceID = uint32(instanceID)
-	event.InstanceName = instanceName
 	event.IfNeedTagged = true
-	if eventType == eventapi.RESOURCE_EVENT_TYPE_CREATE || eventType == eventapi.RESOURCE_EVENT_TYPE_ADD_IP {
+	if slices.Contains([]string{
+		eventapi.RESOURCE_EVENT_TYPE_CREATE,
+		eventapi.RESOURCE_EVENT_TYPE_ADD_IP,
+		eventapi.RESOURCE_EVENT_TYPE_ADD_CONFIG_MAP,
+		eventapi.RESOURCE_EVENT_TYPE_UPDATE_CONFIG_MAP,
+		eventapi.RESOURCE_EVENT_TYPE_DELETE_CONFIG_MAP,
+	}, eventType) {
 		event.IfNeedTagged = false
 	}
 	for _, option := range options {
@@ -76,55 +87,70 @@ func (e EventManagerBase) fillEvent(
 	}
 }
 
-func (e *EventManagerBase) enqueue(resourceLcuuid string, event *eventapi.ResourceEvent) {
+func (e *ManagerComponent) enqueue(md *message.Metadata, resourceLcuuid string, event *eventapi.ResourceEvent) {
 	rt := e.resourceType
 	if rt == "" {
-		rt = DEVICE_TYPE_INT_TO_STR[int(event.InstanceType)]
+		rt = common.DEVICE_TYPE_INT_TO_STR[int(event.InstanceType)]
 	}
-	log.Infof("put %s event (lcuuid: %s): %+v into shared queue", rt, resourceLcuuid, event)
+	log.Infof("put %s event (lcuuid: %s): %+v into shared queue", rt, resourceLcuuid, event, md.LogPrefixes)
 	err := e.Queue.Put(event)
 	if err != nil {
-		log.Error(putEventIntoQueueFailed(rt, err))
+		log.Error(putEventIntoQueueFailed(rt, err), md.LogPrefixes)
 	}
+}
+
+func (e *ManagerComponent) enqueueInstanceIfInsertIntoMySQLFailed(
+	md *message.Metadata,
+	resourceLcuuid, domainLcuuid, eventType, instanceName string, instanceType, instanceID int, options ...eventapi.TagFieldOption,
+) {
+	options = append(
+		options,
+		eventapi.TagInstanceType(uint32(instanceType)),
+		eventapi.TagInstanceID(uint32(instanceID)),
+		eventapi.TagInstanceName(instanceName))
+
+	e.enqueueIfInsertIntoMySQLFailed(md, resourceLcuuid, domainLcuuid, eventType, options...)
 }
 
 // Due to the fixed sequence of resource learning, some data required by resource change events can only be obtained after the completion of subsequent resource learning.
-// Therefore, we need to store the change event temporarily until all resources are learned and the required data is filled before the queue is added
+// Therefore, we need to store the change event temporarily until all resources are learned and the required data is filled before the queue is added.
 // Such change events include:
 // - PodNode's/POD's create event, PodNode's/POD's add-ip event, fill in the L3Device information and HostID as required
 // - POD's recreate event, requires real-time IPs information
-func (e *EventManagerBase) enqueueIfInsertIntoMySQLFailed(
-	resourceLcuuid, domainLcuuid string, eventType, instanceName string, instanceType, instanceID int, options ...eventapi.TagFieldOption,
+// - ConfigMap's create event, ConfigMap's update event, ConfigMap's delete event, requires real-time PodGroup-ConfigMap connection information
+// If the event is not stored in MySQL, it will be directly enqueued.
+func (e *ManagerComponent) enqueueIfInsertIntoMySQLFailed(
+	md *message.Metadata,
+	resourceLcuuid, domainLcuuid, eventType string, options ...eventapi.TagFieldOption,
 ) {
 	// use struct to create ResourceEvent instance if it will be stored in MySQL
 	event := &eventapi.ResourceEvent{}
-	e.fillEvent(event, eventType, instanceName, instanceType, instanceID, options...)
+	e.fillEvent(md, event, eventType, options...)
 	content, err := json.Marshal(event)
 	if err != nil {
-		log.Errorf("json marshal event (detail: %#v) failed: %s", event, err.Error())
+		log.Errorf("json marshal event (detail: %#v) failed: %s", event, err.Error(), md.LogPrefixes)
 	} else {
-		dbItem := mysql.ResourceEvent{
+		dbItem := metadbmodel.ResourceEvent{
 			Domain:  domainLcuuid,
 			Content: string(content),
 		}
-		err = mysql.Db.Create(&dbItem).Error
-		if err != nil {
-			log.Errorf("add resource_event (detail: %#v) failed: %s", dbItem, err.Error())
-		} else {
-			log.Infof("create resource_event (detail: %#v) success", dbItem)
+		if err = md.GetDB().Create(&dbItem).Error; err == nil {
+			log.Infof("create resource_event (detail: %#v) success", dbItem, md.LogPrefixes)
 			return
 		}
+		log.Errorf("add resource_event (detail: %#v) failed: %s", dbItem, err.Error(), md.LogPrefixes)
 	}
 
-	e.convertAndEnqueue(resourceLcuuid, event)
+	e.convertAndEnqueue(md, resourceLcuuid, event)
 }
 
-func (e *EventManagerBase) convertAndEnqueue(resourceLcuuid string, ev *eventapi.ResourceEvent) {
+func (e *ManagerComponent) convertAndEnqueue(md *message.Metadata, resourceLcuuid string, ev *eventapi.ResourceEvent) {
 	event := e.convertToEventBeEnqueued(ev)
-	e.enqueue(resourceLcuuid, event)
+	log.Infof("TODO: put event (lcuuid: %s): %#v into shared queue", resourceLcuuid, event, md.LogPrefixes)
+	e.enqueue(md, resourceLcuuid, event)
 }
 
-func (e *EventManagerBase) convertToEventBeEnqueued(ev *eventapi.ResourceEvent) *eventapi.ResourceEvent {
+func (e *ManagerComponent) convertToEventBeEnqueued(ev *eventapi.ResourceEvent) *eventapi.ResourceEvent {
 	event := eventapi.AcquireResourceEvent()
 	if ev == nil {
 		return event

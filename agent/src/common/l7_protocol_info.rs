@@ -16,28 +16,29 @@
 
 use std::sync::atomic::Ordering;
 
-use super::{flow::PacketDirection, l7_protocol_log::KafkaInfoCache};
+use super::flow::PacketDirection;
 use enum_dispatch::enum_dispatch;
 use log::{debug, error, warn};
 use serde::Serialize;
 
 use crate::{
-    common::l7_protocol_log::LogCache,
+    common::l7_protocol_log::{LogCache, LogCacheKey},
     flow_generator::{
         protocol_logs::{
-            fastcgi::FastCGIInfo, pb_adapter::L7ProtocolSendLog, AmqpInfo, DnsInfo, DubboInfo,
-            HttpInfo, KafkaInfo, MongoDBInfo, MqttInfo, MysqlInfo, OpenWireInfo, OracleInfo,
-            PostgreInfo, RedisInfo, SofaRpcInfo, TlsInfo,
+            fastcgi::FastCGIInfo, pb_adapter::L7ProtocolSendLog, AmqpInfo, BrpcInfo, DnsInfo,
+            DubboInfo, HttpInfo, KafkaInfo, MemcachedInfo, MongoDBInfo, MqttInfo, MysqlInfo,
+            NatsInfo, OpenWireInfo, PingInfo, PostgreInfo, PulsarInfo, RedisInfo, RocketmqInfo,
+            SofaRpcInfo, TarsInfo, ZmtpInfo,
         },
         AppProtoHead, LogMessageType, Result,
     },
     plugin::CustomInfo,
 };
 
-use super::{ebpf::EbpfType, l7_protocol_log::ParseParam};
+use super::l7_protocol_log::ParseParam;
 
 macro_rules! all_protocol_info {
-    ($($name:ident($info_struct:ident)),+$(,)?) => {
+    ($($name:ident($info_struct:ty)),+$(,)?) => {
 
         #[derive(Serialize, Debug, Clone)]
         #[enum_dispatch]
@@ -60,25 +61,64 @@ macro_rules! all_protocol_info {
     };
 }
 
-all_protocol_info!(
-    DnsInfo(DnsInfo),
-    HttpInfo(HttpInfo),
-    MysqlInfo(MysqlInfo),
-    RedisInfo(RedisInfo),
-    MongoDBInfo(MongoDBInfo),
-    DubboInfo(DubboInfo),
-    FastCGIInfo(FastCGIInfo),
-    KafkaInfo(KafkaInfo),
-    MqttInfo(MqttInfo),
-    AmqpInfo(AmqpInfo),
-    PostgreInfo(PostgreInfo),
-    OracleInfo(OracleInfo),
-    SofaRpcInfo(SofaRpcInfo),
-    TlsInfo(TlsInfo),
-    CustomInfo(CustomInfo),
-    OpenWireInfo(OpenWireInfo),
-    // add new protocol info below
-);
+cfg_if::cfg_if! {
+    if #[cfg(not(feature = "enterprise"))] {
+        all_protocol_info!(
+            DnsInfo(DnsInfo),
+            HttpInfo(HttpInfo),
+            MysqlInfo(MysqlInfo),
+            RedisInfo(RedisInfo),
+            MongoDBInfo(MongoDBInfo),
+            MemcachedInfo(MemcachedInfo),
+            DubboInfo(DubboInfo),
+            FastCGIInfo(FastCGIInfo),
+            BrpcInfo(BrpcInfo),
+            TarsInfo(TarsInfo),
+            KafkaInfo(KafkaInfo),
+            MqttInfo(MqttInfo),
+            AmqpInfo(AmqpInfo),
+            NatsInfo(NatsInfo),
+            PulsarInfo(PulsarInfo),
+            ZmtpInfo(ZmtpInfo),
+            RocketmqInfo(RocketmqInfo),
+            PostgreInfo(PostgreInfo),
+            OpenWireInfo(OpenWireInfo),
+            SofaRpcInfo(SofaRpcInfo),
+            PingInfo(PingInfo),
+            CustomInfo(CustomInfo),
+            // add new protocol info below
+        );
+    } else {
+        all_protocol_info!(
+            DnsInfo(DnsInfo),
+            HttpInfo(HttpInfo),
+            MysqlInfo(MysqlInfo),
+            RedisInfo(RedisInfo),
+            MongoDBInfo(MongoDBInfo),
+            MemcachedInfo(MemcachedInfo),
+            DubboInfo(DubboInfo),
+            FastCGIInfo(FastCGIInfo),
+            BrpcInfo(BrpcInfo),
+            TarsInfo(TarsInfo),
+            KafkaInfo(KafkaInfo),
+            MqttInfo(MqttInfo),
+            AmqpInfo(AmqpInfo),
+            NatsInfo(NatsInfo),
+            PulsarInfo(PulsarInfo),
+            ZmtpInfo(ZmtpInfo),
+            RocketmqInfo(RocketmqInfo),
+            PostgreInfo(PostgreInfo),
+            OpenWireInfo(OpenWireInfo),
+            OracleInfo(crate::flow_generator::protocol_logs::sql::OracleInfo),
+            SofaRpcInfo(SofaRpcInfo),
+            TlsInfo(crate::flow_generator::protocol_logs::tls::TlsInfo),
+            SomeIpInfo(crate::flow_generator::protocol_logs::rpc::SomeIpInfo),
+            PingInfo(PingInfo),
+            CustomInfo(CustomInfo),
+            // add new protocol info below
+        );
+    }
+}
 
 #[enum_dispatch(L7ProtocolInfo)]
 pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
@@ -98,6 +138,10 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
 
     fn get_endpoint(&self) -> Option<String> {
         None
+    }
+
+    fn get_biz_type(&self) -> u8 {
+        0
     }
 
     fn skip_send(&self) -> bool {
@@ -120,28 +164,6 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
         (false, false)
     }
 
-    fn cal_cache_key(&self, param: &ParseParam) -> u128 {
-        /*
-            if session id is some: flow id 64bit | 0 32bit | session id 32bit
-            if session id is none: flow id 64bit | packet_seq 64bit
-        */
-        match self.session_id() {
-            Some(sid) => ((param.flow_id as u128) << 64) | sid as u128,
-            None => {
-                ((param.flow_id as u128) << 64)
-                    | (if param.ebpf_type != EbpfType::None {
-                        if param.direction == PacketDirection::ClientToServer {
-                            param.packet_seq + 1
-                        } else {
-                            param.packet_seq
-                        }
-                    } else {
-                        0
-                    }) as u128
-            }
-        }
-    }
-
     /*
         calculate rrt
         if have previous log cache:
@@ -154,30 +176,32 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
 
         if have no previous log cache, cache the current log rrt
     */
-    fn cal_rrt(&self, param: &ParseParam, kafka_info: Option<KafkaInfoCache>) -> Option<u64> {
+    fn cal_rrt(
+        &self,
+        param: &ParseParam,
+        endpoint: &Option<String>,
+    ) -> Option<(u64, Option<String>)> {
         let mut perf_cache = param.l7_perf_cache.borrow_mut();
-        let cache_key = self.cal_cache_key(param);
-        let previous_log_info = perf_cache.rrt_cache.pop(&cache_key);
+        let cache_key = LogCacheKey::new(param, self.session_id());
+        let previous_log_info = perf_cache.pop(cache_key);
 
         let time = param.time;
         let msg_type: LogMessageType = param.direction.into();
         let timeout = param.rrt_timeout as u64;
 
         if time != 0 {
-            let (in_cached_req, timeout_count) = perf_cache
-                .timeout_cache
-                .get_or_insert_mut(param.flow_id, || (0, 0));
+            let (in_cached_req, timeout_count) = perf_cache.get_or_insert_mut(param.flow_id);
 
-            let Some(previous_log_info) = previous_log_info else {
+            let Some(mut previous_log_info) = previous_log_info else {
                 if msg_type == LogMessageType::Request {
                     *in_cached_req += 1;
                 }
                 perf_cache.put(
                     cache_key,
                     LogCache {
+                        endpoint: endpoint.clone(),
                         msg_type: param.direction.into(),
                         time: param.time,
-                        kafka_info,
                         multi_merge_info: None,
                     },
                 );
@@ -206,20 +230,10 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
                 // timeout, save the latest
                 if rrt > timeout {
                     *timeout_count += 1;
-                    perf_cache.rrt_cache.put(
-                        cache_key,
-                        LogCache {
-                            msg_type: param.direction.into(),
-                            time: param.time,
-                            kafka_info,
-                            multi_merge_info: None,
-                        },
-                    );
                     None
                 } else {
-                    Some(rrt)
+                    Some((rrt, previous_log_info.endpoint.take()))
                 }
-
             // if previous is resp and current is req and previous time gt current time, likely ebpf disorder,
             // calculate the round trip time.
             } else if previous_log_info.msg_type == LogMessageType::Response
@@ -230,12 +244,10 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
                 if rrt > timeout {
                     // disorder info rrt unlikely have large rrt gt timeout
                     warn!("l7 log info disorder with long time rrt {}", rrt);
-                    // timeout, save latest
                     *timeout_count += 1;
-                    perf_cache.rrt_cache.put(cache_key, previous_log_info);
                     None
                 } else {
-                    Some(rrt)
+                    Some((rrt, None))
                 }
             } else {
                 debug!(
@@ -251,7 +263,7 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
                     if previous_log_info.msg_type == LogMessageType::Request {
                         *in_cached_req += 1;
                     }
-                    perf_cache.rrt_cache.put(cache_key, previous_log_info);
+                    perf_cache.put(cache_key, previous_log_info);
                 } else {
                     if previous_log_info.msg_type == LogMessageType::Request {
                         *timeout_count += 1;
@@ -259,12 +271,12 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
                     if msg_type == LogMessageType::Request {
                         *in_cached_req += 1;
                     }
-                    perf_cache.rrt_cache.put(
+                    perf_cache.put(
                         cache_key,
                         LogCache {
+                            endpoint: endpoint.clone(),
                             msg_type: param.direction.into(),
                             time: param.time,
-                            kafka_info,
                             multi_merge_info: None,
                         },
                     );
@@ -286,12 +298,16 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
 
     // must have request id
     // the main different with cal_rrt() is need to push back to lru when session not end
-    fn cal_rrt_for_multi_merge_log(&self, param: &ParseParam) -> Option<u64> {
+    fn cal_rrt_for_multi_merge_log(
+        &self,
+        param: &ParseParam,
+        endpoint: &Option<String>,
+    ) -> Option<(u64, Option<String>)> {
         assert!(self.session_id().is_some());
 
         let mut perf_cache = param.l7_perf_cache.borrow_mut();
-        let cache_key = self.cal_cache_key(param);
-        let previous_log_info = perf_cache.rrt_cache.pop(&cache_key);
+        let cache_key = LogCacheKey::new(param, self.session_id());
+        let previous_log_info = perf_cache.pop(cache_key);
 
         let time = param.time;
         let msg_type: LogMessageType = param.direction.into();
@@ -302,9 +318,7 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
             return None;
         }
 
-        let (in_cached_req, timeout_count) = perf_cache
-            .timeout_cache
-            .get_or_insert_mut(param.flow_id, || (0, 0));
+        let (in_cached_req, timeout_count) = perf_cache.get_or_insert_mut(param.flow_id);
 
         let (req_end, resp_end) = {
             let (req_end, resp_end) = self.is_req_resp_end();
@@ -321,9 +335,9 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
             perf_cache.put(
                 cache_key,
                 LogCache {
+                    endpoint: endpoint.clone(),
                     msg_type: param.direction.into(),
                     time: param.time,
-                    kafka_info: None,
                     multi_merge_info: Some((req_end, resp_end, false)),
                 },
             );
@@ -387,11 +401,15 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
                 }
                 None
             } else {
-                Some(rrt)
+                if msg_type == LogMessageType::Response {
+                    Some((rrt, previous_log_info.endpoint.clone()))
+                } else {
+                    Some((rrt, None))
+                }
             };
 
             if put_back {
-                perf_cache.rrt_cache.put(cache_key, previous_log_info);
+                perf_cache.put(cache_key, previous_log_info);
             }
             r
         } else {
@@ -399,7 +417,7 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
                 *timeout_count += 1;
             }
             if put_back {
-                perf_cache.rrt_cache.put(cache_key, previous_log_info);
+                perf_cache.put(cache_key, previous_log_info);
             }
             None
         }
@@ -407,6 +425,18 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
 
     fn tcp_seq_offset(&self) -> u32 {
         return 0;
+    }
+
+    fn get_request_domain(&self) -> String {
+        String::default()
+    }
+
+    fn get_request_resource_length(&self) -> usize {
+        0
+    }
+
+    fn is_on_blacklist(&self) -> bool {
+        false
     }
 }
 

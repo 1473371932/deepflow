@@ -27,7 +27,8 @@ import (
 	"github.com/google/uuid"
 
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	rcommon "github.com/deepflowio/deepflow/server/controller/recorder/common"
 	"github.com/deepflowio/deepflow/server/controller/recorder/config"
@@ -52,7 +53,7 @@ func BenchmarkAdd(b *testing.B) {
 	fmt.Printf("第%d次\n", times)
 	cfg := config.RecorderConfig{CacheRefreshInterval: 3600}
 	for i := 0; i < len(cloudData); i++ {
-		recorder := NewRecorder(domainLcuuids[i], domainName[i], cfg, context.Background(), nil)
+		recorder := NewRecorder(domainLcuuids[i], domainNames[i], cfg, context.Background(), nil)
 		recorder.Start()
 		time.Sleep(time.Second * 1)
 		recorder.Refresh(cloudData[i])
@@ -69,27 +70,27 @@ func BenchmarkAdd(b *testing.B) {
 
 func TestMain(m *testing.M) {
 	clearDBFile()
-	mysql.Db = test.GetDB(TEST_DB_FILE)
+	metadb.DefaultDB = test.GetDB(TEST_DB_FILE)
 	for _, val := range test.GetModels() {
-		mysql.Db.AutoMigrate(val)
+		metadb.DefaultDB.AutoMigrate(val)
 	}
 
 	for i := 0; i < 1; i++ {
-		domain := new(mysql.Domain)
+		domain := new(metadbmodel.Domain)
 		domain.Lcuuid = uuid.NewString()
 		domain.Name = fmt.Sprintf("第 %d 次性能测试", i)
-		mysql.Db.Create(&domain)
+		metadb.DefaultDB.Create(&domain)
 		domainLcuuids = append(domainLcuuids, domain.Lcuuid)
 		domainNames = append(domainNames, domain.Name)
 		cloudData = append(cloudData, test.NewCloudResource(1))
 	}
-	publicNetwork := new(mysql.Network)
+	publicNetwork := new(metadbmodel.Network)
 	publicNetwork.Lcuuid = rcommon.PUBLIC_NETWORK_LCUUID
-	mysql.Db.Create(&publicNetwork)
+	metadb.DefaultDB.Create(&publicNetwork)
 
 	exitCode := m.Run()
 
-	sqlDB, _ := mysql.Db.DB()
+	sqlDB, _ := metadb.DefaultDB.DB()
 	defer sqlDB.Close()
 	clearDBFile()
 	os.Exit(exitCode)

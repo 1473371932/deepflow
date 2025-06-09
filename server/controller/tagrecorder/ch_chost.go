@@ -17,82 +17,98 @@
 package tagrecorder
 
 import (
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"gorm.io/gorm/clause"
+
+	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type ChChost struct {
-	UpdaterBase[mysql.ChChost, IDKey]
+	SubscriberComponent[
+		*message.VMAdd,
+		message.VMAdd,
+		*message.VMFieldsUpdate,
+		message.VMFieldsUpdate,
+		*message.VMDelete,
+		message.VMDelete,
+		metadbmodel.VM,
+		metadbmodel.ChChost,
+		IDKey,
+	]
 }
 
 func NewChChost() *ChChost {
-	updater := &ChChost{
-		UpdaterBase[mysql.ChChost, IDKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_CHOST,
-		},
+	mng := &ChChost{
+		newSubscriberComponent[
+			*message.VMAdd,
+			message.VMAdd,
+			*message.VMFieldsUpdate,
+			message.VMFieldsUpdate,
+			*message.VMDelete,
+			message.VMDelete,
+			metadbmodel.VM,
+			metadbmodel.ChChost,
+			IDKey,
+		](
+			common.RESOURCE_TYPE_VM_EN, RESOURCE_TYPE_CH_CHOST,
+		),
 	}
-	updater.dataGenerator = updater
-	return updater
+	mng.subscriberDG = mng
+	return mng
 }
 
-func (p *ChChost) generateNewData() (map[IDKey]mysql.ChChost, bool) {
-	var (
-		chosts []mysql.VM
-		hosts  []mysql.Host
-	)
-	err := mysql.Db.Unscoped().Find(&chosts).Error
-	if err != nil {
-		log.Errorf(dbQueryResourceFailed(p.resourceTypeName, err))
-		return nil, false
-	}
-	err = mysql.Db.Unscoped().Select("id", "ip").Find(&hosts).Error
-	if err != nil {
-		log.Errorf(dbQueryResourceFailed(p.resourceTypeName, err))
-		return nil, false
+// sourceToTarget implements SubscriberDataGenerator
+func (c *ChChost) sourceToTarget(md *message.Metadata, source *metadbmodel.VM) (keys []IDKey, targets []metadbmodel.ChChost) {
+	sourceName := source.Name
+	if source.DeletedAt.Valid {
+		sourceName += " (deleted)"
 	}
 
-	ipToHostID := make(map[string]int, len(hosts))
-	for _, host := range hosts {
-		ipToHostID[host.IP] = host.ID
-	}
-
-	keyToItem := make(map[IDKey]mysql.ChChost)
-	for _, chost := range chosts {
-		if chost.DeletedAt.Valid {
-			keyToItem[IDKey{ID: chost.ID}] = mysql.ChChost{
-				ID:      chost.ID,
-				Name:    chost.Name + " (deleted)",
-				L3EPCID: chost.VPCID,
-				HostID:  ipToHostID[chost.LaunchServer],
-			}
-		} else {
-			keyToItem[IDKey{ID: chost.ID}] = mysql.ChChost{
-				ID:      chost.ID,
-				Name:    chost.Name,
-				L3EPCID: chost.VPCID,
-				HostID:  ipToHostID[chost.LaunchServer],
-			}
-		}
-	}
-	return keyToItem, true
+	keys = append(keys, IDKey{ID: source.ID})
+	targets = append(targets, metadbmodel.ChChost{
+		ChIDBase: metadbmodel.ChIDBase{ID: source.ID},
+		Name:     sourceName,
+		L3EPCID:  source.VPCID,
+		HostID:   source.HostID,
+		Hostname: source.Hostname,
+		IP:       source.IP,
+		TeamID:   md.TeamID,
+		DomainID: md.DomainID,
+		SubnetID: source.NetworkID,
+	})
+	return
 }
 
-func (p *ChChost) generateKey(dbItem mysql.ChChost) IDKey {
-	return IDKey{ID: dbItem.ID}
-}
-
-func (p *ChChost) generateUpdateInfo(oldItem, newItem mysql.ChChost) (map[string]interface{}, bool) {
+// onResourceUpdated implements SubscriberDataGenerator
+func (c *ChChost) onResourceUpdated(sourceID int, fieldsUpdate *message.VMFieldsUpdate, db *metadb.DB) {
 	updateInfo := make(map[string]interface{})
-	if oldItem.Name != newItem.Name {
-		updateInfo["name"] = newItem.Name
+	if fieldsUpdate.Name.IsDifferent() {
+		updateInfo["name"] = fieldsUpdate.Name.GetNew()
 	}
-	if oldItem.L3EPCID != newItem.L3EPCID {
-		updateInfo["l3_epc_id"] = newItem.L3EPCID
+	if fieldsUpdate.VPCID.IsDifferent() {
+		updateInfo["l3_epc_id"] = fieldsUpdate.VPCID.GetNew()
 	}
-	if oldItem.HostID != newItem.HostID {
-		updateInfo["host_id"] = newItem.HostID
+	if fieldsUpdate.HostID.IsDifferent() {
+		updateInfo["host_id"] = fieldsUpdate.HostID.GetNew()
 	}
-	if len(updateInfo) > 0 {
-		return updateInfo, true
+	if fieldsUpdate.Hostname.IsDifferent() {
+		updateInfo["hostname"] = fieldsUpdate.Hostname.GetNew()
 	}
-	return nil, false
+	if fieldsUpdate.IP.IsDifferent() {
+		updateInfo["ip"] = fieldsUpdate.IP.GetNew()
+	}
+	if fieldsUpdate.NetworkID.IsDifferent() {
+		updateInfo["subnet_id"] = fieldsUpdate.NetworkID.GetNew()
+	}
+	c.updateOrSync(db, IDKey{ID: sourceID}, updateInfo)
+}
+
+// softDeletedTargetsUpdated implements SubscriberDataGenerator
+func (c *ChChost) softDeletedTargetsUpdated(targets []metadbmodel.ChChost, db *metadb.DB) {
+	db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"name"}),
+	}).Create(&targets)
 }

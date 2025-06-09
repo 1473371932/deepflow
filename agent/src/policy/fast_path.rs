@@ -16,12 +16,13 @@
 
 use std::cmp::max;
 use std::net::IpAddr;
-use std::sync::{Arc, RwLock};
-use std::thread;
-use std::time::Duration;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, RwLock,
+};
 
 use ipnet::{IpNet, Ipv4Net};
-use log::{info, warn};
+use log::warn;
 use lru::LruCache;
 
 use crate::common::endpoint::{EndpointData, EndpointStore};
@@ -34,6 +35,63 @@ use npb_pcap_policy::PolicyData;
 const MAX_ACL_PROTOCOL: usize = 255;
 const MAX_TAP_TYPE: usize = 256;
 const MAX_FAST_PATH: usize = MAX_TAP_TYPE * (super::MAX_QUEUE_COUNT + 1);
+const NET_IP_MAX: u32 = 32;
+const NET_IP_LEN: u32 = 16;
+const NET_IP_MASK: u32 = u32::MAX << NET_IP_LEN;
+// MAX_COPY_ON_WRITE = QUEUE_COUNT(8) * TAP_TYPE_COUNT(16)
+const MAX_COPY_ON_WRITE: usize = 8 * 16;
+
+#[inline]
+fn generate_mask_ip(netmask_table: &Vec<u32>, ip_src: IpAddr, ip_dst: IpAddr) -> (u32, u32) {
+    match (ip_src, ip_dst) {
+        (IpAddr::V4(src_addr), IpAddr::V4(dst_addr)) => {
+            let src = u32::from_be_bytes(src_addr.octets());
+            let dst = u32::from_be_bytes(dst_addr.octets());
+            let mut src_mask = netmask_table[(src >> NET_IP_LEN) as usize];
+            let mut dst_mask = netmask_table[(dst >> NET_IP_LEN) as usize];
+            // The EPC of the local link IP and private IP is 0, which needs to be
+            // distinguished from other internet IP to avoid querying incorrect EPC.
+            // The longest netmask between local link IP and private IP is used to
+            // ensure accurate queries.
+            if src_addr.is_link_local() || src_addr.is_private() {
+                src_mask = src_mask.max(NET_IP_MASK);
+            }
+            if dst_addr.is_link_local() || dst_addr.is_private() {
+                dst_mask = dst_mask.max(NET_IP_MASK);
+            }
+            return (src & src_mask, dst & dst_mask);
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            let src = u128::from_be_bytes(src.octets());
+            let dst = u128::from_be_bytes(dst.octets());
+            return (
+                src as u32 ^ (src >> 32) as u32 ^ (src >> 64) as u32 ^ (src >> 96) as u32,
+                dst as u32 ^ (dst >> 32) as u32 ^ (dst >> 64) as u32 ^ (dst >> 96) as u32,
+            );
+        }
+        _ => {
+            warn!(
+                    "IpAddr({:?} and {:?}) is invalid: ip address version is inconsistent, deepflow-agent restart...\n",
+                    ip_src, ip_dst,
+                );
+            crate::utils::clean_and_exit(1);
+            return (0, 0);
+        }
+    }
+}
+
+#[inline]
+fn generate_map_key(netmask_table: &Vec<u32>, key: &LookupKey) -> (u64, u64) {
+    let (src_masked_ip, dst_masked_ip) = generate_mask_ip(netmask_table, key.src_ip, key.dst_ip);
+
+    key.fast_key(src_masked_ip, dst_masked_ip)
+}
+
+#[inline]
+fn interest_table_map(interest_table: &Vec<PortRange>, key: &mut LookupKey) {
+    key.src_port = interest_table[key.src_port as usize].min();
+    key.dst_port = interest_table[key.dst_port as usize].min();
+}
 
 type TableLruCache = LruCache<u128, PolicyTableItem>;
 
@@ -43,31 +101,178 @@ struct PolicyTableItem {
     protocol_table: [Option<Arc<PolicyData>>; MAX_ACL_PROTOCOL + 1],
 }
 
+struct FastPathMap {
+    interest_table: Vec<PortRange>,
+    netmask_table: Vec<u32>,
+    policy_table: TableLruCache,
+}
+
+impl FastPathMap {
+    #[inline]
+    fn new(interest_table: Vec<PortRange>, netmask_table: Vec<u32>, map_size: usize) -> Self {
+        FastPathMap {
+            interest_table,
+            netmask_table,
+            policy_table: LruCache::new(map_size.try_into().unwrap()),
+        }
+    }
+
+    #[inline]
+    fn clear(&mut self, interest_table: Vec<PortRange>, netmask_table: Vec<u32>) {
+        self.interest_table = interest_table;
+        self.netmask_table = netmask_table;
+        self.policy_table.clear();
+    }
+
+    #[inline]
+    fn add_policy(
+        &mut self,
+        packet: &mut LookupKey,
+        policy: &PolicyData,
+        endpoints: EndpointData,
+    ) -> (Arc<PolicyData>, Arc<EndpointData>) {
+        interest_table_map(&self.interest_table, packet);
+
+        let acl_id = policy.acl_id;
+        let (key_0, key_1) = generate_map_key(&self.netmask_table, packet);
+        let proto = u8::from(packet.proto) as usize;
+        let key = (key_0 as u128) << 64 | key_1 as u128;
+        let table = &mut self.policy_table;
+
+        let mut forward = PolicyData::default();
+        if acl_id > 0 {
+            forward.merge_and_dedup_npb_actions(&policy.npb_actions, acl_id, false);
+            forward.format_npb_action();
+        }
+
+        let (forward_policy, forward_endpoints) = if let Some(item) = table.get_mut(&key) {
+            let forward_policy = Arc::new(forward.clone());
+            item.protocol_table[proto] = Some(forward_policy.clone());
+            let forward_endpoints = item.store.get(
+                packet.l2_end_0,
+                packet.l2_end_1,
+                packet.l3_end_0,
+                packet.l3_end_1,
+            );
+            (forward_policy, forward_endpoints)
+        } else {
+            let mut item = PolicyTableItem {
+                store: EndpointStore::from(endpoints),
+                protocol_table: unsafe { std::mem::zeroed() },
+            };
+            let forward_policy = Arc::new(forward.clone());
+            let forward_endpoints = item.store.get(
+                packet.l2_end_0,
+                packet.l2_end_1,
+                packet.l3_end_0,
+                packet.l3_end_1,
+            );
+            item.protocol_table[proto] = Some(forward_policy.clone());
+            table.put(key, item);
+
+            (forward_policy, forward_endpoints)
+        };
+
+        if key_0 == key_1 {
+            return (forward_policy, forward_endpoints);
+        }
+
+        let mut backward = PolicyData::default();
+        if acl_id > 0 {
+            backward.merge_and_dedup_npb_actions(&policy.npb_actions, acl_id, true);
+            backward.format_npb_action();
+        }
+
+        let (key_0, key_1) = (key_1, key_0);
+        let key = (key_0 as u128) << 64 | key_1 as u128;
+        if let Some(item) = table.get_mut(&key) {
+            item.protocol_table[proto] = Some(Arc::new(backward.clone()));
+        } else {
+            let endpoints = EndpointData {
+                src_info: endpoints.dst_info,
+                dst_info: endpoints.src_info,
+            };
+            let mut item = PolicyTableItem {
+                store: EndpointStore::from(endpoints),
+                protocol_table: unsafe { std::mem::zeroed() },
+            };
+
+            item.protocol_table[proto] = Some(Arc::new(backward.clone()));
+            table.put(key, item);
+        }
+        return (forward_policy, forward_endpoints);
+    }
+
+    #[inline]
+    fn get_policy(
+        &mut self,
+        packet: &mut LookupKey,
+    ) -> Option<(Arc<PolicyData>, Arc<EndpointData>)> {
+        interest_table_map(&self.interest_table, packet);
+
+        let (key_0, key_1) = generate_map_key(&self.netmask_table, packet);
+        let key = (key_0 as u128) << 64 | key_1 as u128;
+        if let Some(item) = self.policy_table.get(&key) {
+            if let Some(policy) = &item.protocol_table[u8::from(packet.proto) as usize] {
+                return Some((
+                    Arc::clone(policy),
+                    item.store.get(
+                        packet.l2_end_0,
+                        packet.l2_end_1,
+                        packet.l3_end_0,
+                        packet.l3_end_1,
+                    ),
+                ));
+            }
+        }
+        return None;
+    }
+}
+
 pub struct FastPath {
     interest_table: RwLock<Vec<PortRange>>,
-    policy_table: Vec<Option<TableLruCache>>,
+    policy_table: Vec<Option<FastPathMap>>,
+    // Multi threaded access has thread safety issues, the ebpf
+    // table must be accessed by an ebpf dispatcher thread.
+    ebpf_table: LruCache<u128, Arc<EndpointData>>,
+    // Multi threaded access has thread safety issues, the otel
+    // table must be accessed by an otel dispatcher thread
+    otel_table: LruCache<u128, Arc<EndpointData>>,
 
+    // Use the first 16 bits of the IPv4 address to query the table and obtain the corresponding netmask.
     netmask_table: RwLock<Vec<u32>>,
 
-    policy_table_flush_flags: [bool; super::MAX_QUEUE_COUNT + 1],
+    policy_table_flush_flags: [AtomicBool; super::MAX_QUEUE_COUNT + 1],
+    caches: [Option<(Vec<PortRange>, Vec<u32>)>; super::MAX_QUEUE_COUNT + 1],
+    ebpf_table_flush_flag: AtomicBool,
+    otel_table_flush_flag: AtomicBool,
 
     mask_from_interface: RwLock<Vec<u32>>,
     mask_from_ipgroup: RwLock<Vec<u32>>,
     mask_from_cidr: RwLock<Vec<u32>>,
 
     map_size: usize,
-    queue_count: usize,
-
-    // 统计计数
-    policy_count: usize,
 }
+
+#[derive(Clone, Copy)]
+pub enum EndpointTableType {
+    Ebpf,
+    Otel,
+}
+
+const FLUSH_FLAGS: AtomicBool = AtomicBool::new(false);
+const ARRAY_REPEAT_NONE: Option<(std::vec::Vec<PortRange>, std::vec::Vec<u32>)> = None;
 
 impl FastPath {
     // 策略相关等内容更新后必须执行该函数以清空策略表
     pub fn flush(&mut self) {
         self.generate_mask_table();
-        self.policy_table_flush_flags = [true; super::MAX_QUEUE_COUNT + 1];
-        self.policy_count = 0;
+        self.generate_caches();
+        self.policy_table_flush_flags.iter_mut().for_each(|f| {
+            f.store(true, Ordering::Relaxed);
+        });
+        self.ebpf_table_flush_flag.store(true, Ordering::Relaxed);
+        self.otel_table_flush_flag.store(true, Ordering::Relaxed);
     }
 
     pub fn generate_mask_from_interface(&mut self, interfaces: &Vec<Arc<Interface>>) {
@@ -78,13 +283,13 @@ impl FastPath {
                 match ip.raw_ip {
                     IpAddr::V4(ipv4) => {
                         let ip_int = u32::from_be_bytes(ipv4.octets());
-                        let mask = u32::MAX << (32 - ip.netmask);
+                        let mask = u32::MAX << (NET_IP_MAX - ip.netmask);
                         let net_addr = ip_int & mask;
 
-                        let mut start = net_addr >> 16;
+                        let mut start = net_addr >> NET_IP_LEN;
                         let mut end = start;
-                        if ip.netmask < 16 {
-                            end += (1 << (16 - ip.netmask)) - 1;
+                        if ip.netmask < NET_IP_LEN {
+                            end += (1 << (NET_IP_LEN - ip.netmask)) - 1;
                         }
 
                         while start <= end {
@@ -110,11 +315,11 @@ impl FastPath {
             // internet资源因为匹配所有IP, 不需要加在这里
             return;
         }
-        let mut start = ipv4 >> 16;
+        let mut start = ipv4 >> NET_IP_LEN;
         let mut end = start;
         let mask = u32::from(addr.netmask());
-        if mask_len < 16 {
-            end += (1 << (16 - mask_len)) - 1;
+        if mask_len < NET_IP_LEN as u8 {
+            end += (1 << (NET_IP_LEN as u8 - mask_len)) - 1;
         }
 
         while start <= end {
@@ -173,36 +378,6 @@ impl FastPath {
         *self.netmask_table.write().unwrap() = netmask_table;
     }
 
-    fn generate_mask_ip(&self, key: &LookupKey) -> (u32, u32) {
-        match (key.src_ip, key.dst_ip) {
-            (IpAddr::V4(src), IpAddr::V4(dst)) => {
-                let src = u32::from_be_bytes(src.octets());
-                let dst = u32::from_be_bytes(dst.octets());
-                let netmask_table = self.netmask_table.read().unwrap();
-                return (
-                    src & netmask_table[(src >> 16) as usize],
-                    dst & netmask_table[(dst >> 16) as usize],
-                );
-            }
-            (IpAddr::V6(src), IpAddr::V6(dst)) => {
-                let src = u128::from_be_bytes(src.octets());
-                let dst = u128::from_be_bytes(dst.octets());
-                return (
-                    src as u32 ^ (src >> 32) as u32 ^ (src >> 64) as u32 ^ (src >> 96) as u32,
-                    dst as u32 ^ (dst >> 32) as u32 ^ (dst >> 64) as u32 ^ (dst >> 96) as u32,
-                );
-            }
-            _ => {
-                warn!(
-                    "LookupKey({}) is invalid: ip address version is inconsistent, deepflow-agent restart...\n",
-                    key
-                );
-                thread::sleep(Duration::from_secs(1));
-                std::process::exit(-1);
-            }
-        }
-    }
-
     pub fn generate_interest_table(&mut self, acls: &Vec<Arc<Acl>>) {
         let mut interest_table: Vec<PortRange> = std::iter::repeat(PortRange::new(0, 0))
             .take(u16::MAX as usize + 1)
@@ -242,46 +417,51 @@ impl FastPath {
         *self.interest_table.write().unwrap() = interest_table;
     }
 
-    fn interest_table_map(&self, key: &mut LookupKey) {
-        let table = &self.interest_table.read().unwrap();
-        key.src_port = table[key.src_port as usize].min();
-        key.dst_port = table[key.dst_port as usize].min();
-    }
-
-    pub fn update_map_size(&mut self, map_size: usize) {
-        if self.map_size == map_size {
-            return;
-        }
-        info!(
-            "fastpath map size change from {} to {}",
-            self.map_size, map_size
-        );
-        self.map_size = map_size;
-
-        for i in 0..self.queue_count {
-            self.policy_table_flush_flags[i] = true
+    fn generate_caches(&mut self) {
+        for (index, flags) in self.policy_table_flush_flags.iter().enumerate() {
+            if !flags.load(Ordering::Relaxed) {
+                self.caches[index] = Some((
+                    self.interest_table.read().unwrap().clone(),
+                    self.netmask_table.read().unwrap().clone(),
+                ));
+            }
         }
     }
 
+    #[inline]
     fn table_flush_check(&mut self, key: &LookupKey) -> bool {
         let start_index = key.fast_index * MAX_TAP_TYPE;
-        if self.policy_table_flush_flags[key.fast_index] {
+        if self.policy_table_flush_flags[key.fast_index].load(Ordering::Relaxed) {
             for i in 0..MAX_TAP_TYPE {
                 if let Some(t) = &mut self.policy_table[start_index + i] {
-                    t.clear();
+                    let (interest_table, netmask_table) = if self.caches[key.fast_index].is_some() {
+                        self.caches[key.fast_index].take().unwrap()
+                    } else {
+                        (
+                            self.interest_table.read().unwrap().clone(),
+                            self.netmask_table.read().unwrap().clone(),
+                        )
+                    };
+
+                    t.clear(interest_table, netmask_table);
                 }
             }
-            self.policy_table_flush_flags[key.fast_index] = false
+            self.policy_table_flush_flags[key.fast_index].store(false, Ordering::Relaxed);
         }
 
         if self.policy_table[start_index + u16::from(key.tap_type) as usize].is_none() {
             self.policy_table[start_index + u16::from(key.tap_type) as usize] =
-                Some(LruCache::new(self.map_size.try_into().unwrap()));
+                Some(FastPathMap::new(
+                    self.interest_table.read().unwrap().clone(),
+                    self.netmask_table.read().unwrap().clone(),
+                    self.map_size,
+                ));
             return true;
         }
         false
     }
 
+    #[inline]
     pub fn add_policy(
         &mut self,
         packet: &mut LookupKey,
@@ -289,84 +469,13 @@ impl FastPath {
         endpoints: EndpointData,
     ) -> (Arc<PolicyData>, Arc<EndpointData>) {
         self.table_flush_check(packet);
-        self.interest_table_map(packet);
+        let index = packet.fast_index * MAX_TAP_TYPE + u16::from(packet.tap_type) as usize;
+        let table = self.policy_table[index].as_mut().unwrap();
 
-        let start_index = packet.fast_index * MAX_TAP_TYPE;
-        let acl_id = policy.acl_id;
-        let (key_0, key_1) = self.generate_map_key(packet);
-        let proto = u8::from(packet.proto) as usize;
-        let key = (key_0 as u128) << 64 | key_1 as u128;
-        let table = self.policy_table[start_index + u16::from(packet.tap_type) as usize]
-            .as_mut()
-            .unwrap();
-
-        let mut forward = PolicyData::default();
-        if acl_id > 0 {
-            forward.merge_and_dedup_npb_actions(&policy.npb_actions, acl_id, false);
-            forward.format_npb_action();
-        }
-
-        let (forward_policy, forward_endpoints) = if let Some(item) = table.get_mut(&key) {
-            let forward_policy = Arc::new(forward.clone());
-            item.protocol_table[proto] = Some(forward_policy.clone());
-            let forward_endpoints = item.store.get(
-                packet.l2_end_0,
-                packet.l2_end_1,
-                packet.l3_end_0,
-                packet.l3_end_1,
-            );
-            (forward_policy, forward_endpoints)
-        } else {
-            let mut item = PolicyTableItem {
-                store: EndpointStore::from(endpoints),
-                protocol_table: unsafe { std::mem::zeroed() },
-            };
-            let forward_policy = Arc::new(forward.clone());
-            let forward_endpoints = item.store.get(
-                packet.l2_end_0,
-                packet.l2_end_1,
-                packet.l3_end_0,
-                packet.l3_end_1,
-            );
-            item.protocol_table[proto] = Some(forward_policy.clone());
-            table.put(key, item);
-
-            self.policy_count += 1;
-            (forward_policy, forward_endpoints)
-        };
-
-        if key_0 == key_1 {
-            return (forward_policy, forward_endpoints);
-        }
-
-        let mut backward = PolicyData::default();
-        if acl_id > 0 {
-            backward.merge_and_dedup_npb_actions(&policy.npb_actions, acl_id, true);
-            backward.format_npb_action();
-        }
-
-        let (key_0, key_1) = (key_1, key_0);
-        let key = (key_0 as u128) << 64 | key_1 as u128;
-        if let Some(item) = table.get_mut(&key) {
-            item.protocol_table[proto] = Some(Arc::new(backward.clone()));
-        } else {
-            let endpoints = EndpointData {
-                src_info: endpoints.dst_info,
-                dst_info: endpoints.src_info,
-            };
-            let mut item = PolicyTableItem {
-                store: EndpointStore::from(endpoints),
-                protocol_table: unsafe { std::mem::zeroed() },
-            };
-
-            item.protocol_table[proto] = Some(Arc::new(backward.clone()));
-            table.put(key, item);
-
-            self.policy_count += 1;
-        }
-        return (forward_policy, forward_endpoints);
+        table.add_policy(packet, policy, endpoints)
     }
 
+    #[inline]
     pub fn get_policy(
         &mut self,
         packet: &mut LookupKey,
@@ -374,35 +483,105 @@ impl FastPath {
         if self.table_flush_check(packet) {
             return None;
         }
-        self.interest_table_map(packet);
+        let index = packet.fast_index * MAX_TAP_TYPE + u16::from(packet.tap_type) as usize;
+        let table = self.policy_table[index].as_mut().unwrap();
 
-        let start_index = packet.fast_index * MAX_TAP_TYPE;
-        let (key_0, key_1) = self.generate_map_key(packet);
-        let key = (key_0 as u128) << 64 | key_1 as u128;
-        let table = self.policy_table[start_index + u16::from(packet.tap_type) as usize]
-            .as_mut()
-            .unwrap();
-        if let Some(item) = table.get(&key) {
-            if let Some(policy) = &item.protocol_table[u8::from(packet.proto) as usize] {
-                return Some((
-                    Arc::clone(policy),
-                    item.store.get(
-                        packet.l2_end_0,
-                        packet.l2_end_1,
-                        packet.l3_end_0,
-                        packet.l3_end_1,
-                    ),
-                ));
-            }
-        }
-        return None;
+        table.get_policy(packet)
     }
 
-    // 查询路径调用会影响性能
-    fn generate_map_key(&self, key: &LookupKey) -> (u64, u64) {
-        let (src_masked_ip, dst_masked_ip) = self.generate_mask_ip(key);
+    fn flush_endpoint_table(&mut self, table_type: EndpointTableType) -> bool {
+        match table_type {
+            EndpointTableType::Ebpf => {
+                if self.ebpf_table_flush_flag.swap(false, Ordering::Relaxed) {
+                    self.ebpf_table.clear();
 
-        key.fast_key(src_masked_ip, dst_masked_ip)
+                    true
+                } else {
+                    false
+                }
+            }
+            EndpointTableType::Otel => {
+                if self.otel_table_flush_flag.swap(false, Ordering::Relaxed) {
+                    self.otel_table.clear();
+
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    fn get_endpoint_table(
+        &mut self,
+        table_type: EndpointTableType,
+    ) -> &mut LruCache<u128, Arc<EndpointData>> {
+        match table_type {
+            EndpointTableType::Ebpf => &mut self.ebpf_table,
+            EndpointTableType::Otel => &mut self.otel_table,
+        }
+    }
+
+    pub fn add_endpoints(
+        &mut self,
+        table_type: EndpointTableType,
+        ip_src: IpAddr,
+        ip_dst: IpAddr,
+        l3_epc_id_src: i32,
+        l3_epc_id_dst: i32,
+        endpoints: EndpointData,
+    ) -> Arc<EndpointData> {
+        let (key_0, key_1) =
+            self.generate_endpoints_map_key(ip_src, ip_dst, l3_epc_id_src, l3_epc_id_dst);
+        let key = (key_0 as u128) << 64 | key_1 as u128;
+        let endpoints = Arc::new(endpoints);
+        let table = self.get_endpoint_table(table_type);
+        table.put(key, endpoints.clone());
+
+        // NOTE: key_0 and key_1 cannot be the same.
+        let key = (key_1 as u128) << 64 | key_0 as u128;
+        table.put(key, Arc::new(endpoints.reversed()));
+
+        return endpoints;
+    }
+
+    pub fn get_endpoints(
+        &mut self,
+        table_type: EndpointTableType,
+        ip_src: IpAddr,
+        ip_dst: IpAddr,
+        l3_epc_id_src: i32,
+        l3_epc_id_dst: i32,
+    ) -> Option<Arc<EndpointData>> {
+        if self.flush_endpoint_table(table_type) {
+            return None;
+        }
+
+        let (key_0, key_1) =
+            self.generate_endpoints_map_key(ip_src, ip_dst, l3_epc_id_src, l3_epc_id_dst);
+        let key = (key_0 as u128) << 64 | key_1 as u128;
+
+        self.get_endpoint_table(table_type)
+            .get(&key)
+            .and_then(|x| Some(x.clone()))
+    }
+
+    fn generate_endpoints_map_key(
+        &self,
+        ip_src: IpAddr,
+        ip_dst: IpAddr,
+        l3_epc_id_src: i32,
+        l3_epc_id_dst: i32,
+    ) -> (u64, u64) {
+        let netmask_table = self.netmask_table.read().unwrap();
+        let (src_masked_ip, dst_masked_ip) = generate_mask_ip(&netmask_table, ip_src, ip_dst);
+        let l3_epc_id_src = l3_epc_id_src as u64;
+        let l3_epc_id_dst = l3_epc_id_dst as u64;
+
+        (
+            (src_masked_ip as u64) | 0xffff << 32 | l3_epc_id_src << 48,
+            (dst_masked_ip as u64) | 0xffff << 32 | l3_epc_id_dst << 48,
+        )
     }
 
     pub fn new(queue_count: usize, map_size: usize) -> Self {
@@ -412,7 +591,6 @@ impl FastPath {
         );
         FastPath {
             map_size,
-            queue_count,
 
             mask_from_interface: RwLock::new(
                 std::iter::repeat(0).take(u16::MAX as usize + 1).collect(),
@@ -436,12 +614,26 @@ impl FastPath {
                 }
                 table
             },
+            ebpf_table: LruCache::new(map_size.try_into().unwrap()),
+            otel_table: LruCache::new(map_size.try_into().unwrap()),
 
-            policy_table_flush_flags: [false; super::MAX_QUEUE_COUNT + 1],
-
-            // 统计计数
-            policy_count: 0,
+            policy_table_flush_flags: [FLUSH_FLAGS; super::MAX_QUEUE_COUNT + 1],
+            caches: [ARRAY_REPEAT_NONE; super::MAX_QUEUE_COUNT + 1],
+            ebpf_table_flush_flag: FLUSH_FLAGS,
+            otel_table_flush_flag: FLUSH_FLAGS,
         }
+    }
+
+    pub fn reset_queue_size(&mut self, queue_count: usize) {
+        assert!(
+            queue_count <= super::MAX_QUEUE_COUNT,
+            "Fastpath queue count over limit."
+        );
+        self.policy_table_flush_flags.iter_mut().for_each(|f| {
+            f.store(true, Ordering::Relaxed);
+        });
+        self.ebpf_table_flush_flag.store(true, Ordering::Relaxed);
+        self.otel_table_flush_flag.store(true, Ordering::Relaxed);
     }
 }
 
@@ -464,13 +656,14 @@ mod test {
         };
         table.generate_interest_table(&vec![Arc::new(acl)]);
 
+        let interest_table = table.interest_table.read().unwrap();
         // 1-4 -> 1  5->10 -> 5 11->11 other->12
         let mut key = LookupKey {
             src_port: 1,
             dst_port: 9,
             ..Default::default()
         };
-        table.interest_table_map(&mut key);
+        interest_table_map(&interest_table, &mut key);
         assert_eq!(key.src_port, 0);
         assert_eq!(key.dst_port, 5);
 
@@ -479,7 +672,7 @@ mod test {
             dst_port: 3000,
             ..Default::default()
         };
-        table.interest_table_map(&mut key);
+        interest_table_map(&interest_table, &mut key);
         assert_eq!(key.src_port, 11);
         assert_eq!(key.dst_port, 12)
     }
@@ -494,13 +687,14 @@ mod test {
         };
         table.generate_interest_table(&vec![Arc::new(acl)]);
 
+        let interest_table = table.interest_table.read().unwrap();
         // 0-10 -> 0  13->65535 -> 13 other->11
         let mut key = LookupKey {
             src_port: 1,
             dst_port: 65535,
             ..Default::default()
         };
-        table.interest_table_map(&mut key);
+        interest_table_map(&interest_table, &mut key);
         assert_eq!(key.src_port, 0);
         assert_eq!(key.dst_port, 13);
 
@@ -509,7 +703,7 @@ mod test {
             dst_port: 12,
             ..Default::default()
         };
-        table.interest_table_map(&mut key);
+        interest_table_map(&interest_table, &mut key);
         assert_eq!(key.src_port, 11);
         assert_eq!(key.dst_port, 11);
     }
@@ -524,13 +718,14 @@ mod test {
         };
         table.generate_interest_table(&vec![Arc::new(acl)]);
 
+        let interest_table = table.interest_table.read().unwrap();
         // 5-10 -> 5  13->65535 -> 13 other->11
         let mut key = LookupKey {
             src_port: 8,
             dst_port: 65535,
             ..Default::default()
         };
-        table.interest_table_map(&mut key);
+        interest_table_map(&interest_table, &mut key);
         assert_eq!(key.src_port, 5);
         assert_eq!(key.dst_port, 13);
 
@@ -539,7 +734,7 @@ mod test {
             dst_port: 3,
             ..Default::default()
         };
-        table.interest_table_map(&mut key);
+        interest_table_map(&interest_table, &mut key);
         assert_eq!(key.src_port, 0);
         assert_eq!(key.dst_port, 0);
     }
@@ -552,15 +747,17 @@ mod test {
             dst_port_ranges: vec![PortRange::new(100, 300), PortRange::new(500, 600)],
             ..Default::default()
         };
+
         table.generate_interest_table(&vec![Arc::new(acl)]);
 
+        let interest_table = table.interest_table.read().unwrap();
         // other->11
         let mut key = LookupKey {
             src_port: 22,
             dst_port: 88,
             ..Default::default()
         };
-        table.interest_table_map(&mut key);
+        interest_table_map(&interest_table, &mut key);
         assert_eq!(key.src_port, 11);
         assert_eq!(key.dst_port, 11);
     }
@@ -690,5 +887,35 @@ mod test {
         for i in 0xc0a9..0xc0b0 {
             assert_eq!(table.mask_from_ipgroup.read().unwrap()[i], 0xfff80000);
         }
+    }
+
+    #[test]
+    fn test_ebpf_fast() {
+        let mut table = FastPath::new(1, 1024);
+        let ip_src = IpAddr::from("192.169.1.100".parse::<Ipv4Addr>().unwrap());
+        let ip_dst = IpAddr::from("172.29.2.200".parse::<Ipv4Addr>().unwrap());
+        let mut endpoints: EndpointData = Default::default();
+        endpoints.src_info.l3_epc_id = 10;
+        endpoints.dst_info.l3_epc_id = 20;
+
+        let e = table.add_endpoints(EndpointTableType::Ebpf, ip_src, ip_dst, 10, 0, endpoints);
+        assert_eq!(10, e.src_info.l3_epc_id);
+        assert_eq!(20, e.dst_info.l3_epc_id);
+        let e = table
+            .get_endpoints(EndpointTableType::Ebpf, ip_src, ip_dst, 10, 0)
+            .unwrap();
+        assert_eq!(10, e.src_info.l3_epc_id);
+        assert_eq!(20, e.dst_info.l3_epc_id);
+        let e = table
+            .get_endpoints(EndpointTableType::Ebpf, ip_dst, ip_src, 0, 10)
+            .unwrap();
+        assert_eq!(20, e.src_info.l3_epc_id);
+        assert_eq!(10, e.dst_info.l3_epc_id);
+        let e = table.get_endpoints(EndpointTableType::Ebpf, ip_src, ip_dst, 0, 0);
+        assert!(e.is_none());
+        let e = table.get_endpoints(EndpointTableType::Ebpf, ip_src, ip_dst, 0, 10);
+        assert!(e.is_none());
+        let e = table.get_endpoints(EndpointTableType::Ebpf, ip_src, ip_dst, 10, 20);
+        assert!(e.is_none());
     }
 }

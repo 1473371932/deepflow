@@ -15,7 +15,7 @@
  */
 
 use std::cell::RefCell;
-use std::fmt::Debug;
+use std::fmt;
 use std::net::IpAddr;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -30,24 +30,27 @@ use super::flow::{L7PerfStats, PacketDirection};
 use super::l7_protocol_info::L7ProtocolInfo;
 use super::MetaPacket;
 
+use crate::common::meta_packet::{IcmpData, ProtocolData};
 use crate::config::handler::LogParserConfig;
-use crate::config::OracleParseConfig;
+use crate::config::OracleConfig;
 use crate::flow_generator::flow_map::FlowMapCounter;
 use crate::flow_generator::protocol_logs::fastcgi::FastCGILog;
 use crate::flow_generator::protocol_logs::plugin::custom_wrap::CustomWrapLog;
 use crate::flow_generator::protocol_logs::plugin::get_custom_log_parser;
 use crate::flow_generator::protocol_logs::sql::ObfuscateCache;
 use crate::flow_generator::protocol_logs::{
-    AmqpLog, DnsLog, DubboLog, HttpLog, KafkaLog, MongoDBLog, MqttLog, MysqlLog, OpenWireLog,
-    OracleLog, PostgresqlLog, RedisLog, SofaRpcLog, TlsLog,
+    AmqpLog, BrpcLog, DnsLog, DubboLog, HttpLog, KafkaLog, MemcachedLog, MongoDBLog, MqttLog,
+    MysqlLog, NatsLog, OpenWireLog, PingLog, PostgresqlLog, PulsarLog, RedisLog, RocketmqLog,
+    SofaRpcLog, TarsLog, ZmtpLog,
 };
+
 use crate::flow_generator::{LogMessageType, Result};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::plugin::c_ffi::SoPluginFunc;
 use crate::plugin::wasm::WasmVm;
 
 use public::enums::IpProtocol;
-use public::l7_protocol::{CustomProtocol, L7Protocol, L7ProtocolEnum};
+use public::l7_protocol::{CustomProtocol, L7Protocol, L7ProtocolChecker, L7ProtocolEnum};
 
 /*
  所有协议都需要实现L7ProtocolLogInterface这个接口.
@@ -158,25 +161,66 @@ macro_rules! impl_protocol_parser {
 // enum name will be used to parse strings so case matters
 // large structs (>128B) should be boxed to reduce memory consumption
 //
-impl_protocol_parser! {
-    pub enum L7ProtocolParser {
-        // http have two version but one parser, can not place in macro param.
-        // custom must in frist so can not place in macro
-        DNS(DnsLog),
-        SofaRPC(SofaRpcLog),
-        MySQL(MysqlLog),
-        Kafka(KafkaLog),
-        Redis(RedisLog),
-        MongoDB(MongoDBLog),
-        PostgreSQL(PostgresqlLog),
-        Dubbo(DubboLog),
-        FastCGI(FastCGILog),
-        Oracle(OracleLog),
-        MQTT(MqttLog),
-        AMQP(AmqpLog),
-        TLS(TlsLog),
-        OpenWire(OpenWireLog),
-        // add protocol below
+cfg_if::cfg_if! {
+    if #[cfg(not(feature = "enterprise"))] {
+        impl_protocol_parser! {
+            pub enum L7ProtocolParser {
+                // http have two version but one parser, can not place in macro param.
+                // custom must in first so can not place in macro
+                DNS(DnsLog),
+                SofaRPC(SofaRpcLog),
+                MySQL(MysqlLog),
+                Kafka(KafkaLog),
+                Redis(RedisLog),
+                MongoDB(MongoDBLog),
+                Memcached(MemcachedLog),
+                PostgreSQL(PostgresqlLog),
+                Dubbo(DubboLog),
+                FastCGI(FastCGILog),
+                Brpc(BrpcLog),
+                Tars(TarsLog),
+                MQTT(MqttLog),
+                AMQP(AmqpLog),
+                NATS(NatsLog),
+                Pulsar(PulsarLog),
+                ZMTP(ZmtpLog),
+                RocketMQ(RocketmqLog),
+                OpenWire(OpenWireLog),
+                Ping(PingLog),
+                // add protocol below
+            }
+        }
+    } else {
+        impl_protocol_parser! {
+            pub enum L7ProtocolParser {
+                // http have two version but one parser, can not place in macro param.
+                // custom must in first so can not place in macro
+                DNS(DnsLog),
+                SofaRPC(SofaRpcLog),
+                MySQL(MysqlLog),
+                Kafka(KafkaLog),
+                Redis(RedisLog),
+                MongoDB(MongoDBLog),
+                Memcached(MemcachedLog),
+                PostgreSQL(PostgresqlLog),
+                Dubbo(DubboLog),
+                FastCGI(FastCGILog),
+                Brpc(BrpcLog),
+                Tars(TarsLog),
+                Oracle(crate::flow_generator::protocol_logs::sql::OracleLog),
+                MQTT(MqttLog),
+                AMQP(AmqpLog),
+                NATS(NatsLog),
+                Pulsar(PulsarLog),
+                ZMTP(ZmtpLog),
+                RocketMQ(RocketmqLog),
+                OpenWire(OpenWireLog),
+                TLS(crate::flow_generator::protocol_logs::tls::TlsLog),
+                SomeIp(crate::flow_generator::protocol_logs::rpc::SomeIpLog),
+                Ping(PingLog),
+                // add protocol below
+            }
+        }
     }
 }
 
@@ -197,7 +241,7 @@ impl L7ParseResult {
     pub fn unwrap_single(self) -> L7ProtocolInfo {
         match self {
             L7ParseResult::Single(s) => s,
-            L7ParseResult::Multi(_) => panic!("parse result is mutli but unwrap single"),
+            L7ParseResult::Multi(_) => panic!("parse result is multi but unwrap single"),
             L7ParseResult::None => panic!("parse result is none but unwrap single"),
         }
     }
@@ -249,6 +293,13 @@ pub trait L7ProtocolParserInterface {
         true
     }
 
+    // l4即不是udp也不是tcp，用于快速过滤协议
+    // ==============================
+    // L4 is neither UDP nor TCP and is used to quickly filter protocols
+    fn parsable_on_other(&self) -> bool {
+        false
+    }
+
     // is parse default? use for config init.
     fn parse_default(&self) -> bool {
         true
@@ -262,7 +313,7 @@ pub trait L7ProtocolParserInterface {
     fn set_obfuscate_cache(&mut self, _: Option<ObfuscateCache>) {}
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct EbpfParam<'a> {
     pub is_tls: bool,
     // 目前仅 http2 uprobe 有意义
@@ -273,28 +324,62 @@ pub struct EbpfParam<'a> {
     pub process_kname: &'a str,
 }
 
-pub struct KafkaInfoCache {
-    // kafka req
-    pub api_key: u16,
-    pub api_version: u16,
-
-    // kafka resp code
-    pub code: i16,
-}
 pub struct LogCache {
     pub msg_type: LogMessageType,
     pub time: u64,
-    pub kafka_info: Option<KafkaInfoCache>,
+    pub endpoint: Option<String>,
     // req_end, resp_end, merged
     // set merged to true when req and resp merge once
     pub multi_merge_info: Option<(bool, bool, bool)>,
 }
 
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct LogCacheKey(pub u128);
+
+impl LogCacheKey {
+    pub fn new(param: &ParseParam, session_id: Option<u32>) -> Self {
+        /*
+            if session id is some: flow id 64bit | 0 32bit | session id 32bit
+            if session id is none: flow id 64bit | packet_seq 64bit
+        */
+        let key = match session_id {
+            Some(sid) => ((param.flow_id as u128) << 64) | sid as u128,
+            None => {
+                ((param.flow_id as u128) << 64)
+                    | (if param.ebpf_type != EbpfType::None {
+                        // NOTE:
+                        //   In the request-log session aggregation process, for eBPF data, we require that requests and
+                        // responses have consecutive cap_seq to ensure the correctness of session aggregation. However,
+                        // when SR (Segmentation-Reassembly) is enabled, we combine multiple eBPF socket event events
+                        // before parsing the protocol. Therefore, in order to ensure that session aggregation can still
+                        // be performed correctly, we need to retain the cap_seq of the last request and the cap_seq of
+                        // the first response, so that the cap_seq of the request and response can still be consecutive.
+                        if param.direction == PacketDirection::ClientToServer {
+                            param.packet_end_seq + 1
+                        } else {
+                            param.packet_start_seq
+                        }
+                    } else {
+                        0
+                    }) as u128
+            }
+        };
+
+        Self(key)
+    }
+
+    fn flow_id(&self) -> u64 {
+        (self.0 >> 64) as u64
+    }
+}
+
 pub struct L7PerfCache {
     // lru cache previous rrt
-    pub rrt_cache: LruCache<u128, LogCache>,
+    pub rrt_cache: LruCache<LogCacheKey, LogCache>,
     // LruCache<flow_id, (in_cache_req, count)>
     pub timeout_cache: LruCache<u64, (usize, usize)>,
+    // LruCache<flow_id, LruCache<LogCacheKey, bool>>
+    pub flow_id_map: LruCache<u64, LruCache<LogCacheKey, bool>>,
     // time in microseconds
     pub last_log_time: u64,
 }
@@ -302,16 +387,19 @@ pub struct L7PerfCache {
 impl L7PerfCache {
     // 60 seconds
     const LOG_INTERVAL: u64 = 60_000_000;
+    // When the number of concurrent transactions exceeds this value, the RRT calculation error will occur.
+    const MAX_RRT_CACHE_PER_FLOW: usize = 128;
 
     pub fn new(cap: usize) -> Self {
         L7PerfCache {
             rrt_cache: LruCache::new(cap.try_into().unwrap()),
             timeout_cache: LruCache::new(cap.try_into().unwrap()),
+            flow_id_map: LruCache::new(cap.try_into().unwrap()),
             last_log_time: 0,
         }
     }
 
-    pub fn put(&mut self, key: u128, value: LogCache) -> Option<LogCache> {
+    pub fn put(&mut self, key: LogCacheKey, value: LogCache) -> Option<LogCache> {
         let now = value.time;
         if self.rrt_cache.len() >= usize::from(self.rrt_cache.cap())
             && self.last_log_time + Self::LOG_INTERVAL < now
@@ -319,7 +407,40 @@ impl L7PerfCache {
             self.last_log_time = now;
             debug!("The capacity({}) of the rrt table will be exceeded. please adjust the configuration", self.rrt_cache.cap());
         }
+        if let Some((old, _)) = self
+            .flow_id_map
+            .get_or_insert_mut(key.flow_id(), || {
+                let mut cache = LruCache::new(Self::MAX_RRT_CACHE_PER_FLOW.try_into().unwrap());
+                cache.put(key.clone(), true);
+                cache
+            })
+            .push(key.clone(), true)
+        {
+            // Another cache entry is removed due to the lru's capacity.
+            if key != old {
+                self.rrt_cache.pop(&old);
+                if self.last_log_time + Self::LOG_INTERVAL < now {
+                    self.last_log_time = now;
+                    debug!(
+                        "The capacity({}) of the flow id table will be exceeded, flow id: {}",
+                        Self::MAX_RRT_CACHE_PER_FLOW,
+                        old.flow_id()
+                    );
+                }
+            }
+        }
         self.rrt_cache.put(key, value)
+    }
+
+    pub fn pop(&mut self, key: LogCacheKey) -> Option<LogCache> {
+        if let Some(cache) = self.flow_id_map.get_mut(&key.flow_id()) {
+            cache.pop(&key);
+
+            if cache.is_empty() {
+                self.flow_id_map.pop(&key.flow_id());
+            }
+        }
+        self.rrt_cache.pop(&key)
     }
 
     pub fn pop_timeout_count(&mut self, flow_id: &u64, flow_end: bool) -> usize {
@@ -329,6 +450,22 @@ impl L7PerfCache {
         } else {
             self.timeout_cache.put(*flow_id, (in_cache, 0));
             t
+        }
+    }
+
+    pub fn get_or_insert_mut(&mut self, flow_id: u64) -> &mut (usize, usize) {
+        self.timeout_cache.get_or_insert_mut(flow_id, || (0, 0))
+    }
+
+    pub fn remove(&mut self, flow_id: &u64) {
+        self.timeout_cache.pop(flow_id);
+
+        let Some(keys) = self.flow_id_map.pop(flow_id) else {
+            return;
+        };
+
+        for (key, _) in keys {
+            self.rrt_cache.pop(&key);
         }
     }
 }
@@ -341,6 +478,7 @@ pub struct ParseParam<'a> {
     pub port_src: u16,
     pub port_dst: u16,
     pub flow_id: u64,
+    pub icmp_data: Option<&'a IcmpData>,
 
     // parse info
     pub direction: PacketDirection,
@@ -350,7 +488,8 @@ pub struct ParseParam<'a> {
     // not None when payload from ebpf
     pub ebpf_param: Option<EbpfParam<'a>>,
     // calculate from cap_seq, req and correspond resp may have same packet seq, non ebpf always 0
-    pub packet_seq: u64,
+    pub packet_start_seq: u64,
+    pub packet_end_seq: u64,
     pub time: u64, // micro second
     pub parse_perf: bool,
     pub parse_log: bool,
@@ -371,8 +510,39 @@ pub struct ParseParam<'a> {
 
     // the config of `l7_log_packet_size`, must set in parse_payload and check_payload
     pub buf_size: u16,
+    pub captured_byte: u16,
 
-    pub oracle_parse_conf: OracleParseConfig,
+    pub oracle_parse_conf: OracleConfig,
+}
+
+impl<'a> fmt::Debug for ParseParam<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut ds = f.debug_struct("ParseParam");
+        ds.field("l4_protocol", &self.l4_protocol)
+            .field("ip_src", &self.ip_src)
+            .field("ip_dst", &self.ip_dst)
+            .field("port_src", &self.port_src)
+            .field("port_dst", &self.port_dst)
+            .field("flow_id", &self.flow_id)
+            .field("icmp_data", &self.icmp_data)
+            .field("direction", &self.direction)
+            .field("ebpf_type", &self.ebpf_type)
+            .field("ebpf_param", &self.ebpf_param)
+            .field("packet_start_seq", &self.packet_start_seq)
+            .field("packet_end_seq", &self.packet_end_seq)
+            .field("time", &self.time)
+            .field("parse_perf", &self.parse_perf)
+            .field("parse_log", &self.parse_log)
+            .field("parse_config", &self.parse_config)
+            .field("wasm_vm", &self.wasm_vm.borrow().is_some());
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        ds.field("so_func", &self.so_func.borrow().is_some());
+        ds.field("rrt_timeout", &self.rrt_timeout)
+            .field("buf_size", &self.buf_size)
+            .field("captured_byte", &self.captured_byte)
+            .field("oracle_parse_conf", &self.oracle_parse_conf)
+            .finish()
+    }
 }
 
 impl<'a> ParseParam<'a> {
@@ -396,11 +566,17 @@ impl<'a> ParseParam<'a> {
             ip_dst: packet.lookup_key.dst_ip,
             port_src: packet.lookup_key.src_port,
             port_dst: packet.lookup_key.dst_port,
+            icmp_data: if let ProtocolData::IcmpData(icmp_data) = &packet.protocol_data {
+                Some(icmp_data)
+            } else {
+                None
+            },
             flow_id: packet.flow_id,
 
             direction: packet.lookup_key.direction,
             ebpf_type: packet.ebpf_type,
-            packet_seq: packet.cap_seq,
+            packet_start_seq: packet.cap_start_seq,
+            packet_end_seq: packet.cap_end_seq,
             ebpf_param: None,
             time: packet.lookup_key.timestamp.as_micros() as u64,
             parse_perf,
@@ -419,8 +595,9 @@ impl<'a> ParseParam<'a> {
             rrt_timeout: Duration::from_secs(10).as_micros() as usize,
 
             buf_size: 0,
+            captured_byte: 0,
 
-            oracle_parse_conf: OracleParseConfig::default(),
+            oracle_parse_conf: OracleConfig::default(),
         };
         if packet.ebpf_type != EbpfType::None {
             param.ebpf_param = Some(EbpfParam {
@@ -454,15 +631,19 @@ impl<'a> ParseParam<'a> {
         self.buf_size = buf_size as u16;
     }
 
+    pub fn set_captured_byte(&mut self, captured_byte: usize) {
+        self.captured_byte = captured_byte as u16;
+    }
+
     pub fn set_rrt_timeout(&mut self, t: usize) {
         self.rrt_timeout = t;
     }
 
-    pub fn set_log_parse_config(&mut self, conf: &'a LogParserConfig) {
+    pub fn set_log_parser_config(&mut self, conf: &'a LogParserConfig) {
         self.parse_config = Some(conf);
     }
 
-    pub fn set_oracle_conf(&mut self, conf: OracleParseConfig) {
+    pub fn set_oracle_conf(&mut self, conf: OracleConfig) {
         self.oracle_parse_conf = conf;
     }
 }
@@ -512,18 +693,20 @@ impl L7ProtocolBitmap {
     pub fn set_disabled(&mut self, p: L7Protocol) {
         self.0 &= !(1 << (p as u128));
     }
+}
 
-    pub fn is_disabled(&self, p: L7Protocol) -> bool {
+impl L7ProtocolChecker for L7ProtocolBitmap {
+    fn is_disabled(&self, p: L7Protocol) -> bool {
         self.0 & (1 << (p as u128)) == 0
     }
 
-    pub fn is_enabled(&self, p: L7Protocol) -> bool {
+    fn is_enabled(&self, p: L7Protocol) -> bool {
         !self.is_disabled(p)
     }
 }
 
-impl From<&Vec<String>> for L7ProtocolBitmap {
-    fn from(vs: &Vec<String>) -> Self {
+impl From<&[String]> for L7ProtocolBitmap {
+    fn from(vs: &[String]) -> Self {
         let mut bitmap = L7ProtocolBitmap(0);
         for v in vs.iter() {
             if let Ok(p) = L7ProtocolParser::try_from(v.as_str()) {
@@ -534,8 +717,8 @@ impl From<&Vec<String>> for L7ProtocolBitmap {
     }
 }
 
-impl Debug for L7ProtocolBitmap {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for L7ProtocolBitmap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut p = vec![];
         for i in get_all_protocol() {
             if self.is_enabled(i.protocol()) {

@@ -29,7 +29,7 @@ use crate::{
         l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
     },
     flow_generator::{
-        protocol_logs::{L7ResponseStatus, LogMessageType},
+        protocol_logs::{set_captured_byte, L7ResponseStatus, LogMessageType},
         Error, Result,
     },
     plugin::{
@@ -64,8 +64,8 @@ impl L7ProtocolParserInterface for SoLog {
             /*
                 call the func from so, correctness depends on plugin implementation.
 
-                there is impossible to verify the plugin implemention correctness, so plugin maybe do some UB,
-                for eaxmple, modify the payload (due to the payload is not copy but pass the ptr to ctx directly and should
+                there is impossible to verify the plugin implementation correctness, so plugin maybe do some UB,
+                for example, modify the payload (due to the payload is not copy but pass the ptr to ctx directly and should
                 not be modify, modify the payload is UB).
 
                 the plugin correctness depend on the implementation of the developer
@@ -171,7 +171,7 @@ impl L7ProtocolParserInterface for SoLog {
                             Ok(mut info) => {
                                 info.proto_str = self.proto_str.clone();
                                 info.proto = self.proto_num.unwrap();
-
+                                set_captured_byte!(info, param);
                                 match info.msg_type {
                                     LogMessageType::Request => {
                                         self.perf_stats.as_mut().map(|p| p.inc_req());
@@ -192,8 +192,16 @@ impl L7ProtocolParserInterface for SoLog {
                                     _ => {}
                                 }
 
-                                info.cal_rrt(param, None).map(|rrt| {
+                                let endpoint = if info.req.endpoint.is_empty() {
+                                    None
+                                } else {
+                                    Some(info.req.endpoint.clone())
+                                };
+                                info.cal_rrt(param, &endpoint).map(|(rrt, endpoint)| {
                                     info.rrt = rrt;
+                                    if info.msg_type == LogMessageType::Response {
+                                        info.req.endpoint = endpoint.unwrap_or_default();
+                                    }
                                     self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
                                 });
                                 if res.len == 1 {

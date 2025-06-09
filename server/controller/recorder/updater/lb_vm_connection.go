@@ -19,25 +19,55 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type LBVMConnection struct {
-	UpdaterBase[cloudmodel.LBVMConnection, mysql.LBVMConnection, *diffbase.LBVMConnection]
+	UpdaterBase[
+		cloudmodel.LBVMConnection,
+		*diffbase.LBVMConnection,
+		*metadbmodel.LBVMConnection,
+		metadbmodel.LBVMConnection,
+		*message.LBVMConnectionAdd,
+		message.LBVMConnectionAdd,
+		message.AddNoneAddition,
+		*message.LBVMConnectionUpdate,
+		message.LBVMConnectionUpdate,
+		*message.LBVMConnectionFieldsUpdate,
+		message.LBVMConnectionFieldsUpdate,
+		*message.LBVMConnectionDelete,
+		message.LBVMConnectionDelete,
+		message.DeleteNoneAddition]
 }
 
 func NewLBVMConnection(wholeCache *cache.Cache, cloudData []cloudmodel.LBVMConnection) *LBVMConnection {
 	updater := &LBVMConnection{
-		UpdaterBase[cloudmodel.LBVMConnection, mysql.LBVMConnection, *diffbase.LBVMConnection]{
-			resourceType: ctrlrcommon.RESOURCE_TYPE_LB_VM_CONNECTION_EN,
-			cache:        wholeCache,
-			dbOperator:   db.NewLBVMConnection(),
-			diffBaseData: wholeCache.DiffBaseDataSet.LBVMConnections,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.LBVMConnection,
+			*diffbase.LBVMConnection,
+			*metadbmodel.LBVMConnection,
+			metadbmodel.LBVMConnection,
+			*message.LBVMConnectionAdd,
+			message.LBVMConnectionAdd,
+			message.AddNoneAddition,
+			*message.LBVMConnectionUpdate,
+			message.LBVMConnectionUpdate,
+			*message.LBVMConnectionFieldsUpdate,
+			message.LBVMConnectionFieldsUpdate,
+			*message.LBVMConnectionDelete,
+			message.LBVMConnectionDelete,
+			message.DeleteNoneAddition,
+		](
+			ctrlrcommon.RESOURCE_TYPE_LB_VM_CONNECTION_EN,
+			wholeCache,
+			db.NewLBVMConnection().SetMetadata(wholeCache.GetMetadata()),
+			wholeCache.DiffBaseDataSet.LBVMConnections,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
@@ -48,7 +78,7 @@ func (c *LBVMConnection) getDiffBaseByCloudItem(cloudItem *cloudmodel.LBVMConnec
 	return
 }
 
-func (c *LBVMConnection) generateDBItemToAdd(cloudItem *cloudmodel.LBVMConnection) (*mysql.LBVMConnection, bool) {
+func (c *LBVMConnection) generateDBItemToAdd(cloudItem *cloudmodel.LBVMConnection) (*metadbmodel.LBVMConnection, bool) {
 	vmID, exists := c.cache.ToolDataSet.GetVMIDByLcuuid(cloudItem.VMLcuuid)
 	if !exists {
 		log.Error(resourceAForResourceBNotFound(
@@ -66,8 +96,8 @@ func (c *LBVMConnection) generateDBItemToAdd(cloudItem *cloudmodel.LBVMConnectio
 		return nil, false
 	}
 
-	dbItem := &mysql.LBVMConnection{
-		Domain: c.cache.DomainLcuuid,
+	dbItem := &metadbmodel.LBVMConnection{
+		Domain: c.metadata.Domain.Lcuuid,
 		VMID:   vmID,
 		LBID:   lbID,
 	}
@@ -76,6 +106,6 @@ func (c *LBVMConnection) generateDBItemToAdd(cloudItem *cloudmodel.LBVMConnectio
 }
 
 // 保留接口
-func (c *LBVMConnection) generateUpdateInfo(diffBase *diffbase.LBVMConnection, cloudItem *cloudmodel.LBVMConnection) (map[string]interface{}, bool) {
-	return nil, false
+func (c *LBVMConnection) generateUpdateInfo(diffBase *diffbase.LBVMConnection, cloudItem *cloudmodel.LBVMConnection) (*message.LBVMConnectionFieldsUpdate, map[string]interface{}, bool) {
+	return nil, nil, false
 }

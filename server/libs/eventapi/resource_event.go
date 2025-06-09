@@ -19,13 +19,17 @@ package eventapi
 import "github.com/deepflowio/deepflow/server/libs/pool"
 
 const (
-	RESOURCE_EVENT_TYPE_CREATE       = "create"
-	RESOURCE_EVENT_TYPE_DELETE       = "delete"
-	RESOURCE_EVENT_TYPE_UPDATE_STATE = "update-state"
-	RESOURCE_EVENT_TYPE_MIGRATE      = "migrate"
-	RESOURCE_EVENT_TYPE_RECREATE     = "recreate"
-	RESOURCE_EVENT_TYPE_ADD_IP       = "add-ip"
-	RESOURCE_EVENT_TYPE_REMOVE_IP    = "remove-ip"
+	RESOURCE_EVENT_TYPE_CREATE            = "create"
+	RESOURCE_EVENT_TYPE_DELETE            = "delete"
+	RESOURCE_EVENT_TYPE_UPDATE_STATE      = "update-state"
+	RESOURCE_EVENT_TYPE_MIGRATE           = "migrate"
+	RESOURCE_EVENT_TYPE_RECREATE          = "recreate"
+	RESOURCE_EVENT_TYPE_ADD_IP            = "attach-ip"
+	RESOURCE_EVENT_TYPE_REMOVE_IP         = "detach-ip"
+	RESOURCE_EVENT_TYPE_UPDATE_CONFIG     = "modify"
+	RESOURCE_EVENT_TYPE_ADD_CONFIG_MAP    = "attach-config"
+	RESOURCE_EVENT_TYPE_UPDATE_CONFIG_MAP = "update-config"
+	RESOURCE_EVENT_TYPE_DELETE_CONFIG_MAP = "detach-config"
 )
 
 type ResourceEvent struct {
@@ -57,9 +61,52 @@ type ResourceEvent struct {
 	PodID        uint32
 	SubnetID     uint32
 	IP           string
+	ConfigMapID  uint32
+
+	AttributeNames  []string
+	AttributeValues []string
+
+	ORGID  uint16
+	TeamID uint16
 }
 
+const (
+	AttributeNameConfig     = "config"
+	AttributeNameConfigDiff = "config_diff"
+)
+
 type TagFieldOption func(opts *ResourceEvent)
+
+func TagConfigMapID(id uint32) TagFieldOption {
+	return func(r *ResourceEvent) {
+		r.ConfigMapID = id
+	}
+}
+
+func TagAttributes(names, values []string) TagFieldOption {
+	return func(r *ResourceEvent) {
+		r.AttributeNames = names
+		r.AttributeValues = values
+	}
+}
+
+func TagInstanceType(instanceType uint32) TagFieldOption {
+	return func(r *ResourceEvent) {
+		r.InstanceType = instanceType
+	}
+}
+
+func TagInstanceID(instanceID uint32) TagFieldOption {
+	return func(r *ResourceEvent) {
+		r.InstanceID = instanceID
+	}
+}
+
+func TagInstanceName(instanceName string) TagFieldOption {
+	return func(r *ResourceEvent) {
+		r.InstanceName = instanceName
+	}
+}
 
 func TagAttributeSubnetIDs(netIDs []uint32) TagFieldOption {
 	return func(r *ResourceEvent) {
@@ -145,6 +192,12 @@ func TagPodGroupID(id int) TagFieldOption {
 	}
 }
 
+func TagPodGroupType(t uint32) TagFieldOption {
+	return func(r *ResourceEvent) {
+		r.PodGroupType = uint8(t)
+	}
+}
+
 func TagPodID(id int) TagFieldOption {
 	return func(r *ResourceEvent) {
 		r.PodID = uint32(id)
@@ -163,16 +216,28 @@ func TagIP(ip string) TagFieldOption {
 	}
 }
 
+func TagGProcessID(id uint32) TagFieldOption {
+	return func(r *ResourceEvent) {
+		r.GProcessID = id
+	}
+}
+
+func TagGProcessName(name string) TagFieldOption {
+	return func(r *ResourceEvent) {
+		r.GProcessName = name
+	}
+}
+
 func (r *ResourceEvent) Release() {
 	ReleaseResourceEvent(r)
 }
 
-var poolResourceEvent = pool.NewLockFreePool(func() interface{} {
+var poolResourceEvent = pool.NewLockFreePool(func() *ResourceEvent {
 	return new(ResourceEvent)
 })
 
 func AcquireResourceEvent() *ResourceEvent {
-	return poolResourceEvent.Get().(*ResourceEvent)
+	return poolResourceEvent.Get()
 }
 
 func ReleaseResourceEvent(event *ResourceEvent) {

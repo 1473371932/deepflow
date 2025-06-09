@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use enum_dispatch::enum_dispatch;
 use public::bitmap::Bitmap;
-use public::l7_protocol::L7ProtocolEnum;
+use public::l7_protocol::{L7ProtocolChecker as L7ProtocolCheckerBitmap, L7ProtocolEnum};
 
 use super::protocol_logs::sql::ObfuscateCache;
 use super::{
@@ -124,6 +124,7 @@ pub type L7ProtocolTuple = (L7Protocol, Option<Bitmap>);
 pub struct L7ProtocolChecker {
     tcp: Vec<L7ProtocolTuple>,
     udp: Vec<L7ProtocolTuple>,
+    other: Vec<L7ProtocolTuple>,
 }
 
 impl L7ProtocolChecker {
@@ -133,9 +134,14 @@ impl L7ProtocolChecker {
     ) -> Self {
         let mut tcp = vec![];
         let mut udp = vec![];
+        let mut other = vec![];
         for parser in get_all_protocol() {
             let protocol = parser.protocol();
             if !protocol_bitmap.is_enabled(protocol) {
+                continue;
+            }
+            if parser.parsable_on_other() {
+                other.push((protocol, port_bitmap.get(&protocol).map(|m| m.clone())));
                 continue;
             }
             if parser.parsable_on_tcp() {
@@ -146,7 +152,7 @@ impl L7ProtocolChecker {
             }
         }
 
-        L7ProtocolChecker { tcp, udp }
+        L7ProtocolChecker { tcp, udp, other }
     }
 
     pub fn possible_protocols(
@@ -158,7 +164,7 @@ impl L7ProtocolChecker {
             iter: match l4_protocol {
                 L4Protocol::Tcp => self.tcp.iter(),
                 L4Protocol::Udp => self.udp.iter(),
-                _ => [].iter(),
+                _ => self.other.iter(),
             },
             port,
         }
@@ -190,15 +196,15 @@ pub struct FlowLog {
     l7_protocol_log_parser: Option<Box<L7ProtocolParser>>,
     // use for cache previous log info, use for calculate rrt
     perf_cache: Rc<RefCell<L7PerfCache>>,
-    l7_protocol_enum: L7ProtocolEnum,
+    pub l7_protocol_enum: L7ProtocolEnum,
 
     // Only for eBPF data, the server_port will be set in l7_check() method, it checks the first
     // request packet's payload, and then set self.server_port = packet.lookup_key.dst_port,
     // we use the server_port to judge packet's direction.
     pub server_port: u16,
 
-    is_success: bool,
-    is_skip: bool,
+    l7_protocol_inference_succeed: bool,
+    skip_l7_protocol_inference: bool,
 
     wasm_vm: Rc<RefCell<Option<WasmVm>>>,
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -207,7 +213,7 @@ pub struct FlowLog {
     rrt_timeout: usize,
 
     // the timestamp sec of accumulate fail exceed l7_protocol_inference_max_fail_count
-    last_fail: Option<u64>,
+    start_of_skip_l7_protocol_inference: Option<u64>,
     l7_protocol_inference_ttl: u64,
 
     ntp_diff: Arc<AtomicI64>,
@@ -220,11 +226,17 @@ impl FlowLog {
     // if flow parse fail exceed l7_protocol_inference_max_fail_count and time exceed l7_protocol_inference_ttl,
     // recover the flow check and parse
     fn check_fail_recover(&mut self) {
-        if self.is_skip {
+        if self.skip_l7_protocol_inference {
             let now = get_timestamp(self.ntp_diff.load(Ordering::Relaxed));
-            if now.as_secs() > self.last_fail.unwrap() + self.l7_protocol_inference_ttl {
-                self.last_fail = None;
-                self.is_skip = false;
+            if now.as_secs()
+                > self.start_of_skip_l7_protocol_inference.unwrap() + self.l7_protocol_inference_ttl
+            {
+                self.start_of_skip_l7_protocol_inference = None;
+                self.skip_l7_protocol_inference = false;
+
+                if !self.l7_protocol_inference_succeed {
+                    self.l7_protocol_log_parser = None
+                }
             }
         }
     }
@@ -240,7 +252,7 @@ impl FlowLog {
         local_epc: i32,
         remote_epc: i32,
     ) -> Result<L7ParseResult> {
-        if let Some(payload) = packet.get_l4_payload() {
+        if let Some(payload) = packet.get_l7() {
             let mut parse_param = ParseParam::new(
                 &*packet,
                 self.perf_cache.clone(),
@@ -250,11 +262,12 @@ impl FlowLog {
                 is_parse_perf,
                 is_parse_log,
             );
-            parse_param.set_log_parse_config(log_parser_config);
+            parse_param.set_log_parser_config(log_parser_config);
             #[cfg(any(target_os = "linux", target_os = "android"))]
             parse_param.set_counter(self.stats_counter.clone());
             parse_param.set_rrt_timeout(self.rrt_timeout);
             parse_param.set_buf_size(flow_config.l7_log_packet_size as usize);
+            parse_param.set_captured_byte(packet.get_captured_byte());
             parse_param.set_oracle_conf(flow_config.oracle_parse_conf);
 
             let parser = self.l7_protocol_log_parser.as_mut().unwrap();
@@ -295,15 +308,16 @@ impl FlowLog {
             };
             parser.reset();
 
-            if !self.is_success {
-                self.is_success = ret.is_ok();
-                if self.is_success && !cached {
+            if !self.l7_protocol_inference_succeed {
+                self.l7_protocol_inference_succeed = ret.is_ok();
+                if self.l7_protocol_inference_succeed && !cached {
                     cache_proto(self.l7_protocol_enum.clone());
                 }
-                if !self.is_success {
-                    self.is_skip = cache_proto(L7ProtocolEnum::default());
-                    if self.is_skip {
-                        self.last_fail = Some(packet.lookup_key.timestamp.as_secs())
+                if !self.l7_protocol_inference_succeed {
+                    self.skip_l7_protocol_inference = cache_proto(L7ProtocolEnum::default());
+                    if self.skip_l7_protocol_inference {
+                        self.start_of_skip_l7_protocol_inference =
+                            Some(packet.lookup_key.timestamp.as_secs())
                     }
                 }
             }
@@ -325,7 +339,7 @@ impl FlowLog {
         remote_epc: i32,
         checker: &L7ProtocolChecker,
     ) -> Result<L7ParseResult> {
-        if let Some(payload) = packet.get_l4_payload() {
+        if let Some(payload) = packet.get_l7() {
             let pkt_size = flow_config.l7_log_packet_size as usize;
 
             let cut_payload = if pkt_size > payload.len() {
@@ -343,11 +357,12 @@ impl FlowLog {
                 is_parse_perf,
                 is_parse_log,
             );
-            param.set_log_parse_config(log_parser_config);
+            param.set_log_parser_config(log_parser_config);
             #[cfg(any(target_os = "linux", target_os = "android"))]
             param.set_counter(self.stats_counter.clone());
             param.set_rrt_timeout(self.rrt_timeout);
             param.set_buf_size(pkt_size);
+            param.set_captured_byte(payload.len());
             param.set_oracle_conf(flow_config.oracle_parse_conf);
 
             for protocol in checker.possible_protocols(
@@ -369,7 +384,7 @@ impl FlowLog {
                 if parser.check_payload(cut_payload, &param) {
                     self.l7_protocol_enum = parser.l7_protocol_enum();
 
-                    // redis can not determine dirction by RESP protocol when pakcet is from ebpf, special treatment
+                    // redis can not determine direction by RESP protocol when packet is from ebpf, special treatment
                     if self.l7_protocol_enum.get_l7_protocol() == L7Protocol::Redis {
                         let host = packet.get_redis_server_addr();
                         let server_ip = host.0;
@@ -381,7 +396,13 @@ impl FlowLog {
                         } else {
                             packet.lookup_key.direction = PacketDirection::ClientToServer;
                         }
-                    } else {
+                    } else if packet.signal_source != SignalSource::EBPF || self.server_port == 0 {
+                        /*
+                            1. non-eBPF: Set the first packet's `dst_port` as `server_port` and
+                                its direction as c2s.
+                            2. eBPF: If the `server_port` can not be determined in `FlowMap::init_flow`,
+                                use the first packet's `dst_port` as `server_port`.
+                        */
                         self.server_port = packet.lookup_key.dst_port;
                         packet.lookup_key.direction = PacketDirection::ClientToServer;
                     }
@@ -400,7 +421,7 @@ impl FlowLog {
                 }
             }
 
-            self.is_skip = match packet.signal_source {
+            self.skip_l7_protocol_inference = match packet.signal_source {
                 SignalSource::EBPF => app_table.set_protocol_from_ebpf(
                     packet,
                     L7ProtocolEnum::default(),
@@ -409,8 +430,9 @@ impl FlowLog {
                 ),
                 _ => app_table.set_protocol(packet, L7ProtocolEnum::default()),
             };
-            if self.is_skip {
-                self.last_fail = Some(packet.lookup_key.timestamp.as_secs())
+            if self.skip_l7_protocol_inference {
+                self.start_of_skip_l7_protocol_inference =
+                    Some(packet.lookup_key.timestamp.as_secs())
             }
         }
 
@@ -430,7 +452,7 @@ impl FlowLog {
         checker: &L7ProtocolChecker,
     ) -> Result<L7ParseResult> {
         self.check_fail_recover();
-        if self.is_skip {
+        if self.skip_l7_protocol_inference {
             return Err(Error::L7ProtocolParseLimit);
         }
 
@@ -458,7 +480,11 @@ impl FlowLog {
             );
         }
 
-        if packet.l4_payload_len() < 2 {
+        let Some(payload) = packet.get_l7() else {
+            return Err(Error::L7ProtocolUnknown);
+        };
+
+        if payload.len() < 2 {
             return Err(Error::L7ProtocolUnknown);
         }
 
@@ -520,14 +546,14 @@ impl FlowLog {
             perf_cache,
             l7_protocol_enum,
             server_port: server_port,
-            is_success: false,
-            is_skip,
+            l7_protocol_inference_succeed: false,
+            skip_l7_protocol_inference: is_skip,
             wasm_vm,
             #[cfg(any(target_os = "linux", target_os = "android"))]
             so_plugin,
             stats_counter,
             rrt_timeout,
-            last_fail: last_time,
+            start_of_skip_l7_protocol_inference: last_time,
             l7_protocol_inference_ttl,
             ntp_diff,
             obfuscate_cache,
@@ -576,11 +602,42 @@ impl FlowLog {
         Ok(L7ParseResult::None)
     }
 
-    pub fn parse_l3(&mut self, packet: &mut MetaPacket) -> Result<()> {
+    pub fn parse_l3(
+        &mut self,
+        flow_config: &FlowConfig,
+        log_parser_config: &LogParserConfig,
+        packet: &mut MetaPacket,
+        l7_performance_enabled: bool,
+        l7_log_parse_enabled: bool,
+        app_table: &mut AppTable,
+        local_epc: i32,
+        remote_epc: i32,
+        checker: &L7ProtocolChecker,
+    ) -> Result<L7ParseResult> {
         if let Some(l4) = self.l4.as_mut() {
             l4.parse(packet, false)?;
         }
-        Ok(())
+
+        if packet.signal_source == SignalSource::EBPF {
+            return Ok(L7ParseResult::None);
+        }
+
+        if l7_performance_enabled || l7_log_parse_enabled {
+            // 抛出错误由flowMap.FlowPerfCounter处理
+            return self.l7_parse(
+                flow_config,
+                log_parser_config,
+                packet,
+                app_table,
+                l7_performance_enabled,
+                l7_log_parse_enabled,
+                local_epc,
+                remote_epc,
+                checker,
+            );
+        }
+
+        Ok(L7ParseResult::None)
     }
 
     pub fn copy_and_reset_l4_perf_data(&mut self, flow_reversed: bool, flow: &mut Flow) {

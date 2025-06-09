@@ -17,81 +17,90 @@
 package tagrecorder
 
 import (
-	"encoding/json"
-	"strings"
-
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type ChPodServiceK8sAnnotations struct {
-	UpdaterBase[mysql.ChPodServiceK8sAnnotations, K8sAnnotationsKey]
+	SubscriberComponent[
+		*message.PodServiceAdd,
+		message.PodServiceAdd,
+		*message.PodServiceFieldsUpdate,
+		message.PodServiceFieldsUpdate,
+		*message.PodServiceDelete,
+		message.PodServiceDelete,
+		metadbmodel.PodService,
+		metadbmodel.ChPodServiceK8sAnnotations,
+		IDKey,
+	]
 }
 
 func NewChPodServiceK8sAnnotations() *ChPodServiceK8sAnnotations {
-	updater := &ChPodServiceK8sAnnotations{
-		UpdaterBase[mysql.ChPodServiceK8sAnnotations, K8sAnnotationsKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_K8S_ANNOTATIONS,
-		},
+	mng := &ChPodServiceK8sAnnotations{
+		newSubscriberComponent[
+			*message.PodServiceAdd,
+			message.PodServiceAdd,
+			*message.PodServiceFieldsUpdate,
+			message.PodServiceFieldsUpdate,
+			*message.PodServiceDelete,
+			message.PodServiceDelete,
+			metadbmodel.PodService,
+			metadbmodel.ChPodServiceK8sAnnotations,
+			IDKey,
+		](
+			common.RESOURCE_TYPE_POD_SERVICE_EN, RESOURCE_TYPE_CH_POD_SERVICE_K8S_ANNOTATIONS,
+		),
 	}
-	updater.dataGenerator = updater
-	return updater
+	mng.subscriberDG = mng
+	return mng
 }
 
-func (k *ChPodServiceK8sAnnotations) generateNewData() (map[K8sAnnotationsKey]mysql.ChPodServiceK8sAnnotations, bool) {
-	var podServices []mysql.PodService
-	err := mysql.Db.Unscoped().Find(&podServices).Error
-	if err != nil {
-		log.Errorf(dbQueryResourceFailed(k.resourceTypeName, err))
-		return nil, false
-	}
-
-	keyToItem := make(map[K8sAnnotationsKey]mysql.ChPodServiceK8sAnnotations)
-	for _, podService := range podServices {
-		annotationsMap := map[string]string{}
-		annotations := strings.Split(podService.Annotation, ", ")
-		for _, singleAnnotation := range annotations {
-			annotationInfo := strings.Split(singleAnnotation, ":")
-			if len(annotationInfo) == 2 {
-				annotationsMap[annotationInfo[0]] = annotationInfo[1]
-			}
-		}
-		if len(annotationsMap) > 0 {
-			annotationStr, err := json.Marshal(annotationsMap)
-			if err != nil {
-				log.Error(err)
-				return nil, false
-			}
-			key := K8sAnnotationsKey{
-				ID: podService.ID,
-			}
-			keyToItem[key] = mysql.ChPodServiceK8sAnnotations{
-				ID:          podService.ID,
-				Annotations: string(annotationStr),
-				L3EPCID:     podService.VPCID,
-				PodNsID:     podService.PodNamespaceID,
-			}
-		}
-	}
-	return keyToItem, true
-}
-
-func (k *ChPodServiceK8sAnnotations) generateKey(dbItem mysql.ChPodServiceK8sAnnotations) K8sAnnotationsKey {
-	return K8sAnnotationsKey{ID: dbItem.ID}
-}
-
-func (k *ChPodServiceK8sAnnotations) generateUpdateInfo(oldItem, newItem mysql.ChPodServiceK8sAnnotations) (map[string]interface{}, bool) {
+// onResourceUpdated implements SubscriberDataGenerator
+func (c *ChPodServiceK8sAnnotations) onResourceUpdated(sourceID int, fieldsUpdate *message.PodServiceFieldsUpdate, db *metadb.DB) {
 	updateInfo := make(map[string]interface{})
-	if oldItem.Annotations != newItem.Annotations {
-		updateInfo["annotations"] = newItem.Annotations
+	var chItem metadbmodel.ChPodServiceK8sAnnotations
+
+	if fieldsUpdate.Annotation.IsDifferent() {
+		annotations, _ := common.StrToJsonAndMap(fieldsUpdate.Annotation.GetNew())
+		if annotations != "" {
+			updateInfo["annotations"] = annotations
+		}
 	}
-	if oldItem.L3EPCID != newItem.L3EPCID {
-		updateInfo["l3_epc_id"] = newItem.L3EPCID
-	}
-	if oldItem.PodNsID != newItem.PodNsID {
-		updateInfo["pod_ns_id"] = newItem.PodNsID
-	}
+	targetKey := IDKey{ID: sourceID}
 	if len(updateInfo) > 0 {
-		return updateInfo, true
+		db.Where("id = ?", sourceID).First(&chItem)
+		if chItem.ID == 0 {
+			c.SubscriberComponent.dbOperator.add(
+				[]IDKey{targetKey},
+				[]metadbmodel.ChPodServiceK8sAnnotations{{
+					ChIDBase:    metadbmodel.ChIDBase{ID: sourceID},
+					Annotations: updateInfo["annotations"].(string),
+				}},
+				db,
+			)
+		}
 	}
-	return nil, false
+	c.updateOrSync(db, targetKey, updateInfo)
+}
+
+// sourceToTarget implements SubscriberDataGenerator
+func (c *ChPodServiceK8sAnnotations) sourceToTarget(md *message.Metadata, source *metadbmodel.PodService) (keys []IDKey, targets []metadbmodel.ChPodServiceK8sAnnotations) {
+	if source.Annotation == "" {
+		return
+	}
+	annotations, _ := common.StrToJsonAndMap(source.Annotation)
+	return []IDKey{{ID: source.ID}}, []metadbmodel.ChPodServiceK8sAnnotations{{
+		ChIDBase:    metadbmodel.ChIDBase{ID: source.ID},
+		Annotations: annotations,
+		TeamID:      md.TeamID,
+		DomainID:    md.DomainID,
+		SubDomainID: md.SubDomainID,
+	}}
+}
+
+// softDeletedTargetsUpdated implements SubscriberDataGenerator
+func (c *ChPodServiceK8sAnnotations) softDeletedTargetsUpdated(targets []metadbmodel.ChPodServiceK8sAnnotations, db *metadb.DB) {
+
 }

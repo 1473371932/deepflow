@@ -14,57 +14,132 @@
  * limitations under the License.
  */
 
-use serde::Serialize;
+use std::fmt::Write;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
-use super::pb_adapter::{ExtendedInfo, L7ProtocolSendLog, L7Request, L7Response};
-use super::{consts::*, value_is_default, AppProtoHead, L7ResponseStatus, LogMessageType};
-use crate::common::flow::L7PerfStats;
-use crate::common::l7_protocol_log::L7ParseResult;
+use log::debug;
+use serde::{ser::SerializeStruct, Serialize, Serializer};
+use simple_dns::{rdata::RData, Packet, PacketFlag, SimpleDnsError, QTYPE, RCODE, TYPE};
+
+use super::{
+    pb_adapter::{ExtendedInfo, L7ProtocolSendLog, L7Request, L7Response},
+    AppProtoHead, L7ResponseStatus, LogMessageType,
+};
 use crate::{
     common::{
         enums::IpProtocol,
+        flow::L7PerfStats,
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
-        l7_protocol_log::{L7ProtocolParserInterface, ParseParam},
+        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
         meta_packet::EbpfFlags,
-        IPV4_ADDR_LEN, IPV6_ADDR_LEN,
     },
-    flow_generator::error::{Error, Result},
+    config::handler::LogParserConfig,
+    flow_generator::{
+        error::{Error, Result},
+        protocol_logs::set_captured_byte,
+    },
     utils::bytes::read_u16_be,
 };
-use public::{l7_protocol::L7Protocol, utils::net::parse_ip_slice};
+use public::l7_protocol::L7Protocol;
 
-#[derive(Serialize, Default, Debug, Clone, PartialEq, Eq)]
+const TCP_PAYLOAD_OFFSET: usize = 2;
+const DNS_HEADER_LEN: usize = 12;
+const ANSWER_SPLIT: &str = ";";
+
+impl From<SimpleDnsError> for Error {
+    fn from(e: SimpleDnsError) -> Self {
+        Error::L7LogParseFailed {
+            proto: L7Protocol::DNS,
+            reason: e.to_string().into(),
+        }
+    }
+}
+
+fn qtype_to_string(qtype: QTYPE) -> String {
+    match qtype {
+        QTYPE::TYPE(t) => format!("{t:?}"),
+        _ => format!("{qtype:?}"),
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DnsInfo {
-    #[serde(rename = "request_id", skip_serializing_if = "value_is_default")]
     pub trans_id: u16,
-    #[serde(rename = "request_type", skip_serializing_if = "value_is_default")]
-    pub query_type: u8,
-    #[serde(skip)]
-    pub domain_type: u16,
+    pub query_type: Option<QTYPE>,
 
-    #[serde(rename = "request_resource", skip_serializing_if = "value_is_default")]
     pub query_name: String,
-    // 根据查询类型的不同而不同，如：
-    // A: ipv4/ipv6地址
-    // NS: name server
-    // SOA: primary name server
-    #[serde(rename = "response_result", skip_serializing_if = "value_is_default")]
-    pub answers: String,
+    pub answers: Vec<(TYPE, String)>,
 
-    #[serde(rename = "response_status")]
-    pub status: L7ResponseStatus,
-    #[serde(rename = "response_code", skip_serializing_if = "Option::is_none")]
-    pub status_code: Option<i32>,
+    pub is_unconcerned: bool,
+    pub status_code: Option<u8>,
 
     msg_type: LogMessageType,
-    #[serde(skip)]
-    is_tls: bool,
+
+    captured_request_byte: u32,
+    captured_response_byte: u32,
     rrt: u64,
+
+    // non serialize fields
+    headers_offset: u32,
+    is_tls: bool,
+    is_on_blacklist: bool,
+}
+
+impl Serialize for DnsInfo {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // initial count for: msg_type, captured_request_byte, captured_response_byte, rrt, status
+        let mut field_count = 5;
+        if self.trans_id != 0 {
+            field_count += 1;
+        }
+        if self.query_type.is_some() {
+            field_count += 1;
+        }
+        if !self.query_name.is_empty() {
+            field_count += 1;
+        }
+        if !self.answers.is_empty() {
+            field_count += 1;
+        }
+        if self.status_code.is_some() {
+            field_count += 1;
+        }
+
+        let mut state = serializer.serialize_struct("DnsInfo", field_count)?;
+        if self.trans_id != 0 {
+            state.serialize_field("request_id", &self.trans_id)?;
+        }
+        if let Some(qtype) = self.query_type {
+            state.serialize_field("request_type", &qtype_to_string(qtype))?;
+        }
+        if !self.query_name.is_empty() {
+            state.serialize_field("request_resource", &self.query_name)?;
+        }
+        if !self.answers.is_empty() {
+            state.serialize_field("response_result", &self.answers_to_string())?;
+        }
+        state.serialize_field("response_status", &self.status())?;
+        if let Some(status_code) = self.status_code {
+            state.serialize_field("response_code", &status_code)?;
+        }
+        state.serialize_field("msg_type", &self.msg_type)?;
+        state.serialize_field("captured_request_byte", &self.captured_request_byte)?;
+        state.serialize_field("captured_response_byte", &self.captured_response_byte)?;
+        state.serialize_field("rrt", &self.rrt)?;
+        state.end()
+    }
 }
 
 impl L7ProtocolInfoInterface for DnsInfo {
     fn session_id(&self) -> Option<u32> {
         Some(self.trans_id as u32)
+    }
+
+    fn tcp_seq_offset(&self) -> u32 {
+        self.headers_offset
     }
 
     fn merge_log(
@@ -88,58 +163,196 @@ impl L7ProtocolInfoInterface for DnsInfo {
     fn is_tls(&self) -> bool {
         self.is_tls
     }
+
+    fn get_endpoint(&self) -> Option<String> {
+        if self.query_name.is_empty() {
+            return None;
+        }
+        Some(self.query_name.clone())
+    }
+
+    fn get_request_resource_length(&self) -> usize {
+        self.query_name.len() + self.answers.iter().map(|(_, s)| s.len()).sum::<usize>()
+    }
+
+    fn is_on_blacklist(&self) -> bool {
+        self.is_on_blacklist
+    }
 }
 
 impl DnsInfo {
     pub fn merge(&mut self, other: &mut Self) {
         std::mem::swap(&mut self.answers, &mut other.answers);
-        if other.status != L7ResponseStatus::default() {
-            self.status = other.status;
+        self.is_unconcerned |= other.is_unconcerned;
+        match (self.status_code, other.status_code) {
+            (None, Some(code)) => self.status_code = Some(code),
+            (Some(code), Some(other_code))
+                if code != other_code && RCODE::from(code as u16) == RCODE::NoError =>
+            {
+                self.status_code = Some(other_code)
+            }
+            _ => (),
         }
+        self.captured_response_byte = other.captured_response_byte;
+        if other.is_on_blacklist {
+            self.is_on_blacklist = other.is_on_blacklist;
+        }
+    }
 
-        if let Some(code) = other.status_code {
-            if code != 0 {
-                self.status_code = Some(code);
+    fn is_query_address(&self) -> bool {
+        match self.query_type {
+            Some(QTYPE::TYPE(TYPE::A | TYPE::AAAA)) => true,
+            _ => false,
+        }
+    }
+
+    fn set_is_on_blacklist(&mut self, config: &LogParserConfig) {
+        if let Some(t) = config.l7_log_blacklist_trie.get(&L7Protocol::DNS) {
+            self.is_on_blacklist = t.request_resource.is_on_blacklist(&self.query_name)
+                || t.request_domain.is_on_blacklist(&self.query_name)
+                || t.endpoint.is_on_blacklist(&self.query_name);
+            if let Some(qtype) = self.query_type {
+                self.is_on_blacklist |= t.request_type.is_on_blacklist(&qtype_to_string(qtype));
             }
         }
     }
 
-    pub fn get_domain_str(&self) -> &'static str {
-        let typ = [
-            "", "A", "NS", "MD", "MF", "CNAME", "SOA", "MB", "MG", "MR", "NULL", "WKS", "PTR",
-            "HINFO", "MINFO", "MX", "TXT",
-        ];
-
-        match self.domain_type {
-            1..=16 => typ[self.domain_type as usize],
-            28 => "AAAA",
-            252 => "AXFR",
-            253 => "MAILB",
-            254 => "MAILA",
-            255 => "ANY",
-            _ => "",
+    fn parse_request(p: &Packet) -> Result<Self> {
+        let mut info = DnsInfo {
+            trans_id: p.id(),
+            msg_type: LogMessageType::Request,
+            ..Default::default()
+        };
+        // in practice only one question in a DNS request
+        if p.questions.len() != 1 {
+            debug!("found DNS request with {} questions", p.questions.len());
         }
+        let Some(question) = p.questions.first() else {
+            return Err(Error::L7LogParseFailed {
+                proto: L7Protocol::DNS,
+                reason: "no question in DNS request".into(),
+            });
+        };
+        info.query_name = question.qname.to_string();
+        info.query_type = Some(question.qtype);
+        Ok(info)
+    }
+
+    fn parse_response(p: &Packet) -> Result<Self> {
+        let mut info = DnsInfo {
+            trans_id: p.id(),
+            msg_type: LogMessageType::Response,
+            status_code: Some(p.rcode() as u8),
+            ..Default::default()
+        };
+        // also asserting only one question here
+        let Some(question) = p.questions.first() else {
+            return Err(Error::L7LogParseFailed {
+                proto: L7Protocol::DNS,
+                reason: "no question in DNS request".into(),
+            });
+        };
+        info.query_name = question.qname.to_string();
+        info.query_type = Some(question.qtype);
+        for rr in p.answers.iter().chain(p.name_servers.iter()) {
+            let answer = match &rr.rdata {
+                RData::A(d) => Ipv4Addr::from(d.address).to_string(),
+                RData::AAAA(d) => Ipv6Addr::from(d.address).to_string(),
+                RData::NS(d) => d.0.to_string(),
+                RData::SOA(d) => d.mname.to_string(),
+                RData::WKS(d) => Ipv4Addr::from(d.address).to_string(),
+                RData::PTR(d) => d.0.to_string(),
+                // TODO: DNAME
+                // simple-dns do not have dname support, perhaps this is not often used
+                _ => String::new(),
+            };
+            info.answers.push((rr.rdata.type_code(), answer));
+        }
+        Ok(info)
+    }
+
+    // parse a UDP DNS packet
+    fn parse(params: &ParseParam, payload: &[u8]) -> Result<Self> {
+        let p = Packet::parse(payload)?;
+        let mut info = if p.has_flags(PacketFlag::RESPONSE) {
+            let mut info = Self::parse_response(&p)?;
+            if let Some(c) = params.parse_config {
+                for (_, answer) in info.answers.iter() {
+                    if c.unconcerned_dns_nxdomain_trie.is_unconcerned(answer) {
+                        info.is_unconcerned = true;
+                        break;
+                    }
+                }
+            }
+            info
+        } else {
+            Self::parse_request(&p)?
+        };
+        set_captured_byte!(info, params);
+        Ok(info)
+    }
+
+    fn status(&self) -> L7ResponseStatus {
+        if let Some(status_code) = self.status_code {
+            if self.is_unconcerned {
+                return L7ResponseStatus::Ok;
+            }
+            match RCODE::from(status_code as u16) {
+                RCODE::NoError => L7ResponseStatus::Ok,
+                RCODE::FormatError | RCODE::NameError => L7ResponseStatus::ClientError,
+                _ => L7ResponseStatus::ServerError,
+            }
+        } else {
+            L7ResponseStatus::Unknown
+        }
+    }
+
+    fn answers_to_string(&self) -> String {
+        let mut answers = String::new();
+        for (i, (rtype, answer)) in self.answers.iter().enumerate() {
+            if i > 0 {
+                answers.push_str(ANSWER_SPLIT);
+            }
+            if answer.is_empty() {
+                let _ = write!(&mut answers, "{rtype:?}");
+            } else {
+                let _ = write!(&mut answers, "{rtype:?}={answer}");
+            }
+        }
+        answers
     }
 }
 
 impl From<DnsInfo> for L7ProtocolSendLog {
     fn from(f: DnsInfo) -> Self {
-        let req_type = String::from(f.get_domain_str());
         let flags = if f.is_tls {
             EbpfFlags::TLS.bits()
         } else {
             EbpfFlags::NONE.bits()
         };
+        let status = f.status();
+        let result = f.answers_to_string();
         let log = L7ProtocolSendLog {
+            captured_request_byte: f.captured_request_byte,
+            captured_response_byte: f.captured_response_byte,
             req: L7Request {
-                req_type,
-                resource: f.query_name,
+                req_type: f
+                    .query_type
+                    .map(|qtype| qtype_to_string(qtype))
+                    .unwrap_or_default(),
+                resource: f.query_name.clone(),
+                domain: if f.is_query_address() {
+                    f.query_name.clone()
+                } else {
+                    String::new()
+                },
+                endpoint: f.query_name,
                 ..Default::default()
             },
             resp: L7Response {
-                result: f.answers,
-                code: f.status_code,
-                status: f.status,
+                result,
+                code: f.status_code.map(|c| c as i32),
+                status,
                 ..Default::default()
             },
             ext_info: Some(ExtendedInfo {
@@ -157,6 +370,7 @@ impl From<DnsInfo> for L7ProtocolSendLog {
 #[derive(Default)]
 pub struct DnsLog {
     perf_stats: Option<L7PerfStats>,
+    last_is_on_blacklist: bool,
 }
 
 //解析器接口实现
@@ -165,22 +379,54 @@ impl L7ProtocolParserInterface for DnsLog {
         if !param.ebpf_type.is_raw_protocol() {
             return false;
         }
-        let mut info = DnsInfo::default();
-        self.parse(payload, &mut info, param).is_ok()
-            && info.msg_type == LogMessageType::Request
-            && !info.query_name.is_empty()
+
+        match self.parse(payload, param, true) {
+            Ok(info) => match info.get(0) {
+                Some(info)
+                    if info.msg_type == LogMessageType::Request && !info.query_name.is_empty() =>
+                {
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
-        let mut info = DnsInfo::default();
-        self.parse(payload, &mut info, param)?;
-        info.cal_rrt(param, None).map(|rrt| {
-            info.rrt = rrt;
-            self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
-        });
-        info.is_tls = param.is_tls();
+        let mut infos = self.parse(payload, param, false)?;
+
+        for info in &mut infos {
+            info.is_tls = param.is_tls();
+            if let Some(config) = param.parse_config {
+                info.set_is_on_blacklist(config);
+            }
+            if !info.is_on_blacklist && !self.last_is_on_blacklist {
+                if info.msg_type == LogMessageType::Response {
+                    self.perf_stats.as_mut().map(|p| p.inc_resp());
+                    if info.status() == L7ResponseStatus::ClientError {
+                        self.perf_stats.as_mut().map(|p| p.inc_req_err());
+                    } else if info.status() == L7ResponseStatus::ServerError {
+                        self.perf_stats.as_mut().map(|p| p.inc_resp_err());
+                    }
+                } else {
+                    self.perf_stats.as_mut().map(|p| p.inc_req());
+                }
+                info.cal_rrt(param, &None).map(|(rrt, _)| {
+                    info.rrt = rrt;
+                    self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
+                });
+            }
+            self.last_is_on_blacklist = info.is_on_blacklist;
+        }
+
         if param.parse_log {
-            Ok(L7ParseResult::Single(L7ProtocolInfo::DnsInfo(info)))
+            Ok(L7ParseResult::Multi(
+                infos
+                    .drain(..)
+                    .map(|i| L7ProtocolInfo::DnsInfo(i))
+                    .collect(),
+            ))
         } else {
             Ok(L7ParseResult::None)
         }
@@ -196,298 +442,79 @@ impl L7ProtocolParserInterface for DnsLog {
 }
 
 impl DnsLog {
-    fn decode_name(&self, payload: &[u8], g_offset: usize) -> Result<(String, usize)> {
-        let mut l_offset = g_offset;
-        let mut index = g_offset;
-        let mut buffer = String::new();
-
-        if payload.len() <= l_offset {
-            let err_msg = format!("payload too short: {}", payload.len());
-            return Err(Error::DNSLogParseFailed(err_msg));
-        }
-
-        if payload[index] == DNS_NAME_TAIL {
-            return Ok((buffer, index + 1));
-        }
-
-        while payload[index] != DNS_NAME_TAIL {
-            let name_type = payload[index] & 0xc0;
-            match name_type {
-                DNS_NAME_RESERVERD_40 | DNS_NAME_RESERVERD_80 => {
-                    let err_msg = format!("dns name label type error: {}", payload[index]);
-                    return Err(Error::DNSLogParseFailed(err_msg));
-                }
-                DNS_NAME_COMPRESS_POINTER => {
-                    if index + 2 > payload.len() {
-                        let err_msg = format!("dns name invalid index: {}", index);
-                        return Err(Error::DNSLogParseFailed(err_msg));
-                    }
-                    let index_ptr = read_u16_be(&payload[index..]) as usize & 0x3fff;
-                    if index_ptr >= index {
-                        let err_msg = format!("dns name compress pointer invalid: {}", index_ptr);
-                        return Err(Error::DNSLogParseFailed(err_msg));
-                    }
-                    index = index_ptr;
-                }
-                _ => {
-                    let size = index + 1 + payload[index] as usize;
-                    if size > payload.len()
-                        || (size > g_offset && (size - g_offset) > DNS_NAME_MAX_SIZE)
-                    {
-                        let err_msg = format!("dns name invalid index: {}", size);
-                        return Err(Error::DNSLogParseFailed(err_msg));
-                    }
-
-                    if buffer.len() > 0 {
-                        buffer.push('.');
-                    }
-                    match std::str::from_utf8(&payload[index + 1..size]) {
-                        Ok(s) => {
-                            buffer.push_str(s);
-                        }
-                        Err(e) => {
-                            let err_msg = format!("decode name error {}", e);
-                            return Err(Error::DNSLogParseFailed(err_msg));
-                        }
-                    }
-                    if buffer.len() > DNS_NAME_MAX_SIZE {
-                        let err_msg = format!("dns name invalid length:{}", buffer.len());
-                        return Err(Error::DNSLogParseFailed(err_msg));
-                    }
-                    index = size;
-                    if index >= payload.len() {
-                        let err_msg = format!("dns name invalid index: {}", index);
-                        return Err(Error::DNSLogParseFailed(err_msg));
-                    }
-
-                    if index > l_offset {
-                        l_offset = size;
-                    } else if payload[index] == DNS_NAME_TAIL {
-                        l_offset += 1;
-                    }
-                }
-            }
-        }
-
-        Ok((buffer, l_offset + 1))
-    }
-
-    fn decode_question(
-        &mut self,
-        payload: &[u8],
-        g_offset: usize,
-        info: &mut DnsInfo,
-    ) -> Result<usize> {
-        let (name, offset) = self.decode_name(payload, g_offset)?;
-        let qtype_size = payload[offset..].len();
-        if qtype_size < QUESTION_CLASS_TYPE_SIZE {
-            let err_msg = format!("question length error: {}", qtype_size);
-            return Err(Error::DNSLogParseFailed(err_msg));
-        }
-
-        if info.query_name.len() > 0 {
-            info.query_name.push(DOMAIN_NAME_SPLIT);
-        }
-        info.query_name.push_str(&name);
-        if info.query_type == DNS_REQUEST {
-            info.domain_type = read_u16_be(&payload[offset..]);
-            info.msg_type = LogMessageType::Request;
-        }
-
-        Ok(offset + QUESTION_CLASS_TYPE_SIZE)
-    }
-
-    fn decode_resource_record(
-        &mut self,
-        payload: &[u8],
-        g_offset: usize,
-        info: &mut DnsInfo,
-    ) -> Result<usize> {
-        let (_, offset) = self.decode_name(payload, g_offset)?;
-
-        if payload.len() <= offset {
-            let err_msg = format!("payload length error: {}", payload.len());
-            return Err(Error::DNSLogParseFailed(err_msg));
-        }
-
-        let resource_len = payload[offset..].len();
-        if resource_len < RR_RDATA_OFFSET {
-            let err_msg = format!("resource record length error: {}", resource_len);
-            return Err(Error::DNSLogParseFailed(err_msg));
-        }
-
-        info.domain_type = read_u16_be(&payload[offset..]);
-        let data_length = read_u16_be(&payload[offset + RR_DATALENGTH_OFFSET..]) as usize;
-        if data_length != 0 {
-            self.decode_rdata(payload, offset + RR_RDATA_OFFSET, data_length, info)?;
-        }
-
-        Ok(offset + RR_RDATA_OFFSET + data_length)
-    }
-
-    fn decode_rdata(
-        &mut self,
-        payload: &[u8],
-        g_offset: usize,
-        data_length: usize,
-        info: &mut DnsInfo,
-    ) -> Result<()> {
-        if payload.len() < g_offset + data_length {
-            return Err(Error::DNSLogParseFailed(
-                "invalid data: payload.len() < g_offset + data_length".to_string(),
-            ));
-        }
-
-        let answer_name_len = info.answers.len();
-        if answer_name_len > 0
-            && info.answers[answer_name_len - 1..] != DOMAIN_NAME_SPLIT.to_string()
-        {
-            info.answers.push(DOMAIN_NAME_SPLIT);
-        }
-
-        match info.domain_type {
-            DNS_TYPE_A | DNS_TYPE_AAAA => match data_length {
-                IPV4_ADDR_LEN | IPV6_ADDR_LEN => {
-                    if let Some(ipaddr) = parse_ip_slice(&payload[g_offset..g_offset + data_length])
-                    {
-                        info.answers.push_str(&ipaddr.to_string());
-                    }
-                }
-                _ => {
-                    let err_msg = format!(
-                        "domain type {} data length {} invalid",
-                        info.domain_type, data_length
-                    );
-                    return Err(Error::DNSLogParseFailed(err_msg));
-                }
-            },
-            DNS_TYPE_NS | DNS_TYPE_DNAME | DNS_TYPE_SOA => {
-                if data_length > DNS_NAME_MAX_SIZE {
-                    let err_msg = format!(
-                        "domain type {} data length {} invalid",
-                        info.domain_type, data_length
-                    );
-                    return Err(Error::DNSLogParseFailed(err_msg));
-                }
-
-                let (name, _) = self.decode_name(payload, g_offset)?;
-                info.answers.push_str(&name);
-            }
-            DNS_TYPE_WKS => {
-                if data_length < DNS_TYPE_WKS_LENGTH {
-                    let err_msg = format!(
-                        "domain type {} data length {} invalid",
-                        info.domain_type, data_length
-                    );
-                    return Err(Error::DNSLogParseFailed(err_msg));
-                }
-                if let Some(ipaddr) = parse_ip_slice(&payload[g_offset..g_offset + data_length]) {
-                    info.answers.push_str(&ipaddr.to_string());
-                }
-            }
-            DNS_TYPE_PTR => {
-                if data_length != DNS_TYPE_PTR_LENGTH {
-                    let err_msg = format!(
-                        "domain type {} data length {} invalid",
-                        info.domain_type, data_length
-                    );
-                    return Err(Error::DNSLogParseFailed(err_msg));
-                }
-            }
-            DNS_TYPE_CNAME => {
-                // doing nothing
-            }
-            _ => {
-                let err_msg = format!(
-                    "other domain type {} data length {} invalid",
-                    info.domain_type, data_length
-                );
-                return Err(Error::DNSLogParseFailed(err_msg));
-            }
-        }
-        Ok(())
-    }
-
-    fn set_status(&mut self, status_code: u8, info: &mut DnsInfo) {
-        if status_code == 0 {
-            info.status = L7ResponseStatus::Ok;
-        } else if status_code == 1 || status_code == 3 {
-            self.perf_stats.as_mut().map(|p| p.inc_req_err());
-            info.status = L7ResponseStatus::ClientError;
-        } else {
-            self.perf_stats.as_mut().map(|p| p.inc_resp_err());
-            info.status = L7ResponseStatus::ServerError;
-        }
-    }
-
-    fn decode_payload(&mut self, payload: &[u8], info: &mut DnsInfo) -> Result<()> {
-        if payload.len() <= DNS_HEADER_SIZE {
-            let err_msg = format!("dns payload length too short:{}", payload.len());
-            return Err(Error::DNSLogParseFailed(err_msg));
-        }
-        info.trans_id = read_u16_be(&payload[..DNS_HEADER_FLAGS_OFFSET]);
-        info.query_type = payload[DNS_HEADER_FLAGS_OFFSET] & 0x80;
-        let code = payload[DNS_HEADER_FLAGS_OFFSET + 1] & 0xf;
-        info.status_code = Some(code as i32);
-
-        let qd_count = read_u16_be(&payload[DNS_HEADER_QDCOUNT_OFFSET..]);
-        let an_count = read_u16_be(&payload[DNS_HEADER_ANCOUNT_OFFSET..]);
-        let ns_count = read_u16_be(&payload[DNS_HEADER_NSCOUNT_OFFSET..]);
-
-        let mut g_offset = DNS_HEADER_SIZE;
-        for _i in 0..qd_count {
-            g_offset = self.decode_question(payload, g_offset, info)?;
-        }
-
-        if info.query_type == DNS_RESPONSE {
-            info.query_type = 1;
-
-            for _i in 0..an_count {
-                g_offset = self.decode_resource_record(payload, g_offset, info)?;
-            }
-
-            for _i in 0..ns_count {
-                g_offset = self.decode_resource_record(payload, g_offset, info)?;
-            }
-
-            self.perf_stats.as_mut().map(|p| p.inc_resp());
-            self.set_status(code, info);
-            info.msg_type = LogMessageType::Response;
-        } else {
-            self.perf_stats.as_mut().map(|p| p.inc_req());
-        }
-
-        Ok(())
-    }
-
-    fn parse(&mut self, payload: &[u8], info: &mut DnsInfo, param: &ParseParam) -> Result<()> {
+    fn parse(&mut self, payload: &[u8], param: &ParseParam, check: bool) -> Result<Vec<DnsInfo>> {
         let proto = param.l4_protocol;
         if self.perf_stats.is_none() && param.parse_perf {
             self.perf_stats = Some(L7PerfStats::default())
         };
         match proto {
-            IpProtocol::UDP => self.decode_payload(payload, info),
+            IpProtocol::UDP => Ok(vec![DnsInfo::parse(param, payload)?]),
             IpProtocol::TCP => {
-                if payload.len() <= DNS_TCP_PAYLOAD_OFFSET {
-                    let err_msg = format!("dns payload length error:{}", payload.len());
-                    return Err(Error::DNSLogParseFailed(err_msg));
+                let mut offset = 0;
+                let mut all_info = vec![];
+
+                while offset < payload.len() {
+                    let frame = &payload[offset..];
+                    let Some(length_bytes) = frame.get(..TCP_PAYLOAD_OFFSET) else {
+                        break;
+                    };
+                    let len = read_u16_be(length_bytes) as usize;
+                    if len < DNS_HEADER_LEN || frame.len() < DNS_HEADER_LEN {
+                        break;
+                    }
+                    // Offset for TCP DNS:
+                    // Example:
+                    //                 0            2               ...
+                    //                 |____________|_______________|__
+                    // DNS Request:    | Length     | UDP DNS Header
+                    //
+                    // eBPF Data: tcp seq is 0 and payload is tcp.payload or tcp.payload[2..]
+                    //
+                    // if remaining bytes is exact match to len, only try parsing at &frame[2..]
+                    // if remaining bytes is greater than len, try parsing at &frame[2..] then &frame[0..]
+                    // if remaining bytes is less than len, try parsing at &frame[0..] then &frame[2..]
+                    let tries = if frame[TCP_PAYLOAD_OFFSET..].len() == len {
+                        [Some(2), None]
+                    } else if frame[TCP_PAYLOAD_OFFSET..].len() > len {
+                        [Some(2), Some(0)]
+                    } else {
+                        [Some(0), Some(2)]
+                    };
+                    let mut valid = false;
+                    for t in tries.iter() {
+                        if t.is_none() {
+                            continue;
+                        }
+                        let start = t.unwrap();
+                        let end_of_frame = frame.len().min(start + len);
+                        if let Ok(mut info) = DnsInfo::parse(&param, &frame[start..end_of_frame]) {
+                            valid = true;
+                            info.headers_offset = offset as u32;
+                            offset += end_of_frame;
+                            all_info.push(info);
+                            break;
+                        }
+                    }
+                    if !valid {
+                        // didn't find a valid DNS packet, finish parsing
+                        break;
+                    }
+
+                    if check {
+                        return Ok(all_info);
+                    }
                 }
 
-                let size = read_u16_be(payload) as usize;
-                if size != payload[DNS_TCP_PAYLOAD_OFFSET..].len() {
-                    self.decode_payload(payload, info)
-                } else {
-                    self.decode_payload(&payload[DNS_TCP_PAYLOAD_OFFSET..], info)
-                        .or_else(|_| {
-                            self.reset();
-                            self.decode_payload(payload, info)
-                        })
+                if all_info.is_empty() {
+                    return Err(Error::L7LogParseFailed {
+                        proto: L7Protocol::DNS,
+                        reason: "no valid DNS info found".into(),
+                    });
                 }
+
+                Ok(all_info)
             }
-            _ => {
-                let err_msg = format!("dns payload length error:{}", payload.len());
-                Err(Error::DNSLogParseFailed(err_msg))
-            }
+            _ => return Err(Error::InvalidIpProtocol),
         }
     }
 }
@@ -509,10 +536,20 @@ mod tests {
 
     const FILE_DIR: &str = "resources/test/flow_generator/dns";
 
+    fn test_output(s: &mut String, info: &DnsInfo, is_dns: bool) {
+        let _ = write!(
+            s,
+            "{} headers_offset: {} is_dns: {}\n",
+            &serde_json::to_string(info).unwrap(),
+            info.headers_offset,
+            is_dns
+        );
+    }
+
     fn run(name: &str) -> String {
-        let capture = Capture::load_pcap(Path::new(FILE_DIR).join(name), None);
+        let capture = Capture::load_pcap(Path::new(FILE_DIR).join(name));
         let log_cache = Rc::new(RefCell::new(L7PerfCache::new(L7_RRT_CACHE_CAPACITY)));
-        let mut packets = capture.as_meta_packets();
+        let mut packets = capture.collect::<Vec<_>>();
         if packets.is_empty() {
             return "".to_string();
         }
@@ -531,7 +568,7 @@ mod tests {
             };
 
             let mut dns = DnsLog::default();
-            let param = &ParseParam::new(
+            let param = &mut ParseParam::new(
                 packet as &MetaPacket,
                 log_cache.clone(),
                 Default::default(),
@@ -540,18 +577,18 @@ mod tests {
                 true,
                 true,
             );
+            param.set_captured_byte(payload.len());
             let is_dns = dns.check_payload(payload, param);
-            dns.reset();
             let info = dns.parse_payload(payload, param);
             if let Ok(info) = info {
-                match info.unwrap_single() {
-                    L7ProtocolInfo::DnsInfo(i) => {
-                        output.push_str(&format!("{:?} is_dns: {}\r\n", i, is_dns));
+                for i in info.unwrap_multi() {
+                    match i {
+                        L7ProtocolInfo::DnsInfo(i) => test_output(&mut output, &i, is_dns),
+                        _ => unreachable!(),
                     }
-                    _ => unreachable!(),
                 }
             } else {
-                output.push_str(&format!("{:?} is_dns: {}\r\n", DnsInfo::default(), is_dns));
+                test_output(&mut output, &DnsInfo::default(), is_dns);
             }
         }
         output
@@ -560,8 +597,10 @@ mod tests {
     #[test]
     fn check() {
         let files = vec![
+            ("dns-tcp-multi.pcap", "dns-tcp-multi.result"),
             ("dns.pcap", "dns.result"),
             ("a-and-ns.pcap", "a-and-ns.result"),
+            ("not-handled-qtype.pcap", "not-handled-qtype.result"),
         ];
 
         for item in files.iter() {
@@ -583,20 +622,36 @@ mod tests {
 
     #[test]
     fn check_perf() {
-        let expected = vec![(
-            "dns.pcap",
-            L7PerfStats {
-                request_count: 2,
-                response_count: 2,
-                err_client_count: 1,
-                err_server_count: 0,
-                err_timeout: 0,
-                rrt_count: 2,
-                rrt_sum: 181558,
-                rrt_max: 176754,
-                ..Default::default()
-            },
-        )];
+        let expected = vec![
+            (
+                "dns.pcap",
+                L7PerfStats {
+                    request_count: 2,
+                    response_count: 2,
+                    err_client_count: 1,
+                    err_server_count: 0,
+                    err_timeout: 0,
+                    rrt_count: 2,
+                    rrt_sum: 181558,
+                    rrt_max: 176754,
+                    ..Default::default()
+                },
+            ),
+            (
+                "dns-tcp-multi.pcap",
+                L7PerfStats {
+                    request_count: 2,
+                    response_count: 2,
+                    err_client_count: 0,
+                    err_server_count: 0,
+                    err_timeout: 0,
+                    rrt_count: 2,
+                    rrt_sum: 649,
+                    rrt_max: 355,
+                    ..Default::default()
+                },
+            ),
+        ];
 
         for item in expected.iter() {
             assert_eq!(item.1, run_perf(item.0), "parse pcap {} unexcepted", item.0);
@@ -607,8 +662,8 @@ mod tests {
         let rrt_cache = Rc::new(RefCell::new(L7PerfCache::new(100)));
         let mut dns = DnsLog::default();
 
-        let capture = Capture::load_pcap(Path::new(FILE_DIR).join(pcap), None);
-        let mut packets = capture.as_meta_packets();
+        let capture = Capture::load_pcap(Path::new(FILE_DIR).join(pcap));
+        let mut packets = capture.collect::<Vec<_>>();
         if packets.len() < 2 {
             unreachable!()
         }
@@ -619,8 +674,11 @@ mod tests {
             } else {
                 packet.lookup_key.direction = PacketDirection::ServerToClient;
             }
+            let Some(payload) = packet.get_l4_payload() else {
+                continue;
+            };
             let _ = dns.parse_payload(
-                packet.get_l4_payload().unwrap(),
+                payload,
                 &ParseParam::new(
                     &*packet,
                     rrt_cache.clone(),
@@ -633,5 +691,23 @@ mod tests {
             );
         }
         dns.perf_stats.unwrap()
+    }
+
+    #[test]
+    fn malformed_packet() {
+        let packet = MetaPacket::empty();
+        let mut pp = ParseParam::new(
+            &packet,
+            Rc::new(RefCell::new(L7PerfCache::new(100))),
+            Default::default(),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            Default::default(),
+            true,
+            true,
+        );
+        pp.l4_protocol = IpProtocol::TCP;
+
+        let mut dns = DnsLog::default();
+        let _ = dns.parse_payload(&[0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], &pp);
     }
 }

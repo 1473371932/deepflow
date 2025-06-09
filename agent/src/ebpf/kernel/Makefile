@@ -17,7 +17,8 @@ CLANG ?= /usr/bin/clang
 LLVM_STRIP ?= /usr/bin/llvm-strip
 LLVM_OBJDUMP ?= /usr/bin/llvm-objdump
 CC ?= gcc
-TAEGET_KERN_SRC = socket_trace.c perf_profiler.c
+TAEGET_KERN_SRC := socket_trace.bpf.c perf_profiler.bpf.c
+TAEGET_KERN_SRC += $(KERN_SRC_EXTRA)
 TAEGET_KERN_LL = $(TAEGET_KERN_SRC:c=ll)
 TAEGET_KERN_ELF = $(TAEGET_KERN_SRC:c=elf)
 ifeq ($(V),1)
@@ -38,19 +39,26 @@ else ifeq ($(LINUX_VER_5_2_PLUS),1)
 	EXTRA_EBPF_CLAGS = -DLINUX_VER_5_2_PLUS
 else ifeq ($(LINUX_VER_KYLIN),1)
 	EXTRA_EBPF_CLAGS = -DLINUX_VER_KYLIN
+else ifeq ($(LINUX_VER_KFUNC),1)
+	EXTRA_EBPF_CLAGS = -DLINUX_VER_KFUNC
+else ifeq ($(LINUX_VER_RT),1)
+	EXTRA_EBPF_CLAGS = -DLINUX_VER_RT
+else ifeq ($(LINUX_VER_KPROBE),1)
+	EXTRA_EBPF_CLAGS = -DSUPPORTS_KPROBE_ONLY
 endif
 
 FINAL_TARGET = -emit-llvm -D__TARGET_ARCH_$(ARCH) -o ${@:.elf=.ll} -c $^ && $(LLC) -march=bpf -filetype=obj -mcpu=v2 -o $@ ${@:.elf=.ll}
 
 all: $(TAEGET_KERN_ELF)
 
-EBPF_CLAGS ?= -I. -Ivmlinux -Iinclude -D__BPF_TRACING__ -D GROUP_LEADER_OFFSET_OVERRIDE=0 \
+EBPF_CLAGS ?= -I. -Ivmlinux -Iinclude -I../../../crates/trace-utils/src \
+        -D__BPF_TRACING__ -D GROUP_LEADER_OFFSET_OVERRIDE=0 \
         -DSTART_BOOTTIME_OFFSET_OVERRIDE=0      \
         -DSTART_BOOTTIME_VARNAME=real_start_time
 
 %.elf: %.c
 	$(call msg,BPF,$@,$(CORE))	
-	$(Q)$(CLANG) $(EBPF_CLAGS) $(EXTRA_EBPF_CLAGS) -std=gnu99 -Wimplicit-function-declaration \
+	$(Q)$(CLANG) $(EBPF_CLAGS) $(EXTRA_EBPF_CLAGS) -DCOMPILE_MUSL=$(C_USE_STATIC) -std=gnu99 -Wimplicit-function-declaration \
 		-ffreestanding -fno-builtin -Wall \
 		-Wno-deprecated-declarations \
 		-Wno-gnu-variable-sized-type-not-at-end \
@@ -65,6 +73,7 @@ EBPF_CLAGS ?= -I. -Ivmlinux -Iinclude -D__BPF_TRACING__ -D GROUP_LEADER_OFFSET_O
 	$(Q)$(LLVM_STRIP) -g $@ # strip useless DWARF info
 
 clean:
+	@rm -f ../user/extended/bpf/*.bpf.elf ../user/extended/bpf/*.bpf.ll
 	@rm $(TAEGET_KERN_ELF) $(TARGET) ${TAEGET_KERN_ELF:.elf=.ll} *.S *.objdump -rf
 
 .PHONY: all clean

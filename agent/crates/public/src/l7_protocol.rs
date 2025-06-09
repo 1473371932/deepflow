@@ -26,8 +26,10 @@ pub const DEFAULT_TLS_PORT: u16 = 443;
     Clone,
     Copy,
     PartialEq,
-    Hash,
     Eq,
+    PartialOrd,
+    Ord,
+    Hash,
     FromPrimitive,
     IntoPrimitive,
     num_enum::Default,
@@ -47,6 +49,9 @@ pub enum L7Protocol {
     SofaRPC = 43,
 
     FastCGI = 44,
+    Brpc = 45,
+    Tars = 46,
+    SomeIp = 47,
 
     // SQL
     MySQL = 60,
@@ -56,47 +61,92 @@ pub enum L7Protocol {
     // NoSQL
     Redis = 80,
     MongoDB = 81,
+    Memcached = 82,
 
     // MQ
     Kafka = 100,
     MQTT = 101,
     AMQP = 102,
     OpenWire = 103,
+    NATS = 104,
+    Pulsar = 105,
+    ZMTP = 106,
+    RocketMQ = 107,
 
     // INFRA
     DNS = 120,
     TLS = 121,
+    Ping = 122,
 
     Custom = 127,
 
     Max = 255,
 }
 
+impl L7Protocol {
+    pub fn has_session_id(&self) -> bool {
+        match self {
+            Self::DNS
+            | Self::FastCGI
+            | Self::Http2
+            | Self::TLS
+            | Self::Kafka
+            | Self::Dubbo
+            | Self::SofaRPC
+            | Self::SomeIp
+            | Self::Ping
+            | Self::Custom => true,
+            _ => false,
+        }
+    }
+}
+
 // Translate the string value of l7_protocol into a L7Protocol enumeration value used by OTEL.
 impl From<String> for L7Protocol {
-    fn from(l7_protocol_str: String) -> Self {
-        let l7_protocol_str = l7_protocol_str.to_lowercase();
-        match l7_protocol_str.as_str() {
+    fn from(mut s: String) -> Self {
+        s.make_ascii_lowercase();
+        match s.as_str() {
             "http" | "https" => Self::Http1,
             "http2" => Self::Http2,
             "dubbo" => Self::Dubbo,
             "grpc" => Self::Grpc,
             "fastcgi" => Self::FastCGI,
+            "brpc" => Self::Brpc,
+            "tars" => Self::Tars,
             "custom" => Self::Custom,
             "sofarpc" => Self::SofaRPC,
             "mysql" => Self::MySQL,
             "mongodb" => Self::MongoDB,
             "postgresql" => Self::PostgreSQL,
             "redis" => Self::Redis,
+            "memcached" => Self::Memcached,
             "kafka" => Self::Kafka,
             "mqtt" => Self::MQTT,
             "amqp" => Self::AMQP,
             "openwire" => Self::OpenWire,
+            "nats" => Self::NATS,
+            "pulsar" => Self::Pulsar,
+            "zmtp" => Self::ZMTP,
+            "rocketmq" => Self::RocketMQ,
             "dns" => Self::DNS,
             "oracle" => Self::Oracle,
             "tls" => Self::TLS,
+            "ping" => Self::Ping,
+            "some/ip" | "someip" => Self::SomeIp,
             _ => Self::Unknown,
         }
+    }
+}
+
+// separate impl for &str and &String because `From<AsRef<str>>` conflict with FromPrimitive trait
+impl From<&str> for L7Protocol {
+    fn from(s: &str) -> Self {
+        s.to_lowercase().into()
+    }
+}
+impl From<&String> for L7Protocol {
+    fn from(s: &String) -> Self {
+        s.to_lowercase().into()
     }
 }
 
@@ -125,4 +175,9 @@ impl L7ProtocolEnum {
             L7ProtocolEnum::Custom(_) => L7Protocol::Custom,
         }
     }
+}
+
+pub trait L7ProtocolChecker {
+    fn is_disabled(&self, p: L7Protocol) -> bool;
+    fn is_enabled(&self, p: L7Protocol) -> bool;
 }
