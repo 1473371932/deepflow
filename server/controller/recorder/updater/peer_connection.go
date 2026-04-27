@@ -24,7 +24,27 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
+
+// PeerConnectionMessageFactory PeerConnection资源的消息工厂
+type PeerConnectionMessageFactory struct{}
+
+func (f *PeerConnectionMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedPeerConnections{}
+}
+
+func (f *PeerConnectionMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedPeerConnection{}
+}
+
+func (f *PeerConnectionMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedPeerConnections{}
+}
+
+func (f *PeerConnectionMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedPeerConnectionFields{}
+}
 
 type PeerConnection struct {
 	UpdaterBase[
@@ -32,36 +52,12 @@ type PeerConnection struct {
 		*diffbase.PeerConnection,
 		*metadbmodel.PeerConnection,
 		metadbmodel.PeerConnection,
-		*message.PeerConnectionAdd,
-		message.PeerConnectionAdd,
-		message.AddNoneAddition,
-		*message.PeerConnectionUpdate,
-		message.PeerConnectionUpdate,
-		*message.PeerConnectionFieldsUpdate,
-		message.PeerConnectionFieldsUpdate,
-		*message.PeerConnectionDelete,
-		message.PeerConnectionDelete,
-		message.DeleteNoneAddition]
+	]
 }
 
 func NewPeerConnection(wholeCache *cache.Cache, cloudData []cloudmodel.PeerConnection) *PeerConnection {
 	updater := &PeerConnection{
-		newUpdaterBase[
-			cloudmodel.PeerConnection,
-			*diffbase.PeerConnection,
-			*metadbmodel.PeerConnection,
-			metadbmodel.PeerConnection,
-			*message.PeerConnectionAdd,
-			message.PeerConnectionAdd,
-			message.AddNoneAddition,
-			*message.PeerConnectionUpdate,
-			message.PeerConnectionUpdate,
-			*message.PeerConnectionFieldsUpdate,
-			message.PeerConnectionFieldsUpdate,
-			*message.PeerConnectionDelete,
-			message.PeerConnectionDelete,
-			message.DeleteNoneAddition,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_PEER_CONNECTION_EN,
 			wholeCache,
 			db.NewPeerConnection().SetMetadata(wholeCache.GetMetadata()),
@@ -69,13 +65,13 @@ func NewPeerConnection(wholeCache *cache.Cache, cloudData []cloudmodel.PeerConne
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
-	return updater
-}
+	updater.setDataGenerator(updater)
 
-func (c *PeerConnection) getDiffBaseByCloudItem(cloudItem *cloudmodel.PeerConnection) (diffBase *diffbase.PeerConnection, exists bool) {
-	diffBase, exists = c.diffBaseData[cloudItem.Lcuuid]
-	return
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &PeerConnectionMessageFactory{})
+	}
+
+	return updater
 }
 
 func (c *PeerConnection) generateDBItemToAdd(cloudItem *cloudmodel.PeerConnection) (*metadbmodel.PeerConnection, bool) {
@@ -99,19 +95,19 @@ func (c *PeerConnection) generateDBItemToAdd(cloudItem *cloudmodel.PeerConnectio
 	dbItem := &metadbmodel.PeerConnection{
 		Name:         cloudItem.Name,
 		Label:        cloudItem.Label,
-		TeamID:       c.msgMetadata.TeamID,
-		Domain:       c.metadata.Domain.Lcuuid,
+		TeamID:       c.msgMetadata.GetTeamID(),
+		Domain:       c.metadata.GetDomainLcuuid(),
 		RemoteVPCID:  &remoteVPCID,
 		LocalVPCID:   &localVPCID,
-		RemoteDomain: c.metadata.Domain.Lcuuid,
-		LocalDomain:  c.metadata.Domain.Lcuuid,
+		RemoteDomain: c.metadata.GetDomainLcuuid(),
+		LocalDomain:  c.metadata.GetDomainLcuuid(),
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	return dbItem, true
 }
 
-func (c *PeerConnection) generateUpdateInfo(diffBase *diffbase.PeerConnection, cloudItem *cloudmodel.PeerConnection) (*message.PeerConnectionFieldsUpdate, map[string]interface{}, bool) {
-	structInfo := new(message.PeerConnectionFieldsUpdate)
+func (c *PeerConnection) generateUpdateInfo(diffBase *diffbase.PeerConnection, cloudItem *cloudmodel.PeerConnection) (types.UpdatedFields, map[string]interface{}, bool) {
+	structInfo := new(message.UpdatedPeerConnectionFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
 		mapInfo["name"] = cloudItem.Name

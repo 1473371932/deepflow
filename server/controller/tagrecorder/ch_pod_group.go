@@ -27,12 +27,12 @@ import (
 
 type ChPodGroup struct {
 	SubscriberComponent[
-		*message.PodGroupAdd,
-		message.PodGroupAdd,
-		*message.PodGroupFieldsUpdate,
-		message.PodGroupFieldsUpdate,
-		*message.PodGroupDelete,
-		message.PodGroupDelete,
+		*message.AddedPodGroups,
+		message.AddedPodGroups,
+		*message.UpdatedPodGroup,
+		message.UpdatedPodGroup,
+		*message.DeletedPodGroups,
+		message.DeletedPodGroups,
 		metadbmodel.PodGroup,
 		metadbmodel.ChPodGroup,
 		IDKey,
@@ -43,12 +43,12 @@ type ChPodGroup struct {
 func NewChPodGroup(resourceTypeToIconID map[IconKey]int) *ChPodGroup {
 	mng := &ChPodGroup{
 		newSubscriberComponent[
-			*message.PodGroupAdd,
-			message.PodGroupAdd,
-			*message.PodGroupFieldsUpdate,
-			message.PodGroupFieldsUpdate,
-			*message.PodGroupDelete,
-			message.PodGroupDelete,
+			*message.AddedPodGroups,
+			message.AddedPodGroups,
+			*message.UpdatedPodGroup,
+			message.UpdatedPodGroup,
+			*message.DeletedPodGroups,
+			message.DeletedPodGroups,
 			metadbmodel.PodGroup,
 			metadbmodel.ChPodGroup,
 			IDKey,
@@ -58,6 +58,7 @@ func NewChPodGroup(resourceTypeToIconID map[IconKey]int) *ChPodGroup {
 		resourceTypeToIconID,
 	}
 	mng.subscriberDG = mng
+	mng.softDelete = true
 	return mng
 }
 
@@ -76,38 +77,22 @@ func (c *ChPodGroup) sourceToTarget(md *message.Metadata, source *metadbmodel.Po
 		ChIDBase:     metadbmodel.ChIDBase{ID: source.ID},
 		Name:         sourceName,
 		IconID:       iconID,
-		PodGroupType: RESOURCE_POD_GROUP_TYPE_MAP[source.Type],
+		PodGroupType: common.RESOURCE_POD_GROUP_TYPE_MAP[source.Type],
 		PodClusterID: source.PodClusterID,
 		PodNsID:      source.PodNamespaceID,
-		TeamID:       md.TeamID,
-		DomainID:     md.DomainID,
-		SubDomainID:  md.SubDomainID,
+		TeamID:       md.GetTeamID(),
+		DomainID:     md.GetDomainID(),
+		SubDomainID:  md.GetSubDomainID(),
 	})
 	return
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChPodGroup) onResourceUpdated(sourceID int, fieldsUpdate *message.PodGroupFieldsUpdate, db *metadb.DB) {
-	updateInfo := make(map[string]interface{})
-
-	if fieldsUpdate.Name.IsDifferent() {
-		updateInfo["name"] = fieldsUpdate.Name.GetNew()
-	}
-	if fieldsUpdate.Type.IsDifferent() {
-		updateInfo["pod_group_type"] = RESOURCE_POD_GROUP_TYPE_MAP[fieldsUpdate.Type.GetNew()]
-	}
-	if fieldsUpdate.PodClusterID.IsDifferent() {
-		updateInfo["pod_cluster_id"] = fieldsUpdate.PodClusterID.GetNew()
-	}
-	if fieldsUpdate.PodNamespaceID.IsDifferent() {
-		updateInfo["pod_ns_id"] = fieldsUpdate.PodNamespaceID.GetNew()
-	}
-	c.updateOrSync(db, IDKey{ID: sourceID}, updateInfo)
+func (c *ChPodGroup) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedPodGroup) {
 }
 
 // softDeletedTargetsUpdated implements SubscriberDataGenerator
 func (c *ChPodGroup) softDeletedTargetsUpdated(targets []metadbmodel.ChPodGroup, db *metadb.DB) {
-
 	db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "id"}},
 		DoUpdates: clause.AssignmentColumns([]string{"name"}),

@@ -35,7 +35,7 @@ type ConfigMap struct {
 func NewConfigMap(cfg config.Config, q *queue.OverwriteQueue) *ConfigMap {
 	mng := &ConfigMap{
 		newManagerComponent(ctrlCommon.RESOURCE_TYPE_CONFIG_MAP_EN, q),
-		newCUDSubscriberComponent(ctrlCommon.RESOURCE_TYPE_CONFIG_MAP_EN, SubTopic(pubsub.TopicResourceUpdatedMessage)),
+		newCUDSubscriberComponent(ctrlCommon.RESOURCE_TYPE_CONFIG_MAP_EN, SubTopic(pubsub.TopicResourceUpdatedFull)),
 		cfg,
 	}
 	mng.SetSubscriberSelf(mng)
@@ -49,21 +49,23 @@ func (c *ConfigMap) OnResourceBatchAdded(md *message.Metadata, msg interface{}) 
 			eventapi.TagPodNSID(item.PodNamespaceID),
 			eventapi.TagPodClusterID(item.PodClusterID),
 			eventapi.TagVPCID(item.VPCID),
-			eventapi.TagAttributes([]string{eventapi.AttributeNameConfig}, []string{item.Data}),
+			eventapi.TagAttributes(
+				[]string{eventapi.AttributeNameConfigName},
+				[]string{item.Name}),
 		}
 
-		c.enqueueIfInsertIntoMySQLFailed(
-			md, item.Lcuuid, item.Domain, eventapi.RESOURCE_EVENT_TYPE_ADD_CONFIG_MAP, opts...,
+		c.enqueueIfInsertIntoMetadbFailed(
+			md, item.Lcuuid, item.Domain, eventapi.RESOURCE_EVENT_TYPE_ATTACH_CONFIG_MAP, opts...,
 		)
 	}
 }
 
 func (c *ConfigMap) OnResourceUpdated(md *message.Metadata, msg interface{}) {
-	fields := msg.(*message.ConfigMapUpdate).GetFields().(*message.ConfigMapFieldsUpdate)
+	fields := msg.(*message.UpdatedConfigMap).GetFields().(*message.UpdatedConfigMapFields)
 	if !fields.Data.IsDifferent() {
 		return
 	}
-	item := msg.(*message.ConfigMapUpdate).GetNewMySQLItem().(*metadbModel.ConfigMap)
+	item := msg.(*message.UpdatedConfigMap).GetNewMetadbItem().(*metadbModel.ConfigMap)
 
 	diff := CompareConfig(fields.Data.GetOld(), fields.Data.GetNew(), int(c.cfg.ConfigDiffContext))
 
@@ -73,12 +75,12 @@ func (c *ConfigMap) OnResourceUpdated(md *message.Metadata, msg interface{}) {
 		eventapi.TagPodClusterID(item.PodClusterID),
 		eventapi.TagVPCID(item.VPCID),
 		eventapi.TagAttributes(
-			[]string{eventapi.AttributeNameConfig, eventapi.AttributeNameConfigDiff},
-			[]string{item.Data, diff}),
+			[]string{eventapi.AttributeNameConfigName, eventapi.AttributeNameConfig, eventapi.AttributeNameConfigDiff},
+			[]string{item.Name, string(item.Data), diff}),
 	}
 
-	c.enqueueIfInsertIntoMySQLFailed(
-		md, item.Lcuuid, item.Domain, eventapi.RESOURCE_EVENT_TYPE_UPDATE_CONFIG_MAP, opts...,
+	c.enqueueIfInsertIntoMetadbFailed(
+		md, item.Lcuuid, item.Domain, eventapi.RESOURCE_EVENT_TYPE_MODIFY_CONFIG_MAP, opts...,
 	)
 }
 
@@ -89,9 +91,12 @@ func (c *ConfigMap) OnResourceBatchDeleted(md *message.Metadata, msg interface{}
 			eventapi.TagPodNSID(item.PodNamespaceID),
 			eventapi.TagPodClusterID(item.PodClusterID),
 			eventapi.TagVPCID(item.VPCID),
+			eventapi.TagAttributes(
+				[]string{eventapi.AttributeNameConfigName},
+				[]string{item.Name}),
 		}
-		c.enqueueIfInsertIntoMySQLFailed(
-			md, item.Lcuuid, item.Domain, eventapi.RESOURCE_EVENT_TYPE_DELETE_CONFIG_MAP, opts...,
+		c.enqueueIfInsertIntoMetadbFailed(
+			md, item.Lcuuid, item.Domain, eventapi.RESOURCE_EVENT_TYPE_DETACH_CONFIG_MAP, opts...,
 		)
 	}
 }

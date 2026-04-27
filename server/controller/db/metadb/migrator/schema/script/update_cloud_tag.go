@@ -18,11 +18,11 @@ package script
 
 import (
 	"bytes"
-	"compress/zlib"
 	"encoding/json"
 	"strings"
 
 	"github.com/bitly/go-simplejson"
+	"github.com/klauspost/compress/zlib"
 	"gorm.io/gorm"
 
 	"github.com/deepflowio/deepflow/server/controller/db/metadb/model"
@@ -214,7 +214,7 @@ func updateVMCloudTags(db *gorm.DB) error {
 		if err == nil {
 			continue
 		}
-		db.Unscoped().Model(&model.VM{}).Where("id = ?", vmID).Updates(model.VM{CloudTags: dataStringConvertToMap(cloudTagsString)})
+		db.Unscoped().Model(&model.VM{}).Where("id = ?", vmID).Updates(model.VM{LearnedCloudTags: dataStringConvertToMap(cloudTagsString)})
 	}
 	return nil
 }
@@ -252,7 +252,7 @@ func updatePodNamespaceCloudTags(db *gorm.DB) error {
 		if err == nil {
 			continue
 		}
-		db.Unscoped().Model(&model.PodNamespace{}).Where("id = ?", nsID).Updates(model.PodNamespace{CloudTags: dataStringConvertToMap(cloudTagsString)})
+		db.Unscoped().Model(&model.PodNamespace{}).Where("id = ?", nsID).Updates(model.PodNamespace{LearnedCloudTags: dataStringConvertToMap(cloudTagsString)})
 	}
 	return nil
 }

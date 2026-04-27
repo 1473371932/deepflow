@@ -18,6 +18,7 @@ package ckdb
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -41,6 +42,7 @@ const (
 	AggregationMinute AggregationInterval = iota
 	AggregationHour
 	AggregationDay
+	AggregationSecond
 )
 
 func (a AggregationInterval) String() string {
@@ -51,6 +53,8 @@ func (a AggregationInterval) String() string {
 		return "1h"
 	case AggregationDay:
 		return "1d"
+	case AggregationSecond:
+		return "1s"
 	default:
 		return "unkunown aggregation interval"
 	}
@@ -59,11 +63,13 @@ func (a AggregationInterval) String() string {
 func (a AggregationInterval) BaseTable() string {
 	switch a {
 	case AggregationMinute:
-		return "1s_local"
+		return ".1s_local"
 	case AggregationHour:
-		return "1m_local"
+		return ".1m_local"
 	case AggregationDay:
-		return "1h_agg"
+		return ".1h_agg"
+	case AggregationSecond:
+		return "_local"
 	default:
 		return "unkunown aggregation base table"
 	}
@@ -72,9 +78,11 @@ func (a AggregationInterval) BaseTable() string {
 func (a AggregationInterval) ByconityBaseTable() string {
 	switch a {
 	case AggregationMinute:
-		return "1s"
+		return ".1s"
 	case AggregationHour, AggregationDay:
-		return "1m"
+		return ".1m"
+	case AggregationSecond:
+		return ""
 	default:
 		return "unkunown aggregation byconity base table"
 	}
@@ -88,6 +96,8 @@ func (a AggregationInterval) PartitionBy() TimeFuncType {
 		return TimeFuncWeek
 	case AggregationDay:
 		return TimeFuncYYYYMM
+	case AggregationSecond:
+		return TimeFuncHour
 	default:
 		return TimeFuncWeek
 	}
@@ -101,6 +111,8 @@ func (a AggregationInterval) Aggregation() TimeFuncType {
 		return TimeFuncHour
 	case AggregationDay:
 		return TimeFuncDay
+	case AggregationSecond:
+		return TimeFuncNone
 	default:
 		return TimeFuncHour
 	}
@@ -161,6 +173,7 @@ type Table struct {
 	Columns         []*Column    // 表列结构
 	TimeKey         string       // 时间字段名，用来设置partition和ttl
 	SummingKey      string       // When using SummingMergeEngine, this field is used for Summing aggregation
+	ReplacingKey    string       // When using ReplacingMergeTree, this field is used as the version column (defaults to TimeKey if empty)
 	TTL             int          // 数据默认保留时长。 单位:小时
 	ColdStorage     ColdStorage  // 冷存储配置
 	PartitionFunc   TimeFuncType // partition函数作用于Time,
@@ -170,6 +183,9 @@ type Table struct {
 	OrderKeys       []string     // 排序的key
 	PrimaryKeyCount int          // 一级索引的key的个数, 从orderKeys中数前n个,
 	Aggr1H1D        bool         // 是否创建 1h/1d 表
+	Aggr1S          bool         // 是否创建 1s 表
+	AggrTableSuffix string
+	AggrCounted     bool // 聚合表是否添加count 字段
 }
 
 func (t *Table) OrgDatabase(orgID uint16) string {
@@ -215,7 +231,11 @@ func (t *Table) makeLocalTableCreateSQL(database string) string {
 	if t.Engine == ReplicatedMergeTree || t.Engine == ReplicatedAggregatingMergeTree {
 		engine = fmt.Sprintf(t.Engine.String(), t.Database, t.LocalName)
 	} else if t.Engine == ReplacingMergeTree || t.Engine == CnchReplacingMergeTree {
-		engine = fmt.Sprintf(t.Engine.String(), t.TimeKey)
+		replacingKey := t.ReplacingKey
+		if replacingKey == "" {
+			replacingKey = t.TimeKey
+		}
+		engine = fmt.Sprintf(t.Engine.String(), replacingKey)
 	} else if t.Engine == SummingMergeTree || t.Engine == CnchSummingMergeTree {
 		engine = fmt.Sprintf(t.Engine.String(), t.SummingKey)
 	}
@@ -345,6 +365,78 @@ func getAggr(column *Column) string {
 	return "sum"
 }
 
+func (t *Table) OrderKeysCount() int {
+	orderKeys := t.OrderKeys
+	for _, c := range t.Columns {
+		if !c.GroupBy {
+			continue
+		}
+		if !stringSliceHas(orderKeys, c.Name) {
+			orderKeys = append(orderKeys, c.Name)
+		}
+	}
+	return len(orderKeys)
+}
+
+func (t *Table) IsAggrTableWrong(createTableSQL string) bool {
+	re := regexp.MustCompile(`(?i)ORDER BY\s*\(([^)]+)\)`)
+	match := re.FindStringSubmatch(createTableSQL)
+	if len(match) < 2 {
+		return false
+	}
+	orderKeys := strings.Split(match[1], ",")
+	return len(orderKeys) != t.OrderKeysCount()
+}
+
+func (t *Table) IsLocalTableWrong(createTableSql string) bool {
+	return strings.Contains(createTableSql, "mem-inuse") ||
+		strings.Contains(createTableSql, "hbm-inuse")
+}
+
+func (t *Table) AggrTable(orgID uint16, aggrInterval AggregationInterval) string {
+	return fmt.Sprintf("%s.`%s.%s_agg`", t.OrgDatabase(orgID), t.tableAggrPrefix(), aggrInterval.String())
+}
+
+func (t *Table) AggrTable1S(orgID uint16) string {
+	return t.AggrTable(orgID, AggregationSecond)
+}
+
+func (t *Table) LocalTable1S(orgID uint16) string {
+	return fmt.Sprintf("%s.`%s.%s_local`", t.OrgDatabase(orgID), t.tableAggrPrefix(), AggregationSecond.String())
+}
+
+func (t *Table) MakeLocalTableDropSQL1S(orgID uint16) string {
+	return fmt.Sprintf("DROP TABLE IF EXISTS %s", t.LocalTable1S(orgID))
+}
+
+func (t *Table) MakeAggrTableDropSQL1S(orgID uint16) string {
+	return fmt.Sprintf("DROP TABLE IF EXISTS %s", t.AggrTable1S(orgID))
+}
+
+func (t *Table) MakeAggrTableCreateSQL1S(orgID uint16) string {
+	return t.MakeAggrTableCreateSQL(orgID, AggregationSecond, t.TTL)
+}
+
+func (t *Table) MakeAggrMVTableCreateSQL1S(orgID uint16) string {
+	return t.MakeAggrMVTableCreateSQL(orgID, AggregationSecond)
+}
+
+func (t *Table) MakeAggrLocalTableCreateSQL1S(orgID uint16) string {
+	return t.MakeAggrLocalTableCreateSQL(orgID, AggregationSecond)
+}
+
+func (t *Table) MakeAggrGlobalTableCreateSQL1S(orgID uint16) string {
+	return t.MakeAggrGlobalTableCreateSQL(orgID, AggregationSecond)
+}
+
+func (t *Table) AggrTable1H(orgID uint16) string {
+	return t.AggrTable(orgID, AggregationHour)
+}
+
+func (t *Table) MakeAggrTableDropSQL1H(orgID uint16) string {
+	return fmt.Sprintf("DROP TABLE IF EXISTS %s", t.AggrTable1H(orgID))
+}
+
 func (t *Table) MakeAggrTableCreateSQL1H(orgID uint16) string {
 	return t.MakeAggrTableCreateSQL(orgID, AggregationHour, DEFAULT_1H_TTL)
 }
@@ -359,6 +451,14 @@ func (t *Table) MakeAggrLocalTableCreateSQL1H(orgID uint16) string {
 
 func (t *Table) MakeAggrGlobalTableCreateSQL1H(orgID uint16) string {
 	return t.MakeAggrGlobalTableCreateSQL(orgID, AggregationHour)
+}
+
+func (t *Table) AggrTable1D(orgID uint16) string {
+	return t.AggrTable(orgID, AggregationDay)
+}
+
+func (t *Table) MakeAggrTableDropSQL1D(orgID uint16) string {
+	return fmt.Sprintf("DROP TABLE IF EXISTS %s", t.AggrTable1D(orgID))
 }
 
 func (t *Table) MakeAggrTableCreateSQL1D(orgID uint16) string {
@@ -381,13 +481,17 @@ func (t *Table) tablePrefix() string {
 	return strings.Split(t.GlobalName, ".")[0]
 }
 
+func (t *Table) tableAggrPrefix() string {
+	return t.tablePrefix() + t.AggrTableSuffix
+}
+
 func (t *Table) MakeAggrTableCreateSQL(orgID uint16, aggrInterval AggregationInterval, ttlHour int) string {
-	tableAgg := fmt.Sprintf("%s.`%s.%s_agg`", t.OrgDatabase(orgID), t.tablePrefix(), aggrInterval.String())
+	tableAgg := fmt.Sprintf("%s.`%s.%s_agg`", t.OrgDatabase(orgID), t.tableAggrPrefix(), aggrInterval.String())
 	columns := []string{}
-	orderKeys := t.OrderKeys
+	groupKeys := t.OrderKeys
 	for _, c := range t.Columns {
 		// ignore fields starting with '_', such as _tid, _id
-		if strings.HasPrefix(c.Name, "_") {
+		if strings.HasPrefix(c.Name, "_") || c.IgnoredInAggrTable {
 			continue
 		}
 		codec := ""
@@ -404,10 +508,29 @@ func (t *Table) MakeAggrTableCreateSQL(orgID uint16, aggrInterval AggregationInt
 			if c.Comment != "" {
 				comment = fmt.Sprintf("COMMENT '%s'", c.Comment)
 			}
+			if !stringSliceHas(groupKeys, c.Name) {
+				groupKeys = append(groupKeys, c.Name)
+			}
 			columns = append(columns, fmt.Sprintf("%s %s %s %s", c.Name, c.Type.String(), comment, codec))
 		} else {
-			columns = append(columns, fmt.Sprintf("%s__agg AggregateFunction(%s, %s)", c.Name, getAggr(c), c.Type.String()))
+			switch c.Aggr {
+			case AggrLast:
+				columns = append(columns, fmt.Sprintf("%s %s %s", c.Name, c.Type.String(), codec))
+			case AggrLastAndSum, AggrLastAndSumProfileValue:
+				columns = append(columns, fmt.Sprintf("%s_last %s %s", c.Name, c.Type.String(), codec))
+				columns = append(columns, fmt.Sprintf("%s_sum__agg AggregateFunction(sum, %s)", c.Name, c.Type.String()))
+			case AggrMaxAndSumDurationValue:
+				columns = append(columns, fmt.Sprintf("%s_max__agg AggregateFunction(max, %s)", c.Name, c.Type.String()))
+				columns = append(columns, fmt.Sprintf("%s__agg AggregateFunction(sum, %s)", c.Name, c.Type.String()))
+			case AggrMax, AggrSum, AggrAvg:
+				columns = append(columns, fmt.Sprintf("%s__agg AggregateFunction(%s, %s)", c.Name, c.Aggr, c.Type.String()))
+			default:
+				columns = append(columns, fmt.Sprintf("%s__agg AggregateFunction(%s, %s)", c.Name, getAggr(c), c.Type.String()))
+			}
 		}
+	}
+	if t.AggrCounted {
+		columns = append(columns, fmt.Sprintf("count__agg AggregateFunction(sum, %s)", UInt32))
 	}
 
 	engine := AggregatingMergeTree.String()
@@ -426,26 +549,26 @@ func (t *Table) MakeAggrTableCreateSQL(orgID uint16, aggrInterval AggregationInt
 		tableAgg,
 		strings.Join(columns, ",\n"),
 		engine,
-		strings.Join(t.OrderKeys[:t.PrimaryKeyCount], ","),
-		strings.Join(orderKeys, ","), // 以order by的字段排序, 相同的做聚合
+		strings.Join(groupKeys, ","),
+		strings.Join(groupKeys, ","), // 以order by的字段排序, 相同的做聚合
 		aggrInterval.PartitionBy().String(t.TimeKey),
 		t.makeTTLString(ttlHour),
 		t.StoragePolicy)
 }
 
 func (t *Table) MakeAggrMVTableCreateSQL(orgID uint16, aggrInterval AggregationInterval) string {
-	tableMv := fmt.Sprintf("%s.`%s.%s_mv`", t.OrgDatabase(orgID), t.tablePrefix(), aggrInterval.String())
-	tableAgg := fmt.Sprintf("%s.`%s.%s_agg`", t.OrgDatabase(orgID), t.tablePrefix(), aggrInterval.String())
-	tableBase := fmt.Sprintf("%s.`%s.%s`", t.OrgDatabase(orgID), t.tablePrefix(), aggrInterval.BaseTable())
+	tableMv := fmt.Sprintf("%s.`%s.%s_mv`", t.OrgDatabase(orgID), t.tableAggrPrefix(), aggrInterval.String())
+	tableAgg := fmt.Sprintf("%s.`%s.%s_agg`", t.OrgDatabase(orgID), t.tableAggrPrefix(), aggrInterval.String())
+	tableBase := fmt.Sprintf("%s.`%s%s`", t.OrgDatabase(orgID), t.tablePrefix(), aggrInterval.BaseTable())
 
 	if t.DBType == CKDBTypeByconity {
-		tableBase = fmt.Sprintf("%s.`%s.%s`", t.OrgDatabase(orgID), t.tablePrefix(), aggrInterval.ByconityBaseTable())
+		tableBase = fmt.Sprintf("%s.`%s%s`", t.OrgDatabase(orgID), t.tablePrefix(), aggrInterval.ByconityBaseTable())
 	}
 
 	groupKeys := t.OrderKeys
 	columns := []string{}
 	for _, c := range t.Columns {
-		if strings.HasPrefix(c.Name, "_") {
+		if strings.HasPrefix(c.Name, "_") || c.IgnoredInAggrTable {
 			continue
 		}
 		if c.GroupBy {
@@ -461,9 +584,25 @@ func (t *Table) MakeAggrMVTableCreateSQL(orgID uint16, aggrInterval AggregationI
 			if strings.Contains(tableBase, "_agg") {
 				columns = append(columns, fmt.Sprintf("%sMergeState(%s__agg) AS %s__agg", getAggr(c), c.Name, c.Name))
 			} else {
-				columns = append(columns, fmt.Sprintf("%sState(%s) AS %s__agg", getAggr(c), c.Name, c.Name))
+				switch c.Aggr {
+				case AggrLast:
+					columns = append(columns, fmt.Sprintf("anyLast(%s) AS %s", c.Name, c.Name))
+				case AggrLastAndSum, AggrLastAndSumProfileValue:
+					columns = append(columns, fmt.Sprintf("anyLast(%s) AS %s_last", c.Name, c.Name))
+					columns = append(columns, fmt.Sprintf("sumState(%s) AS %s_sum__agg", c.Name, c.Name))
+				case AggrSum, AggrMax, AggrAvg:
+					columns = append(columns, fmt.Sprintf("%sState(%s) AS %s__agg", c.Aggr, c.Name, c.Name))
+				case AggrMaxAndSumDurationValue:
+					columns = append(columns, fmt.Sprintf("maxState(%s) AS %s_max__agg", c.Name, c.Name))
+					columns = append(columns, fmt.Sprintf("sumState(%s) AS %s__agg", c.Name, c.Name))
+				default:
+					columns = append(columns, fmt.Sprintf("%sState(%s) AS %s__agg", getAggr(c), c.Name, c.Name))
+				}
 			}
 		}
+	}
+	if t.AggrCounted {
+		columns = append(columns, "sumState(toUInt32(1)) AS count__agg")
 	}
 
 	return fmt.Sprintf(`CREATE MATERIALIZED VIEW IF NOT EXISTS %s TO %s
@@ -477,17 +616,20 @@ func (t *Table) MakeAggrMVTableCreateSQL(orgID uint16, aggrInterval AggregationI
 }
 
 func (t *Table) MakeAggrLocalTableCreateSQL(orgID uint16, aggrInterval AggregationInterval) string {
-	tableAgg := fmt.Sprintf("%s.`%s.%s_agg`", t.OrgDatabase(orgID), t.tablePrefix(), aggrInterval.String())
-	tableLocal := fmt.Sprintf("%s.`%s.%s_local`", t.OrgDatabase(orgID), t.tablePrefix(), aggrInterval.String())
+	tableAgg := fmt.Sprintf("%s.`%s.%s_agg`", t.OrgDatabase(orgID), t.tableAggrPrefix(), aggrInterval.String())
+	tableLocal := fmt.Sprintf("%s.`%s.%s_local`", t.OrgDatabase(orgID), t.tableAggrPrefix(), aggrInterval.String())
 	if t.DBType == CKDBTypeByconity {
-		tableLocal = fmt.Sprintf("%s.`%s.%s`", t.OrgDatabase(orgID), t.tablePrefix(), aggrInterval.String())
+		tableLocal = fmt.Sprintf("%s.`%s.%s`", t.OrgDatabase(orgID), t.tableAggrPrefix(), aggrInterval.String())
 	}
 
 	columns := []string{}
 	groupKeys := t.OrderKeys
 	for _, c := range t.Columns {
-		if strings.HasPrefix(c.Name, "_") {
+		if strings.HasPrefix(c.Name, "_") || c.IgnoredInAggrTable {
 			continue
+		}
+		if c.Name == t.TimeKey {
+			c.Comment = t.Version
 		}
 		if c.GroupBy {
 			columns = append(columns, c.Name)
@@ -495,8 +637,26 @@ func (t *Table) MakeAggrLocalTableCreateSQL(orgID uint16, aggrInterval Aggregati
 				groupKeys = append(groupKeys, c.Name)
 			}
 		} else {
-			columns = append(columns, fmt.Sprintf("finalizeAggregation(%s__agg) AS %s", c.Name, c.Name))
+			switch c.Aggr {
+			case AggrLast:
+				columns = append(columns, fmt.Sprintf("%s", c.Name))
+			case AggrLastAndSum:
+				columns = append(columns, fmt.Sprintf("%s_last", c.Name))
+				columns = append(columns, fmt.Sprintf("finalizeAggregation(%s_sum__agg) AS %s_sum", c.Name, c.Name))
+			case AggrLastAndSumProfileValue:
+				// The profile 'mem-inuse' data is collected every 10 seconds. If you want to aggregate it by 1 second,
+				// you need to use the sum aggregation instead of the last aggregation.
+				columns = append(columns, fmt.Sprintf("finalizeAggregation(%s_sum__agg) AS %s", c.Name, c.Name))
+			case AggrMaxAndSumDurationValue:
+				columns = append(columns, fmt.Sprintf("finalizeAggregation(%s_max__agg) AS max_%s", c.Name, c.Name))
+				columns = append(columns, fmt.Sprintf("finalizeAggregation(%s__agg) AS %s", c.Name, c.Name))
+			default:
+				columns = append(columns, fmt.Sprintf("finalizeAggregation(%s__agg) AS %s", c.Name, c.Name))
+			}
 		}
+	}
+	if t.AggrCounted {
+		columns = append(columns, "finalizeAggregation(count__agg) AS count")
 	}
 
 	return fmt.Sprintf(`
@@ -513,8 +673,8 @@ func (t *Table) MakeAggrGlobalTableCreateSQL(orgID uint16, aggrInterval Aggregat
 	if t.DBType == CKDBTypeByconity {
 		return t.MakeAggrLocalTableCreateSQL(orgID, aggrInterval)
 	}
-	tableGlobal := fmt.Sprintf("%s.%s", t.tablePrefix(), aggrInterval.String())
-	tableLocal := fmt.Sprintf("%s.%s_local", t.tablePrefix(), aggrInterval.String())
+	tableGlobal := fmt.Sprintf("%s.%s", t.tableAggrPrefix(), aggrInterval.String())
+	tableLocal := fmt.Sprintf("%s.%s_local", t.tableAggrPrefix(), aggrInterval.String())
 
 	engine := fmt.Sprintf(Distributed.String(), t.Cluster, t.OrgDatabase(orgID), tableLocal)
 	createTable := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s.`%s` AS %s.`%s` ENGINE = %s",

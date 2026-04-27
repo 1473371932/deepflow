@@ -284,17 +284,12 @@ func (p *PlatformDataOP) generatePeerConnections() {
 	// Add CEN(Cloud Enterprise Network) data to peer connection.
 	// Associate cen.vpc_ids in pairs in one direction.
 	for _, cen := range dbDataCache.GetCENs() {
-		epcIDs, err := ConvertStrToU32List(cen.VPCIDs)
-		if err != nil {
-			log.Error(p.Log(err.Error()))
-			continue
-		}
-		for i := 0; i < len(epcIDs); i++ {
-			for j := i + 1; j < len(epcIDs); j++ {
+		for i := 0; i < len(cen.VPCIDs); i++ {
+			for j := i + 1; j < len(cen.VPCIDs); j++ {
 				data := &trident.PeerConnection{
 					Id:          proto.Uint32(0),
-					LocalEpcId:  proto.Uint32(uint32(epcIDs[i])),
-					RemoteEpcId: proto.Uint32(uint32(epcIDs[j])),
+					LocalEpcId:  proto.Uint32(uint32(cen.VPCIDs[i])),
+					RemoteEpcId: proto.Uint32(uint32(cen.VPCIDs[j])),
 				}
 				dpcData.addData(data)
 				dpcData.addDomainData(cen.Domain, data)
@@ -445,6 +440,9 @@ func (p *PlatformDataOP) generateGProcessInfo() {
 	processes := dbDataCache.GetProcesses()
 	gprocessData := newGProcessInfoProto(len(processes))
 	for _, process := range processes {
+		// 存在问题：当 pod 内的 container 重启并伴随进程删除时，pod 会关联上新的 container，
+		// 而进程删除时无法使用其旧的 container 找到对应的 pod 信息，从而下发 pod id 0，
+		// 因此，这里的下发数据停止为进程删除事件打 tag 使用。
 		podId := rawData.containerIdToPodId[process.ContainerID]
 		p := &trident.GProcessInfo{
 			GprocessId: proto.Uint32(process.GID),

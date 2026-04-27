@@ -39,7 +39,7 @@ use super::{
 use crate::{
     common::{
         endpoint::EPC_INTERNET,
-        enums::{CaptureNetworkType, EthernetType, IpProtocol},
+        enums::{EthernetType, IpProtocol},
         flow::{CloseType, L7Protocol, SignalSource},
     },
     config::handler::{CollectorAccess, CollectorConfig},
@@ -54,7 +54,6 @@ use crate::{
     },
 };
 use public::{
-    proto::agent::AgentType,
     queue::{DebugSender, Error, Receiver},
     utils::net::MacAddr,
 };
@@ -66,6 +65,7 @@ pub struct CollectorCounter {
     out: AtomicU64,
     drop_before_window: AtomicU64,
     drop_inactive: AtomicU64,
+    drop_by_queue: AtomicU64,
     no_endpoint: AtomicU64,
     stash_len: AtomicU64,
     stash_capacity: AtomicU64,
@@ -102,6 +102,11 @@ impl RefCountable for CollectorCounter {
                 CounterValue::Unsigned(self.drop_inactive.swap(0, Ordering::Relaxed)),
             ),
             (
+                "drop-by-queue",
+                CounterType::Counted,
+                CounterValue::Unsigned(self.drop_by_queue.swap(0, Ordering::Relaxed)),
+            ),
+            (
                 "no-endpoint",
                 CounterType::Counted,
                 CounterValue::Unsigned(self.no_endpoint.swap(0, Ordering::Relaxed)),
@@ -132,7 +137,7 @@ struct StashKey {
     dst_ip: IpAddr,
     src_gpid: u32,
     dst_gpid: u32,
-    endpoint_hash: u32,
+    endpoint_hash: u64,
     // request-reponse time span
     time_span: u32,
     biz_type: u8,
@@ -193,7 +198,7 @@ impl StashKey {
 
     const ACL: Code = Code::ACL_GID.union(Code::TUNNEL_IP_ID).union(Code::VTAP_ID);
 
-    fn new(tagger: &Tagger, src_ip: IpAddr, dst_ip: Option<IpAddr>, endpoint_hash: u32) -> Self {
+    fn new(tagger: &Tagger, src_ip: IpAddr, dst_ip: Option<IpAddr>, endpoint_hash: u64) -> Self {
         let mut fast_id = 0;
         match tagger.code {
             // single point
@@ -501,65 +506,9 @@ impl Stash {
         directions: &[Direction; 2],
         config: &CollectorConfig,
     ) {
-        for ep in 0..2 {
-            let direction = match config.agent_type {
-                AgentType::TtDedicatedPhysicalMachine
-                    if acc_flow.flow.flow_key.tap_type != CaptureNetworkType::Cloud
-                        && directions[0] != Direction::None
-                        && directions[1] != Direction::None =>
-                {
-                    Direction::None
-                }
-                _ if directions[ep] == Direction::None => continue,
-                _ => directions[ep],
-            };
-            let is_active_host = if ep == 0 {
-                acc_flow.is_active_host0
-            } else {
-                acc_flow.is_active_host1
-            };
-            // single_stats: Do not count the inactive end (Internet/private network IP with no response packet)
-            if !config.inactive_ip_aggregation || is_active_host {
-                let flow_meter = if ep == FLOW_METRICS_PEER_DST {
-                    acc_flow.flow_meter.to_reversed()
-                } else {
-                    acc_flow.flow_meter
-                };
-                let tagger = get_single_tagger(
-                    self.global_thread_id,
-                    &acc_flow.flow,
-                    ep,
-                    direction,
-                    is_active_host,
-                    config,
-                    None,
-                    0,
-                    0,
-                    L7Protocol::Unknown,
-                    self.context.agent_mode,
-                );
-                self.fill_single_l4_stats(tagger, flow_meter);
-            }
-            let tagger = get_edge_tagger(
-                self.global_thread_id,
-                &acc_flow.flow,
-                direction,
-                acc_flow.is_active_host0,
-                acc_flow.is_active_host1,
-                config,
-                None,
-                0,
-                0,
-                L7Protocol::Unknown,
-                self.context.agent_mode,
-            );
-            // edge_stats: If the direction of a certain end is known, the statistical data
-            // will be recorded with the direction (corresponding tap-side), up to two times
-            self.fill_edge_l4_stats(tagger, acc_flow.flow_meter);
-        }
-        // edge_stats: If both ends of direction are None, record the
+        // edge_stats: If both ends of direction are None or not None, record the
         // statistical data with direction=0 (corresponding tap-side=rest)
-        if directions[0] == Direction::None && directions[1] == Direction::None {
+        if Direction::from(directions) == Direction::None {
             // if otel data's directions are unknown, set direction =  Direction::App
             let direction = if acc_flow.flow.signal_source == SignalSource::OTel {
                 Direction::App
@@ -577,8 +526,62 @@ impl Stash {
                 0,
                 0,
                 L7Protocol::Unknown,
+                false,
                 self.context.agent_mode,
             );
+            self.fill_edge_l4_stats(tagger, acc_flow.flow_meter);
+            return;
+        }
+
+        for ep in 0..2 {
+            // Do not count the data of None direction
+            if directions[ep] == Direction::None {
+                continue;
+            }
+            let is_active_host = if ep == 0 {
+                acc_flow.is_active_host0
+            } else {
+                acc_flow.is_active_host1
+            };
+            // single_stats: Do not count the inactive end (Internet/private network IP with no response packet)
+            if !config.inactive_ip_aggregation || is_active_host {
+                let flow_meter = if ep == FLOW_METRICS_PEER_DST {
+                    acc_flow.flow_meter.to_reversed()
+                } else {
+                    acc_flow.flow_meter
+                };
+                let tagger = get_single_tagger(
+                    self.global_thread_id,
+                    &acc_flow.flow,
+                    ep,
+                    directions[ep],
+                    is_active_host,
+                    config,
+                    None,
+                    0,
+                    0,
+                    L7Protocol::Unknown,
+                    false,
+                    self.context.agent_mode,
+                );
+                self.fill_single_l4_stats(tagger, flow_meter);
+            }
+            let tagger = get_edge_tagger(
+                self.global_thread_id,
+                &acc_flow.flow,
+                directions[ep],
+                acc_flow.is_active_host0,
+                acc_flow.is_active_host1,
+                config,
+                None,
+                0,
+                0,
+                L7Protocol::Unknown,
+                false,
+                self.context.agent_mode,
+            );
+            // edge_stats: If the direction of a certain end is known, the statistical data
+            // will be recorded with the direction (corresponding tap-side), up to two times
             self.fill_edge_l4_stats(tagger, acc_flow.flow_meter);
         }
     }
@@ -698,6 +701,34 @@ impl Stash {
         config: &CollectorConfig,
     ) {
         let flow = &meter.flow;
+        // edge_stats: If both ends of direction are None or not None, record the
+        // statistical data with direction=0 (corresponding tap-side=rest)
+        if Direction::from(directions) == Direction::None {
+            // if otel data's directions are unknown, set direction =  Direction::App
+            let direction = if flow.signal_source == SignalSource::OTel {
+                Direction::App
+            } else {
+                Direction::None
+            };
+            let mut tagger = get_edge_tagger(
+                self.global_thread_id,
+                &flow,
+                direction,
+                meter.is_active_host0,
+                meter.is_active_host1,
+                config,
+                meter.endpoint.clone(),
+                meter.biz_type,
+                meter.time_span,
+                meter.l7_protocol,
+                meter.is_reversed,
+                self.context.agent_mode,
+            );
+            tagger.code |= Code::L7_PROTOCOL;
+            self.fill_edge_l7_stats(tagger, meter.endpoint_hash, meter.app_meter);
+            return;
+        }
+
         for ep in 0..2 {
             // Do not count the data of None direction
             if directions[ep] == Direction::None {
@@ -721,6 +752,7 @@ impl Stash {
                     meter.biz_type,
                     meter.time_span,
                     meter.l7_protocol,
+                    meter.is_reversed,
                     self.context.agent_mode,
                 );
                 tagger.code |= Code::L7_PROTOCOL;
@@ -737,6 +769,7 @@ impl Stash {
                 meter.biz_type,
                 meter.time_span,
                 meter.l7_protocol,
+                meter.is_reversed,
                 self.context.agent_mode,
             );
             tagger.code |= Code::L7_PROTOCOL;
@@ -744,34 +777,9 @@ impl Stash {
             // will be recorded with the direction (corresponding tap-side), up to two times
             self.fill_edge_l7_stats(tagger, meter.endpoint_hash, meter.app_meter);
         }
-        // edge_stats: If both ends of direction are None, record the
-        // statistical data with direction=0 (corresponding tap-side=rest)
-        if directions[0] == Direction::None && directions[1] == Direction::None {
-            // if otel data's directions are unknown, set direction =  Direction::App
-            let direction = if flow.signal_source == SignalSource::OTel {
-                Direction::App
-            } else {
-                Direction::None
-            };
-            let mut tagger = get_edge_tagger(
-                self.global_thread_id,
-                &flow,
-                direction,
-                meter.is_active_host0,
-                meter.is_active_host1,
-                config,
-                meter.endpoint.clone(),
-                meter.biz_type,
-                meter.time_span,
-                meter.l7_protocol,
-                self.context.agent_mode,
-            );
-            tagger.code |= Code::L7_PROTOCOL;
-            self.fill_edge_l7_stats(tagger, meter.endpoint_hash, meter.app_meter);
-        }
     }
 
-    fn fill_single_l7_stats(&mut self, tagger: Tagger, endpoint_hash: u32, app_meter: AppMeter) {
+    fn fill_single_l7_stats(&mut self, tagger: Tagger, endpoint_hash: u64, app_meter: AppMeter) {
         // The l7_protocol of otel data may not be available, so report all otel data metrics.
         if tagger.l7_protocol != L7Protocol::Unknown || tagger.signal_source == SignalSource::OTel {
             // Only data whose direction is c|s|local|c-p|s-p|c-app|s-app|app has app_meter.
@@ -788,7 +796,7 @@ impl Stash {
         }
     }
 
-    fn fill_edge_l7_stats(&mut self, tagger: Tagger, endpoint_hash: u32, app_meter: AppMeter) {
+    fn fill_edge_l7_stats(&mut self, tagger: Tagger, endpoint_hash: u64, app_meter: AppMeter) {
         // The l7_protocol of otel data may not be available, so report all otel data metrics.
         // application metrics (vtap_app_edge_port)
         if tagger.l7_protocol != L7Protocol::Unknown || tagger.signal_source == SignalSource::OTel {
@@ -802,6 +810,9 @@ impl Stash {
         if self.closed_docs.len() >= QUEUE_BATCH_SIZE {
             if let Err(e) = self.sender.send_all(&mut self.closed_docs) {
                 warn!("queue failed to send Document data, because {:?}", e);
+                self.counter
+                    .drop_by_queue
+                    .fetch_add(self.closed_docs.len() as u64, Ordering::Relaxed);
                 self.closed_docs.clear();
             }
         }
@@ -833,6 +844,9 @@ impl Stash {
                         "{} queue failed to send data, because {:?}",
                         self.context.name, e
                     );
+                    self.counter
+                        .drop_by_queue
+                        .fetch_add(batch.len() as u64, Ordering::Relaxed);
                     return;
                 }
             }
@@ -846,6 +860,9 @@ impl Stash {
                     "{} queue failed to send data, because {:?}",
                     self.context.name, e
                 );
+                self.counter
+                    .drop_by_queue
+                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
             }
         }
 
@@ -883,13 +900,14 @@ fn get_single_tagger(
     global_thread_id: u8,
     flow: &MiniFlow,
     ep: usize,
-    direction: Direction,
+    mut direction: Direction,
     is_active_host: bool,
     config: &CollectorConfig,
     endpoint: Option<String>,
     biz_type: u8,
     time_span: u32,
     l7_protocol: L7Protocol,
+    is_reversed: bool,
     agent_mode: RunningMode,
 ) -> Tagger {
     let flow_key = &flow.flow_key;
@@ -941,17 +959,35 @@ fn get_single_tagger(
         l3_epc_id: get_l3_epc_id(side.l3_epc_id, flow.signal_source),
         gpid: side.gpid,
         protocol: flow_key.proto,
-        direction,
-        tap_side: TapSide::from(direction),
+        direction: if is_reversed {
+            direction.reverse()
+        } else {
+            direction
+        },
+        tap_side: if is_reversed {
+            TapSide::from(direction).reverse()
+        } else {
+            TapSide::from(direction)
+        },
         tap_port: flow_key.tap_port,
         tap_type: flow_key.tap_type,
         // If the resource is located on the client, the service port is ignored
-        server_port: if ep == FLOW_METRICS_PEER_SRC
-            || ignore_server_port(flow, config.inactive_server_port_aggregation)
-        {
+        server_port: if ignore_server_port(flow, config.inactive_server_port_aggregation) {
             0
         } else {
-            flow.peers[1].nat_real_port
+            if ep == FLOW_METRICS_PEER_SRC {
+                if is_reversed {
+                    flow.peers[0].nat_real_port
+                } else {
+                    0
+                }
+            } else {
+                if is_reversed {
+                    0
+                } else {
+                    flow.peers[1].nat_real_port
+                }
+            }
         },
         is_ipv6,
         code: {
@@ -992,6 +1028,7 @@ fn get_edge_tagger(
     biz_type: u8,
     time_span: u32,
     l7_protocol: L7Protocol,
+    is_reversed: bool,
     agent_mode: RunningMode,
 ) -> Tagger {
     let flow_key = &flow.flow_key;
@@ -1044,7 +1081,7 @@ fn get_edge_tagger(
         (src_mac, dst_mac)
     };
 
-    Tagger {
+    let mut tagger = Tagger {
         global_thread_id,
         agent_id: config.agent_id,
         mac: src_mac,
@@ -1091,7 +1128,18 @@ fn get_edge_tagger(
         biz_type,
         time_span,
         ..Default::default()
+    };
+
+    if is_reversed {
+        let server_port = if ignore_server_port(flow, config.inactive_server_port_aggregation) {
+            0
+        } else {
+            src_ep.nat_real_port
+        };
+        tagger.reverse(server_port);
     }
+
+    tagger
 }
 
 fn get_l3_epc_id(l3_epc_id: i32, signal_source: SignalSource) -> i16 {
@@ -1219,7 +1267,7 @@ impl Collector {
         let thread = thread::Builder::new()
             .name("collector".to_owned())
             .spawn(move || {
-                let mut stash = Stash::new(ctx, sender, counter);
+                let mut stash = Stash::new(ctx, sender, counter.clone());
                 let mut batch = Vec::with_capacity(QUEUE_BATCH_SIZE);
                 while running.load(Ordering::Relaxed) {
                     let config = config.load();
@@ -1231,6 +1279,9 @@ impl Collector {
                             }
                             if let Err(e) = stash.sender.send_all(&mut stash.closed_docs) {
                                 warn!("queue failed to send l4 Document data, because {:?}", e);
+                                counter
+                                    .drop_by_queue
+                                    .fetch_add(stash.closed_docs.len() as u64, Ordering::Relaxed);
                                 stash.closed_docs.clear();
                             }
                             stash.calc_stash_counters();
@@ -1244,6 +1295,9 @@ impl Collector {
                             );
                             if let Err(e) = stash.sender.send_all(&mut stash.closed_docs) {
                                 warn!("queue failed to send l4 Document data, because {:?}", e);
+                                counter
+                                    .drop_by_queue
+                                    .fetch_add(stash.closed_docs.len() as u64, Ordering::Relaxed);
                                 stash.closed_docs.clear();
                             }
                         }
@@ -1351,7 +1405,7 @@ impl L7Collector {
         let thread = thread::Builder::new()
             .name("l7_collector".to_owned())
             .spawn(move || {
-                let mut stash = Stash::new(ctx, sender, counter);
+                let mut stash = Stash::new(ctx, sender, counter.clone());
                 let mut l7_batch = Vec::with_capacity(QUEUE_BATCH_SIZE);
                 while running.load(Ordering::Relaxed) {
                     let config = config.load();
@@ -1363,6 +1417,9 @@ impl L7Collector {
                             }
                             if let Err(e) = stash.sender.send_all(&mut stash.closed_docs) {
                                 warn!("queue failed to send l7 Document data, because {:?}", e);
+                                counter
+                                    .drop_by_queue
+                                    .fetch_add(stash.closed_docs.len() as u64, Ordering::Relaxed);
                                 stash.closed_docs.clear();
                             }
                             stash.calc_stash_counters();
@@ -1376,6 +1433,9 @@ impl L7Collector {
                             );
                             if let Err(e) = stash.sender.send_all(&mut stash.closed_docs) {
                                 warn!("queue failed to send l7 Document data, because {:?}", e);
+                                counter
+                                    .drop_by_queue
+                                    .fetch_add(stash.closed_docs.len() as u64, Ordering::Relaxed);
                                 stash.closed_docs.clear();
                             }
                         }

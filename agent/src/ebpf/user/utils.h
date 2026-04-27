@@ -48,6 +48,8 @@
 
 #define MAX_PATH_LENGTH 1024
 #define CONTAINER_ID_SIZE 65
+#ifndef _LINUX_SYSINFO_H   /* Header guard used by glibc and musl */
+#define _LINUX_SYSINFO_H
 
 struct sysinfo {
 	long uptime;
@@ -65,6 +67,8 @@ struct sysinfo {
 	uint32_t mem_unit;
 	char _f[20 - 2 * sizeof(unsigned long) - sizeof(uint32_t)];
 };
+
+#endif
 
 extern int sysinfo(struct sysinfo *__info);
 
@@ -329,6 +333,45 @@ u32 djb2_32bit(const char *str);
  * @return None. The result is written to `ret_str`.
  */
 void format_port_ranges(uint16_t *ports, size_t size, char *ret_str, int str_sz);
+
+/**
+ * @brief Compute 32-bit MurmurHash3 of the given data buffer.
+ *
+ * MurmurHash3 is a non-cryptographic hash function known for good distribution and speed.
+ *
+ * @param[in] key   Pointer to the input data buffer to hash.
+ * @param[in] len   Length in bytes of the input data.
+ * @param[in] seed  Initial seed value for the hash; can be zero or any 32-bit integer.
+ *
+ * @return 32-bit hash value computed over the input data.
+ */
+uint32_t murmurhash(const void *key, size_t len, uint32_t seed);
+
+/*
+ * Convert uint32_t to decimal string safely
+ *
+ * @param value    The input number to convert
+ * @param buf      Output buffer to store the string
+ * @param bufsize  Size of the output buffer
+ * @return Number of characters written (excluding '\0'), or 0 on failure (e.g., buffer too small)
+ */
+size_t u32_to_str_safe(uint32_t value, char *buf, size_t bufsize);
+
+/*
+ * Safely prepend a prefix to a string buffer
+ *
+ * @param buffer   The string buffer to modify
+ * @param bufsize  Total size of the buffer (including space for '\0')
+ * @param prefix   The prefix to prepend
+ * @return 0 on success, -1 if buffer is too small
+ *
+ * Features:
+ * - Fully safe: checks buffer size
+ * - Uses memmove to handle overlapping memory
+ * - Supports empty prefix or empty buffer
+ * - Always null-terminates on success
+ */
+int prepend_prefix_safe(char *buffer, size_t bufsize, const char *prefix);
 #if !defined(AARCH64_MUSL) && !defined(JAVA_AGENT_ATTACH_TOOL)
 int create_work_thread(const char *name, pthread_t *t, void *fn, void *arg);
 #endif /* !defined(AARCH64_MUSL) && !defined(JAVA_AGENT_ATTACH_TOOL) */

@@ -25,12 +25,12 @@ import (
 
 type ChPodK8sAnnotations struct {
 	SubscriberComponent[
-		*message.PodAdd,
-		message.PodAdd,
-		*message.PodFieldsUpdate,
-		message.PodFieldsUpdate,
-		*message.PodDelete,
-		message.PodDelete,
+		*message.AddedPods,
+		message.AddedPods,
+		*message.UpdatedPod,
+		message.UpdatedPod,
+		*message.DeletedPods,
+		message.DeletedPods,
 		metadbmodel.Pod,
 		metadbmodel.ChPodK8sAnnotations,
 		IDKey,
@@ -40,12 +40,12 @@ type ChPodK8sAnnotations struct {
 func NewChPodK8sAnnotations() *ChPodK8sAnnotations {
 	mng := &ChPodK8sAnnotations{
 		newSubscriberComponent[
-			*message.PodAdd,
-			message.PodAdd,
-			*message.PodFieldsUpdate,
-			message.PodFieldsUpdate,
-			*message.PodDelete,
-			message.PodDelete,
+			*message.AddedPods,
+			message.AddedPods,
+			*message.UpdatedPod,
+			message.UpdatedPod,
+			*message.DeletedPods,
+			message.DeletedPods,
 			metadbmodel.Pod,
 			metadbmodel.ChPodK8sAnnotations,
 			IDKey,
@@ -58,27 +58,7 @@ func NewChPodK8sAnnotations() *ChPodK8sAnnotations {
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChPodK8sAnnotations) onResourceUpdated(sourceID int, fieldsUpdate *message.PodFieldsUpdate, db *metadb.DB) {
-	updateInfo := make(map[string]interface{})
-
-	if fieldsUpdate.Annotation.IsDifferent() {
-		annotations, _ := common.StrToJsonAndMap(fieldsUpdate.Annotation.GetNew())
-		updateInfo["annotations"] = annotations
-	}
-	targetKey := IDKey{ID: sourceID}
-	if len(updateInfo) > 0 {
-		var chItem metadbmodel.ChPodK8sAnnotations
-		db.Where("id = ?", sourceID).First(&chItem)
-		if chItem.ID == 0 {
-			c.SubscriberComponent.dbOperator.add(
-				[]IDKey{targetKey},
-				[]metadbmodel.ChPodK8sAnnotations{{
-					ChIDBase: metadbmodel.ChIDBase{ID: sourceID}, Annotations: updateInfo["annotations"].(string)}},
-				db,
-			)
-		}
-	}
-	c.updateOrSync(db, targetKey, updateInfo)
+func (c *ChPodK8sAnnotations) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedPod) {
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
@@ -86,13 +66,13 @@ func (c *ChPodK8sAnnotations) sourceToTarget(md *message.Metadata, source *metad
 	if source.Annotation == "" {
 		return
 	}
-	annotations, _ := common.StrToJsonAndMap(source.Annotation)
+	annotations, _ := StrToJsonAndMap(source.Annotation)
 	return []IDKey{{ID: source.ID}}, []metadbmodel.ChPodK8sAnnotations{{
 		ChIDBase:    metadbmodel.ChIDBase{ID: source.ID},
 		Annotations: annotations,
-		TeamID:      md.TeamID,
-		DomainID:    md.DomainID,
-		SubDomainID: md.SubDomainID,
+		TeamID:      md.GetTeamID(),
+		DomainID:    md.GetDomainID(),
+		SubDomainID: md.GetSubDomainID(),
 	}}
 }
 

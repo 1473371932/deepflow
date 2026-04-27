@@ -22,21 +22,21 @@ use serde::Serialize;
 use super::pb_adapter::{
     ExtendedInfo, KeyVal, L7ProtocolSendLog, L7Request, L7Response, MetricKeyVal,
 };
-use super::{set_captured_byte, value_is_default, AppProtoHead, L7ResponseStatus, LogMessageType};
+use super::{set_captured_byte, value_is_default, AppProtoHead, L7ResponseStatus};
 use crate::config::handler::LogParserConfig;
 use crate::{
     common::{
         enums::IpProtocol,
         flow::{L7PerfStats, PacketDirection},
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
-        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
-        meta_packet::EbpfFlags,
+        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, LogCache, ParseParam},
+        meta_packet::ApplicationFlags,
         Timestamp,
     },
     flow_generator::error::{Error, Result},
 };
 use l7::tls::TlsHeader;
-use public::l7_protocol::L7Protocol;
+use public::l7_protocol::{L7Protocol, LogMessageType};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum CipherSuite {
@@ -259,7 +259,7 @@ pub struct TlsInfo {
     msg_type: LogMessageType,
     rrt: u64,
     tls_rtt: u64,
-    session_id: Option<u32>,
+    cal_tls_rtt: bool,
 
     #[serde(skip)]
     is_on_blacklist: bool,
@@ -267,7 +267,13 @@ pub struct TlsInfo {
 
 impl L7ProtocolInfoInterface for TlsInfo {
     fn session_id(&self) -> Option<u32> {
-        self.session_id
+        // 0xff is a random non-zero value for tls rtt calculation
+        // Calling `info.perf_stats` with cal_tls_rtt `on` or `off` will generate two different results
+        if self.cal_tls_rtt {
+            Some(0xff)
+        } else {
+            None
+        }
     }
 
     fn merge_log(
@@ -451,7 +457,7 @@ impl From<TlsInfo> for L7ProtocolSendLog {
             } else {
                 None
             },
-            flags: EbpfFlags::TLS.bits(),
+            flags: ApplicationFlags::TLS.bits(),
             ..Default::default()
         };
 
@@ -459,26 +465,41 @@ impl From<TlsInfo> for L7ProtocolSendLog {
     }
 }
 
+impl From<&TlsInfo> for LogCache {
+    fn from(info: &TlsInfo) -> Self {
+        LogCache {
+            msg_type: info.msg_type,
+            resp_status: info.status,
+            on_blacklist: info.is_on_blacklist,
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct TlsLog {
     change_cipher_spec_count: u8,
-    perf_stats: Option<L7PerfStats>,
-    last_is_on_blacklist: bool,
+    is_change_cipher_spec: bool,
+    perf_stats: Vec<L7PerfStats>,
 }
 
 //解析器接口实现
 impl L7ProtocolParserInterface for TlsLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
         if !param.ebpf_type.is_raw_protocol() || param.l4_protocol != IpProtocol::TCP {
-            return false;
+            return None;
         }
 
         if payload.len() < TlsHeader::HEADER_LEN {
-            return false;
+            return None;
         }
 
         let tls_header = TlsHeader::new(payload);
-        tls_header.is_handshake() && tls_header.is_client_hello()
+        if tls_header.is_handshake() && tls_header.is_client_hello() {
+            Some(LogMessageType::Request)
+        } else {
+            None
+        }
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
@@ -488,40 +509,31 @@ impl L7ProtocolParserInterface for TlsLog {
         if let Some(config) = param.parse_config {
             info.set_is_on_blacklist(config);
         }
-        if !info.is_on_blacklist && !self.last_is_on_blacklist {
-            match param.direction {
-                PacketDirection::ClientToServer => {
-                    self.perf_stats.as_mut().map(|p| p.inc_req());
+        if param.parse_perf {
+            let mut perf_stat = L7PerfStats::default();
+            // Triggered by Client Hello and the last Change cipher spec
+            if info.cal_tls_rtt {
+                if let Some(stats) = info.perf_stats(param) {
+                    info.tls_rtt = stats.rrt_sum;
+                    perf_stat.update_tls_rtt(stats.rrt_sum);
                 }
-                PacketDirection::ServerToClient => {
-                    self.perf_stats.as_mut().map(|p| p.inc_resp());
-                }
+                info.cal_tls_rtt = false;
             }
-            match info.status {
-                L7ResponseStatus::ClientError => {
-                    self.perf_stats.as_mut().map(|p| p.inc_req_err());
-                }
-                L7ResponseStatus::ServerError => {
-                    self.perf_stats.as_mut().map(|p| p.inc_resp_err());
-                }
-                _ => {}
+
+            // In some scenarios, the last Change cipher spec does not have a corresponding response,
+            // and this is directly set to be reported by session
+            if self.is_change_cipher_spec && info.msg_type == LogMessageType::Request {
+                info.status = L7ResponseStatus::Ok;
+                info.msg_type = LogMessageType::Session
             }
-            if info.session_id.is_some() {
-                // Triggered by Client Hello and the last Change cipher spec
-                info.cal_rrt(param, &None).map(|(rtt, _)| {
-                    info.tls_rtt = rtt;
-                    self.perf_stats.as_mut().map(|p| p.update_tls_rtt(rtt));
-                });
-                info.session_id = None;
+
+            // This `perf_stats` is called with info.cal_tls_rtt == false
+            if let Some(stats) = info.perf_stats(param) {
+                info.rrt = stats.rrt_sum;
+                perf_stat.sequential_merge(&stats);
             }
-            if info.msg_type != LogMessageType::Session {
-                info.cal_rrt(param, &None).map(|(rrt, _)| {
-                    info.rrt = rrt;
-                    self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
-                });
-            }
+            self.perf_stats.push(perf_stat);
         }
-        self.last_is_on_blacklist = info.is_on_blacklist;
         if param.parse_log {
             Ok(L7ParseResult::Single(L7ProtocolInfo::TlsInfo(info)))
         } else {
@@ -533,8 +545,8 @@ impl L7ProtocolParserInterface for TlsLog {
         L7Protocol::TLS
     }
 
-    fn perf_stats(&mut self) -> Option<L7PerfStats> {
-        self.perf_stats.take()
+    fn perf_stats(&mut self) -> Vec<L7PerfStats> {
+        std::mem::take(&mut self.perf_stats)
     }
 }
 
@@ -542,10 +554,6 @@ impl TlsLog {
     const CHNAGE_CIPHER_SPEC_LIMIT: u8 = 2;
 
     fn parse(&mut self, payload: &[u8], info: &mut TlsInfo, param: &ParseParam) -> Result<()> {
-        if self.perf_stats.is_none() && param.parse_perf {
-            self.perf_stats = Some(L7PerfStats::default())
-        };
-
         let mut tls_headers = vec![];
         let mut offset = 0;
         while offset + TlsHeader::HEADER_LEN <= payload.len() {
@@ -582,7 +590,7 @@ impl TlsLog {
                 info.msg_type = LogMessageType::Request;
                 tls_headers.iter().for_each(|h| {
                     if h.is_client_hello() {
-                        info.session_id = Some(0xff);
+                        info.cal_tls_rtt = true;
                     }
                     if h.is_alert() {
                         info.status = L7ResponseStatus::ClientError;
@@ -590,10 +598,13 @@ impl TlsLog {
                     }
                     if h.is_change_cipher_spec() {
                         self.change_cipher_spec_count += 1;
+                        self.is_change_cipher_spec = true;
                         if self.change_cipher_spec_count >= Self::CHNAGE_CIPHER_SPEC_LIMIT {
                             self.change_cipher_spec_count = 0;
-                            info.session_id = Some(0xff);
+                            info.cal_tls_rtt = true;
                         }
+                    } else {
+                        self.is_change_cipher_spec = false;
                     }
 
                     if info.handshake_protocol.is_empty() && h.handshake_headers.len() > 0 {
@@ -621,6 +632,7 @@ impl TlsLog {
                     .to_string();
             }
             PacketDirection::ServerToClient => {
+                info.status = L7ResponseStatus::Ok;
                 info.msg_type = LogMessageType::Response;
 
                 if info.version.is_empty() {
@@ -647,10 +659,13 @@ impl TlsLog {
 
                     if h.is_change_cipher_spec() {
                         self.change_cipher_spec_count += 1;
+                        self.is_change_cipher_spec = true;
                         if self.change_cipher_spec_count >= Self::CHNAGE_CIPHER_SPEC_LIMIT {
                             self.change_cipher_spec_count = 0;
-                            info.session_id = Some(0xff);
+                            info.cal_tls_rtt = true;
                         }
+                    } else {
+                        self.is_change_cipher_spec = false;
                     }
 
                     if h.cipher_suite().is_some() && info.cipher_suite.is_none() {
@@ -682,152 +697,5 @@ impl TlsLog {
         }
         set_captured_byte!(info, param);
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-    use std::rc::Rc;
-    use std::{cell::RefCell, fs};
-
-    use super::*;
-
-    use crate::{
-        common::{flow::PacketDirection, l7_protocol_log::L7PerfCache, MetaPacket},
-        flow_generator::L7_RRT_CACHE_CAPACITY,
-        utils::test::Capture,
-    };
-
-    const FILE_DIR: &str = "resources/test/flow_generator/tls";
-
-    fn run(name: &str) -> String {
-        let capture = Capture::load_pcap(Path::new(FILE_DIR).join(name));
-        let log_cache = Rc::new(RefCell::new(L7PerfCache::new(L7_RRT_CACHE_CAPACITY)));
-        let mut packets = capture.collect::<Vec<_>>();
-        if packets.is_empty() {
-            return "".to_string();
-        }
-
-        let mut output = String::new();
-        let first_dst_port = packets[0].lookup_key.dst_port;
-        let mut tls = TlsLog::default();
-        for packet in packets.iter_mut() {
-            packet.lookup_key.direction = if packet.lookup_key.dst_port == first_dst_port {
-                PacketDirection::ClientToServer
-            } else {
-                PacketDirection::ServerToClient
-            };
-            let payload = match packet.get_l4_payload() {
-                Some(p) => p,
-                None => continue,
-            };
-
-            let param = &mut ParseParam::new(
-                packet as &MetaPacket,
-                log_cache.clone(),
-                Default::default(),
-                #[cfg(any(target_os = "linux", target_os = "android"))]
-                Default::default(),
-                true,
-                true,
-            );
-            param.set_captured_byte(payload.len());
-            let is_tls = tls.check_payload(payload, param);
-            tls.reset();
-            let info = tls.parse_payload(payload, param);
-            if let Ok(info) = info {
-                match info.unwrap_single() {
-                    L7ProtocolInfo::TlsInfo(i) => {
-                        output.push_str(&format!("{:?} is_tls: {}\r\n", i, is_tls));
-                    }
-                    _ => unreachable!(),
-                }
-            }
-        }
-        output
-    }
-
-    #[test]
-    fn check() {
-        let files = vec![
-            ("tls-1-0.pcap", "tls-1-0.result"),
-            ("tls-1-3.pcap", "tls-1-3.result"),
-            ("tls.pcap", "tls.result"),
-            ("application.pcap", "application.result"),
-            ("alert.pcap", "alert.result"),
-            ("client-extension.pcap", "client-extension.result"),
-        ];
-
-        for item in files.iter() {
-            let expected = fs::read_to_string(&Path::new(FILE_DIR).join(item.1)).unwrap();
-            let output = run(item.0);
-
-            if output != expected {
-                let output_path = Path::new("actual.txt");
-                fs::write(&output_path, &output).unwrap();
-                assert!(
-                    output == expected,
-                    "output different from expected {}, written to {:?}",
-                    item.1,
-                    output_path
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn check_perf() {
-        let expected = vec![(
-            "tls.pcap",
-            L7PerfStats {
-                request_count: 2,
-                response_count: 2,
-                err_client_count: 0,
-                err_server_count: 0,
-                err_timeout: 0,
-                rrt_count: 2,
-                rrt_sum: 102011,
-                rrt_max: 55453,
-                tls_rtt: 103343,
-                ..Default::default()
-            },
-        )];
-
-        for item in expected.iter() {
-            assert_eq!(item.1, run_perf(item.0), "parse pcap {} unexcepted", item.0);
-        }
-    }
-
-    fn run_perf(pcap: &str) -> L7PerfStats {
-        let rrt_cache = Rc::new(RefCell::new(L7PerfCache::new(100)));
-        let mut tls = TlsLog::default();
-
-        let capture = Capture::load_pcap(Path::new(FILE_DIR).join(pcap));
-        let mut packets = capture.collect::<Vec<_>>();
-        if packets.len() < 2 {
-            unreachable!()
-        }
-        let first_dst_port = packets[0].lookup_key.dst_port;
-        for packet in packets.iter_mut() {
-            if packet.lookup_key.dst_port == first_dst_port {
-                packet.lookup_key.direction = PacketDirection::ClientToServer;
-            } else {
-                packet.lookup_key.direction = PacketDirection::ServerToClient;
-            }
-            let _ = tls.parse_payload(
-                packet.get_l4_payload().unwrap(),
-                &ParseParam::new(
-                    &*packet,
-                    rrt_cache.clone(),
-                    Default::default(),
-                    #[cfg(any(target_os = "linux", target_os = "android"))]
-                    Default::default(),
-                    true,
-                    true,
-                ),
-            );
-        }
-        tls.perf_stats.unwrap()
     }
 }

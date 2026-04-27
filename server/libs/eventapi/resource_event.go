@@ -24,12 +24,12 @@ const (
 	RESOURCE_EVENT_TYPE_UPDATE_STATE      = "update-state"
 	RESOURCE_EVENT_TYPE_MIGRATE           = "migrate"
 	RESOURCE_EVENT_TYPE_RECREATE          = "recreate"
-	RESOURCE_EVENT_TYPE_ADD_IP            = "attach-ip"
-	RESOURCE_EVENT_TYPE_REMOVE_IP         = "detach-ip"
-	RESOURCE_EVENT_TYPE_UPDATE_CONFIG     = "modify"
-	RESOURCE_EVENT_TYPE_ADD_CONFIG_MAP    = "attach-config"
-	RESOURCE_EVENT_TYPE_UPDATE_CONFIG_MAP = "update-config"
-	RESOURCE_EVENT_TYPE_DELETE_CONFIG_MAP = "detach-config"
+	RESOURCE_EVENT_TYPE_ATTACH_IP         = "attach-ip"
+	RESOURCE_EVENT_TYPE_DETACH_IP         = "detach-ip"
+	RESOURCE_EVENT_TYPE_MODIFY            = "modify"
+	RESOURCE_EVENT_TYPE_ATTACH_CONFIG_MAP = "attach-config"
+	RESOURCE_EVENT_TYPE_MODIFY_CONFIG_MAP = "modify-config"
+	RESOURCE_EVENT_TYPE_DETACH_CONFIG_MAP = "detach-config"
 )
 
 type ResourceEvent struct {
@@ -42,10 +42,10 @@ type ResourceEvent struct {
 	AttributeSubnetIDs []uint32
 	AttributeIPs       []string
 	Description        string
-	GProcessID         uint32 // if this value is set, InstanceType and InstanceID are empty
-	GProcessName       string // if this value is set, InstanceName is empty
 
 	IfNeedTagged bool // if need ingester set tag
+	GProcessID   uint32
+	GProcessName string
 	RegionID     uint32
 	AZID         uint32
 	VPCID        uint32
@@ -55,7 +55,7 @@ type ResourceEvent struct {
 	PodClusterID uint32
 	PodNSID      uint32
 	PodNodeID    uint32
-	PodServiceID uint32
+	PodServiceID uint32 // TODO 此字段在 ingester 中并未被使用，待删除
 	PodGroupID   uint32
 	PodGroupType uint8
 	PodID        uint32
@@ -71,6 +71,7 @@ type ResourceEvent struct {
 }
 
 const (
+	AttributeNameConfigName = "config_name"
 	AttributeNameConfig     = "config"
 	AttributeNameConfigDiff = "config_diff"
 )
@@ -182,7 +183,7 @@ func TagPodNodeID(id int) TagFieldOption {
 
 func TagPodServiceID(id int) TagFieldOption {
 	return func(r *ResourceEvent) {
-		r.PodServiceID = uint32(id)
+		r.PodServiceID = uint32(id) // TODO 此字段在 ingester 中并未被使用，待删除
 	}
 }
 

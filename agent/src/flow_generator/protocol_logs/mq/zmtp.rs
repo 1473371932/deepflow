@@ -1,16 +1,18 @@
+use public::l7_protocol::LogMessageType;
+
 use crate::{
     common::{
         flow::{L7PerfStats, L7Protocol, PacketDirection},
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
-        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
-        meta_packet::EbpfFlags,
+        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, LogCache, ParseParam},
+        meta_packet::ApplicationFlags,
     },
     config::handler::LogParserConfig,
     flow_generator::{
         error::{Error, Result},
         protocol_logs::{
             pb_adapter::{ExtendedInfo, KeyVal, L7ProtocolSendLog, L7Request, L7Response},
-            set_captured_byte, AppProtoHead, L7ResponseStatus, LogMessageType,
+            set_captured_byte, AppProtoHead, L7ResponseStatus,
         },
     },
     plugin::wasm::{
@@ -98,12 +100,15 @@ impl FrameType {
     }
 }
 
-#[derive(Serialize, Clone, Debug, Default)]
+#[derive(Serialize, Clone, Debug)]
 pub struct ZmtpInfo {
     msg_type: LogMessageType,
     req_msg_size: Option<u64>,
     res_msg_size: Option<u64>,
     is_tls: bool,
+    is_async: bool,
+    #[serde(skip)]
+    is_reversed: bool,
     rtt: u64,
     status: L7ResponseStatus,
     err_msg: Option<String>,
@@ -130,6 +135,36 @@ pub struct ZmtpInfo {
     is_on_blacklist: bool,
 }
 
+impl Default for ZmtpInfo {
+    fn default() -> Self {
+        Self {
+            msg_type: Default::default(),
+            req_msg_size: None,
+            res_msg_size: None,
+            is_tls: false,
+            is_async: false,
+            is_reversed: false,
+            rtt: 0,
+            status: L7ResponseStatus::Ok,
+            err_msg: None,
+            subscription: None,
+            major_version: None,
+            minor_version: None,
+            more_frames: None,
+            socket_type: None,
+            frame_type: Default::default(),
+            mechanism: None,
+            command_name: None,
+            payload: Vec::new(),
+            captured_request_byte: 0,
+            captured_response_byte: 0,
+            attributes: Vec::new(),
+            l7_protocol_str: None,
+            is_on_blacklist: false,
+        }
+    }
+}
+
 impl ZmtpInfo {
     fn get_version(&self) -> String {
         match (self.major_version, self.minor_version) {
@@ -149,6 +184,9 @@ impl ZmtpInfo {
         self.captured_response_byte = res.captured_response_byte;
         if res.is_on_blacklist {
             self.is_on_blacklist = res.is_on_blacklist;
+        }
+        if res.is_reversed {
+            self.is_reversed = res.is_reversed;
         }
     }
     fn wasm_hook(&mut self, param: &ParseParam, payload: &[u8]) {
@@ -173,6 +211,12 @@ impl ZmtpInfo {
             if custom.proto_str.len() > 0 {
                 self.l7_protocol_str = Some(custom.proto_str);
             }
+            if let Some(is_async) = custom.is_async {
+                self.is_async = is_async;
+            }
+            if let Some(is_reversed) = custom.is_reversed {
+                self.is_reversed = is_reversed;
+            }
         }
     }
 
@@ -192,11 +236,17 @@ impl ZmtpInfo {
 
 impl From<ZmtpInfo> for L7ProtocolSendLog {
     fn from(f: ZmtpInfo) -> Self {
-        let flags = if f.is_tls {
-            EbpfFlags::TLS.bits()
+        let mut flags = if f.is_tls {
+            ApplicationFlags::TLS
         } else {
-            EbpfFlags::NONE.bits()
+            ApplicationFlags::NONE
         };
+        if f.is_async {
+            flags = flags | ApplicationFlags::ASYNC;
+        }
+        if f.is_reversed {
+            flags = flags | ApplicationFlags::REVERSED;
+        }
         L7ProtocolSendLog {
             req_len: f.req_msg_size.map(|x| x as u32),
             resp_len: f.res_msg_size.map(|x| x as u32),
@@ -215,7 +265,7 @@ impl From<ZmtpInfo> for L7ProtocolSendLog {
                 ..Default::default()
             },
             version: Some(f.get_version()),
-            flags,
+            flags: flags.bits(),
             ext_info: Some(ExtendedInfo {
                 attributes: {
                     if f.attributes.is_empty() {
@@ -227,6 +277,17 @@ impl From<ZmtpInfo> for L7ProtocolSendLog {
                 protocol_str: f.l7_protocol_str,
                 ..Default::default()
             }),
+            ..Default::default()
+        }
+    }
+}
+
+impl From<&ZmtpInfo> for LogCache {
+    fn from(info: &ZmtpInfo) -> Self {
+        LogCache {
+            msg_type: info.msg_type,
+            resp_status: info.status,
+            on_blacklist: info.is_on_blacklist,
             ..Default::default()
         }
     }
@@ -258,6 +319,10 @@ impl L7ProtocolInfoInterface for ZmtpInfo {
     fn is_on_blacklist(&self) -> bool {
         self.is_on_blacklist
     }
+
+    fn is_reversed(&self) -> bool {
+        self.is_reversed
+    }
 }
 
 #[derive(Default)]
@@ -268,8 +333,7 @@ pub struct ZmtpLog {
     server_socket_type: Option<SocketType>,
     mechanism: Option<Mechanism>,
 
-    perf_stats: Option<L7PerfStats>,
-    last_is_on_blacklist: bool,
+    perf_stats: Vec<L7PerfStats>,
 }
 
 fn parse_byte(payload: &[u8]) -> Option<(&[u8], u8)> {
@@ -618,15 +682,17 @@ impl ZmtpLog {
 }
 
 impl L7ProtocolParserInterface for ZmtpLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
-        Self::check_protocol(payload, param)
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
+        if Self::check_protocol(payload, param) {
+            Some(LogMessageType::Request)
+        } else {
+            None
+        }
     }
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
-        if self.perf_stats.is_none() && param.parse_perf {
-            self.perf_stats = Some(L7PerfStats::default())
-        };
         let mut info_list = self.parse(payload, param, false)?;
 
+        self.perf_stats.clear();
         info_list.iter_mut().for_each(|info| {
             let info = match info {
                 L7ProtocolInfo::ZmtpInfo(info) => info,
@@ -637,34 +703,15 @@ impl L7ProtocolParserInterface for ZmtpLog {
             if let Some(config) = param.parse_config {
                 info.set_is_on_blacklist(config);
             }
-            if !info.is_on_blacklist && !self.last_is_on_blacklist {
-                match param.direction {
-                    PacketDirection::ClientToServer => {
-                        self.perf_stats.as_mut().map(|p| p.inc_req());
-                    }
-                    PacketDirection::ServerToClient => {
-                        self.perf_stats.as_mut().map(|p| p.inc_resp());
-                    }
+
+            if param.parse_perf {
+                let mut perf_stat = L7PerfStats::default();
+                if let Some(stats) = info.perf_stats(param) {
+                    info.rtt = stats.rrt_sum;
+                    perf_stat.sequential_merge(&stats);
                 }
-                match info.status {
-                    L7ResponseStatus::ClientError => {
-                        self.perf_stats
-                            .as_mut()
-                            .map(|p: &mut L7PerfStats| p.inc_req_err());
-                    }
-                    L7ResponseStatus::ServerError => {
-                        self.perf_stats
-                            .as_mut()
-                            .map(|p: &mut L7PerfStats| p.inc_resp_err());
-                    }
-                    _ => {}
-                }
-                info.cal_rrt(param, &None).map(|(rtt, _)| {
-                    info.rtt = rtt;
-                    self.perf_stats.as_mut().map(|p| p.update_rrt(rtt));
-                });
+                self.perf_stats.push(perf_stat);
             }
-            self.last_is_on_blacklist = info.is_on_blacklist;
         });
 
         if !param.parse_log {
@@ -680,8 +727,8 @@ impl L7ProtocolParserInterface for ZmtpLog {
     fn protocol(&self) -> L7Protocol {
         L7Protocol::ZMTP
     }
-    fn perf_stats(&mut self) -> Option<L7PerfStats> {
-        self.perf_stats.take()
+    fn perf_stats(&mut self) -> Vec<L7PerfStats> {
+        std::mem::take(&mut self.perf_stats)
     }
 }
 
@@ -697,7 +744,7 @@ mod tests {
     use crate::flow_generator::L7_RRT_CACHE_CAPACITY;
     use crate::{
         common::{flow::PacketDirection, MetaPacket},
-        utils::test::Capture,
+        utils::test_utils::Capture,
     };
 
     const FILE_DIR: &str = "resources/test/flow_generator/zmtp";
@@ -725,7 +772,7 @@ mod tests {
             };
             let param = &mut ParseParam::new(
                 packet as &MetaPacket,
-                log_cache.clone(),
+                Some(log_cache.clone()),
                 Default::default(),
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 Default::default(),

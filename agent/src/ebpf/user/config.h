@@ -18,10 +18,21 @@
 #define DF_EBPF_CONFIG_H
 
 #define EV_NAME_SIZE			1024
-#define MAX_EVENTS_BURST           	32 // The number of events in batch processing
+#define MAX_EVENTS_BURST           	32	// The number of events in batch processing
 #define BOOT_TIME_UPDATE_PERIOD		60	// 系统启动时间更新周期, 单位：秒
-#define IO_FILEPATH_BUFF_SIZE		1024 // Default value for file path length
-#define DENTRY_NAME_SIZE		256  // Maximum length of a directory entry name
+#define DENTRY_NAME_SIZE		256  	// Maximum length of a directory entry name
+
+/*
+ *  Note: The following settings are related to the offset
+ *  calculations in Rust, in the file 
+ *  `agent/src/common/proc_event/linux.rs`.
+ *  If the values of the four macros below are modified, the
+ *  Rust file must be updated accordingly.
+ */
+#define FILE_NAME_SZ			256
+#define MOUNT_SOURCE_SZ			512
+#define MOUNT_POINT_SZ			256
+#define FILE_PATH_SZ			512
 
 // eBPF Map Name
 #define MAP_MEMBERS_OFFSET_NAME         "__members_offset"
@@ -32,7 +43,7 @@
 #define MAP_TRACE_STATS_NAME            "__trace_stats_map"
 #define MAP_PROTO_FILTER_NAME		"__protocol_filter"
 #define MAP_KPROBE_PORT_BITMAP_NAME	"__kprobe_port_bitmap"
-#define MAP_ADAPT_KERN_UID_NAME		"__adapt_kern_uid_map"
+#define MAP_ADAPT_KERN_DATA_NAME	"__adapt_kern_data_map"
 #define MAP_PROTO_PORTS_BITMAPS_NAME	"__proto_ports_bitmap"
 #define MAP_ALLOW_REASM_PROTOS_NAME     "__allow_reasm_protos_map"
 #define MAP_PKTS_STATES_NAME		"__pkts_stats_map"
@@ -47,8 +58,10 @@
 #define PROG_OUTPUT_DATA_NAME_FOR_TP	"df_TP_output_data"
 #define PROG_IO_EVENT_NAME_FOR_TP	"df_TP_io_event"
 #define PROG_IO_EVENT_NAME_FOR_KP       "df_KP_io_event"
-#define PROG_PROTO_INFER_FOR_KP		"df_KP_proto_infer_2"
-#define PROG_PROTO_INFER_FOR_TP		"df_TP_proto_infer_2"
+#define PROG_PROTO_INFER_2_FOR_KP	"df_KP_proto_infer_2"
+#define PROG_PROTO_INFER_2_FOR_TP	"df_TP_proto_infer_2"
+#define PROG_PROTO_INFER_3_FOR_KP	"df_KP_proto_infer_3"
+#define PROG_PROTO_INFER_3_FOR_TP	"df_TP_proto_infer_3"
 
 // perf profiler
 #define MAP_PERF_PROFILER_BUF_A_NAME	"__profiler_output_a"
@@ -58,23 +71,46 @@
 #define MAP_UNWIND_SYSINFO_NAME         "__unwind_sysinfo"
 #define MAP_PYTHON_UNWIND_INFO_NAME     "__python_unwind_info_map"
 #define MAP_PYTHON_OFFSETS_NAME         "__python_offsets_map"
-#define MAP_SYMBOL_TABLE_NAME          "__symbol_table"
-#define PROFILE_PG_CNT_DEF		16	// perf ring-buffer page count
+#define MAP_PHP_UNWIND_INFO_NAME        "__php_unwind_info_map"
+#define MAP_PHP_OFFSETS_NAME            "__php_offsets_map"
+#define MAP_V8_UNWIND_INFO_NAME         "__v8_unwind_info_map"
+#define MAP_SYMBOL_TABLE_NAME           "__symbol_table"
 
-#define MAP_CP_PROGS_JMP_PE_NAME	"__cp_progs_jmp_pe_map"
-#define PROG_DWARF_UNWIND_FOR_PE    "df_PE_dwarf_unwind"
-#define PROG_PYTHON_UNWIND_FOR_PE   "df_PE_python_unwind"
-#define PROG_ONCPU_OUTPUT_FOR_PE    "df_PE_oncpu_output"
+#define PROFILE_PG_CNT_DEF              16	// perf ring-buffer page count
+
+#define MAP_CP_PROGS_JMP_PE_NAME        "__cp_progs_jmp_pe_map"
+#define PROG_DWARF_UNWIND_FOR_PE        "df_PE_dwarf_unwind"
+#define PROG_PYTHON_UNWIND_FOR_PE       "df_PE_python_unwind"
+#define PROG_LUA_UNWIND_FOR_PE          "df_PE_lua_unwind"
+#define PROG_PHP_UNWIND_FOR_PE          "df_PE_php_unwind"
+#define PROG_V8_UNWIND_FOR_PE           "df_PE_v8_unwind"
+#define PROG_DWARF_UNWIND_BEFORE_V8_FOR_PE   "df_PE_dwarf_unwind_before_v8"
+#define PROG_DWARF_UNWIND_BEFORE_PHP_FOR_PE  "df_PE_dwarf_unwind_before_php"
+#define PROG_ONCPU_OUTPUT_FOR_PE        "df_PE_oncpu_output"
+
+// lua related maps
+#define MAP_LUA_LANG_FLAGS_NAME         "__lua_lang_flags_map"
+#define MAP_LUA_UNWIND_INFO_NAME        "__lua_unwind_info_map"
+#define MAP_LUA_OFFSETS_NAME            "__lua_offsets_map"
+#define MAP_LUAJIT_OFFSETS_NAME         "__luajit_offsets_map"
+#define MAP_LUA_TSTATE_NAME             "__lua_tstate_map"
+#define MAP_LUA_TEXT_REGION_NAME        "__lua_text_region_map"
 
 #define MAP_CP_PROGS_JMP_KP_NAME             "__cp_progs_jmp_kp_map"
 #define PROG_OFFCPU_DWARF_UNWIND_FOR_KP      "df_KP_offcpu_dwarf_unwind"
 #define PROG_OFFCPU_PYTHON_UNWIND_FOR_KP     "df_KP_offcpu_python_unwind"
 #define PROG_OFFCPU_OUTPUT_FOR_KP            "df_KP_offcpu_output"
+#define PROG_OFFCPU_PHP_UNWIND_FOR_KP        "df_KP_offcpu_php_unwind"
+#define PROG_OFFCPU_V8_UNWIND_FOR_KP         "df_KP_offcpu_v8_unwind"
+#define PROG_OFFCPU_DWARF_BEFORE_PHP_FOR_KP  "df_KP_offcpu_dwarf_before_php"
+#define PROG_OFFCPU_DWARF_BEFORE_V8_FOR_KP   "df_KP_offcpu_dwarf_before_v8"
 #define PROG_MEMORY_DWARF_UNWIND_FOR_KP      "df_KP_memory_dwarf_unwind"
+#define PROG_MEMORY_PYTHON_UNWIND_FOR_KP     "df_KP_memory_python_unwind"
 #define PROG_MEMORY_OUTPUT_FOR_KP            "df_KP_memory_output"
 
 enum {
-	PROG_PROTO_INFER_TP_IDX,
+	PROG_PROTO_INFER_TP_2_IDX,
+	PROG_PROTO_INFER_TP_3_IDX,
 	PROG_DATA_SUBMIT_TP_IDX,
 	PROG_OUTPUT_DATA_TP_IDX,
 	PROG_IO_EVENT_TP_IDX,
@@ -82,7 +118,8 @@ enum {
 };
 
 enum {
-	PROG_PROTO_INFER_KP_IDX,
+	PROG_PROTO_INFER_KP_2_IDX,
+	PROG_PROTO_INFER_KP_3_IDX,
 	PROG_DATA_SUBMIT_KP_IDX,
 	PROG_OUTPUT_DATA_KP_IDX,
 	PROG_IO_EVENT_KP_IDX,
@@ -92,6 +129,11 @@ enum {
 enum {
 	PROG_DWARF_UNWIND_PE_IDX,
 	PROG_PYTHON_UNWIND_PE_IDX,
+	PROG_LUA_UNWIND_PE_IDX,
+	PROG_PHP_UNWIND_PE_IDX,
+	PROG_V8_UNWIND_PE_IDX,
+	PROG_DWARF_UNWIND_BEFORE_V8_PE_IDX,  // DWARF unwinding before V8 interpreter unwinding
+	PROG_DWARF_UNWIND_BEFORE_PHP_PE_IDX, // DWARF unwinding before PHP interpreter unwinding
 	PROG_ONCPU_OUTPUT_PE_IDX,
 	CP_PROG_PE_NUM
 };
@@ -100,7 +142,12 @@ enum {
 	PROG_OFFCPU_DWARF_UNWIND_KP_IDX,
 	PROG_OFFCPU_PYTHON_UNWIND_KP_IDX,
 	PROG_OFFCPU_OUTPUT_KP_IDX,
+	PROG_OFFCPU_PHP_UNWIND_KP_IDX,
+	PROG_OFFCPU_V8_UNWIND_KP_IDX,
+	PROG_OFFCPU_DWARF_BEFORE_PHP_KP_IDX,
+	PROG_OFFCPU_DWARF_BEFORE_V8_KP_IDX,
 	PROG_MEMORY_DWARF_UNWIND_KP_IDX,
+	PROG_MEMORY_PYTHON_UNWIND_KP_IDX,
 	PROG_MEMORY_OUTPUT_KP_IDX,
 	CP_PROG_KP_NUM
 };
@@ -130,6 +177,12 @@ enum cfg_feature_idx {
 	FEATURE_PROFILE_MEMORY,
 	FEATURE_SOCKET_TRACER,
 	FEATURE_DWARF_UNWINDING,
+	// Language-specific profiling features
+	FEATURE_PROFILE_PYTHON,
+	FEATURE_PROFILE_PHP,
+	FEATURE_PROFILE_V8,
+	FEATURE_PROFILE_LUA,
+	FEATURE_CPU_BALANCER,
 	FEATURE_MAX,
 };
 
@@ -141,6 +194,11 @@ enum cfg_feature_idx {
 #define FEATURE_FLAG_PROFILE_MEMORY		(1 << FEATURE_PROFILE_MEMORY)
 #define FEATURE_FLAG_SOCKET_TRACER		(1 << FEATURE_SOCKET_TRACER)
 #define FEATURE_FLAG_DWARF_UNWINDING		(1 << FEATURE_DWARF_UNWINDING)
+#define FEATURE_FLAG_PROFILE_PYTHON		(1 << FEATURE_PROFILE_PYTHON)
+#define FEATURE_FLAG_PROFILE_PHP		(1 << FEATURE_PROFILE_PHP)
+#define FEATURE_FLAG_PROFILE_V8			(1 << FEATURE_PROFILE_V8)
+#define FEATURE_FLAG_PROFILE_LUA		(1 << FEATURE_PROFILE_LUA)
+#define FEATURE_FLAG_CPU_BALANCER		(1 << FEATURE_CPU_BALANCER)
 
 #define FEATURE_FLAG_PROFILE				(FEATURE_FLAG_PROFILE_ONCPU | FEATURE_FLAG_PROFILE_OFFCPU | FEATURE_FLAG_PROFILE_MEMORY)
 
@@ -175,7 +233,8 @@ enum cfg_feature_idx {
 #define CP_TRACER_NAME	                "continuous_profiler"
 
 #define DATADUMP_FILE_PATH_SIZE		1024
-#define DATADUMP_FILE_PATH_PREFIX	"/var/log"
+#define DATADUMP_SAVE_DIR		"/var/log"
+#define DATADUMP_FILE_PATH_PREFIX	DATADUMP_SAVE_DIR
 
 // trace map回收的最大比例（指当前数量超过了整个MAP的容量的回收比例才进行回收）
 // Maximum proportion of trace map reclamation (refers to the proportion of
@@ -201,7 +260,7 @@ enum cfg_feature_idx {
 #endif
 
 /*
- * continuous profiler 
+ * continuous profiler
  */
 #define MAP_STACK_A_NAME	"__stack_map_a"
 #define MAP_STACK_B_NAME	"__stack_map_b"
@@ -271,6 +330,13 @@ enum cfg_feature_idx {
  */
 #define KICK_KERN_PERIOD 40000000  // Set default interval to 40 milliseconds
 /*
+ * Default CFS nice value for per-CPU kick threads.
+ *
+ * The actual nice value can be overridden at startup by configuration.
+ */
+#define KICK_KERN_NICE 0
+
+/*
  * A special value should be assigned to indicate the case where no data has
  * been pushed after exceeding 100 milliseconds.
  */
@@ -303,7 +369,7 @@ enum cfg_feature_idx {
  */
 #define CHECK_MAP_EXCEEDED_PERIOD 100	// 100 ticks(1 seconds)
 
-/* 
+/*
  * Used to check whether the kernel adaptation is successful, here is the
  * check cycle time (unit is milliseconds).
  */
@@ -331,7 +397,7 @@ enum cfg_feature_idx {
  * below:
  *
  * User-received  eBPF (Kernel) Data  Description
- * Order          recv-time (ns)	     
+ * Order          recv-time (ns)
  * ---------------------------------------------------------
  * 0	       1043099273143475	   First stack data with stack ID 'A'
  * 1	       1043099276726460    Successfully removed 'A' from the stack map
@@ -358,7 +424,7 @@ enum cfg_feature_idx {
  * For non-Java programs, symbol loading will also be randomly delayed
  * (time range: 0 to PROFILER_DEFER_RANDOM_MAX).
  *
- * The random value has a maximum limit specified above(measured in seconds). 
+ * The random value has a maximum limit specified above(measured in seconds).
  */
 
 #define PROFILER_DEFER_RANDOM_MAX 60	// 60 seconds
@@ -378,4 +444,18 @@ enum cfg_feature_idx {
  */
 #define PERIODIC_PUSH_DELAY_THRESHOLD_NS 50000000ULL	// 50 milliseconds
 
+/*
+ * The update interval for process information is 5 minutes in nanoseconds.
+ */
+#define PROCESS_CACHE_UPDATE_INTERVAL_NS 300000000000ULL
+
+/*
+ * The update interval for mount information is 20 secs in nanoseconds.
+ */
+#define MOUNT_CACHE_UPDATE_INTERVAL_NS 20000000000ULL
+
+/*
+ * Output to the log once every hour to prevent the log file from containing too much content.
+ */
+#define OUTPUT_LOG_INTERVAL_NS 3600000000000ULL
 #endif /* DF_EBPF_CONFIG_H */

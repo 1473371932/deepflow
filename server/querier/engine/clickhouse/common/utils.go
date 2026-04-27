@@ -28,10 +28,13 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/bitly/go-simplejson"
+	"github.com/xwb1989/sqlparser"
+
+	ctlcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/querier/config"
 	"github.com/deepflowio/deepflow/server/querier/engine/clickhouse/client"
 	logging "github.com/op/go-logging"
-	"github.com/xwb1989/sqlparser"
 )
 
 var log = logging.MustGetLogger("common")
@@ -110,7 +113,7 @@ func ParseResponse(response *http.Response) (map[string]interface{}, error) {
 func GetDatasources(db string, table string, orgID string) ([]string, error) {
 	var datasources []string
 	switch db {
-	case "flow_metrics":
+	case "flow_metrics", DB_NAME_PROFILE, DB_NAME_EVENT:
 		var tsdbType string
 		if table == "network" || table == "network_map" {
 			tsdbType = "network"
@@ -118,6 +121,12 @@ func GetDatasources(db string, table string, orgID string) ([]string, error) {
 			tsdbType = "application"
 		} else if table == TABLE_NAME_VTAP_ACL {
 			tsdbType = TABLE_NAME_VTAP_ACL
+		} else if table == TABLE_NAME_IN_PROCESS_METRICS {
+			tsdbType = TABLE_NAME_IN_PROCESS_METRICS
+		} else if table == TABLE_NAME_FILE_EVENT_METRICS {
+			tsdbType = TABLE_NAME_FILE_EVENT_METRICS
+		} else {
+			return datasources, nil
 		}
 		client := &http.Client{}
 		url := fmt.Sprintf("http://localhost:%d/v1/data-sources/?type=%s", config.ControllerCfg.ListenPort, tsdbType)
@@ -245,4 +254,26 @@ func GetExtTables(db, where, queryCacheTTL, orgID string, useQueryCache bool, ct
 		}
 	}
 	return values
+}
+
+func GetCustomMetrics(orgID string) (map[string]*simplejson.Json, error) {
+	result := make(map[string]*simplejson.Json)
+	url := fmt.Sprintf(API_CUSTOM_METRICS_FORMAT, config.ControllerCfg.ListenPort)
+	resp, err := ctlcommon.CURLPerform("GET", url, nil,
+		ctlcommon.WithHeader(ctlcommon.HEADER_KEY_X_ORG_ID, orgID),
+		ctlcommon.WithHeader(ctlcommon.HEADER_KEY_X_USER_ID, strconv.Itoa(ctlcommon.USER_ID_SUPER_ADMIN)),
+		ctlcommon.WithHeader(ctlcommon.HEADER_KEY_X_USER_TYPE, strconv.Itoa(ctlcommon.USER_TYPE_SUPER_ADMIN)),
+	)
+	if err != nil {
+		return result, fmt.Errorf("request controller url (%s) failed: %s", url, err.Error())
+	}
+	resultArray := resp.Get("DATA").MustArray()
+	for i := range resultArray {
+		item := resp.Get("DATA").GetIndex(i)
+		db := item.Get("DB").MustString()
+		table := item.Get("TABLE").MustString()
+		name := item.Get("NAME").MustString()
+		result[fmt.Sprintf("%s.%s.%s", db, table, name)] = item
+	}
+	return result, nil
 }

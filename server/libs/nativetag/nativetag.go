@@ -35,7 +35,7 @@ type NativeTagTable uint8
 const (
 	APPLICATION_LOG NativeTagTable = iota
 	EVENT_EVENT
-	EVENT_PERF_EVENT
+	EVENT_FILE_EVENT
 	L7_FLOW_LOG
 	DEEPFLOW_ADMIN
 	DEEPFLOW_TENANT
@@ -48,7 +48,7 @@ const (
 var NativeTagDatabaseNames = [MAX_NATIVE_TAG_TABLE]string{
 	APPLICATION_LOG:  "application_log",
 	EVENT_EVENT:      "event",
-	EVENT_PERF_EVENT: "event",
+	EVENT_FILE_EVENT: "event",
 	L7_FLOW_LOG:      "flow_log",
 	DEEPFLOW_ADMIN:   "deepflow_admin",
 	DEEPFLOW_TENANT:  "deepflow_tenant",
@@ -59,7 +59,7 @@ var NativeTagDatabaseNames = [MAX_NATIVE_TAG_TABLE]string{
 var NativeTagTableNames = [MAX_NATIVE_TAG_TABLE]string{
 	APPLICATION_LOG:  "log",
 	EVENT_EVENT:      "event",
-	EVENT_PERF_EVENT: "perf_event",
+	EVENT_FILE_EVENT: "file_event",
 	L7_FLOW_LOG:      "l7_flow_log",
 	DEEPFLOW_ADMIN:   "deepflow_server",
 	DEEPFLOW_TENANT:  "deepflow_collector",
@@ -282,6 +282,11 @@ func CKDropNativeTag(isByConity bool, conn *sql.DB, orgId uint16, nativeTag *Nat
 		return err
 	}
 	for _, columnName := range nativeTag.ColumnNames {
+		if IndexOf(ckdb.ColumnNames, columnName) > 0 {
+			err := fmt.Errorf("'%s' is a reserved word and is not allowed as a native tag name.", columnName)
+			log.Warning(err)
+			continue
+		}
 		tableGlobal := fmt.Sprintf("ALTER TABLE %s.`%s` DROP COLUMN IF EXISTS %s",
 			ckdb.OrgDatabasePrefix(orgId)+tableId.Database(), tableId.Table(), columnName)
 		tableLocal := fmt.Sprintf("ALTER TABLE %s.`%s` DROP COLUMN IF EXISTS %s",

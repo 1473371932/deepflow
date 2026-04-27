@@ -99,6 +99,10 @@ func (c *UpdaterManager) refresh() {
 		NewChPolicy(),
 		NewChNpbTunnel(),
 		NewChAlarmPolicy(),
+		NewChOSAppTag(),
+		NewChOSAppTags(),
+		NewChCustomBizService(c.resourceTypeToIconID),
+		NewChCustomBizServiceFilter(),
 	}
 
 	if c.cfg.FPermit.Enabled {
@@ -116,7 +120,7 @@ type Updater interface {
 	// 直接查询ch表，构建旧的ch数据
 	// 遍历新的ch数据，若key不在旧的ch数据中，则新增；否则检查是否有更新，若有更新，则更新
 	// 遍历旧的ch数据，若key不在新的ch数据中，则删除
-	Refresh() bool
+	Refresh()
 	SetConfig(cfg config.ControllerConfig)
 }
 
@@ -153,14 +157,13 @@ func (b *UpdaterComponent[MT, KT]) initDBOperator() {
 	b.dbOperator = newOperator[MT, KT](b.resourceTypeName)
 }
 
-func (b *UpdaterComponent[MT, KT]) Refresh() bool {
-
+func (b *UpdaterComponent[MT, KT]) Refresh() {
 	// 遍历组织ID, 在每个组织的数据库中更新资源
 	// Traverse the orgIDs, updating resources in each org's database
 	orgIDs, err := metadb.GetORGIDs()
 	if err != nil {
 		log.Errorf("get org info fail : %s", err)
-		return false
+		return
 	}
 
 	for _, orgID := range orgIDs {
@@ -176,7 +179,6 @@ func (b *UpdaterComponent[MT, KT]) Refresh() bool {
 		itemsToAdd := []MT{}
 		keysToDelete := []KT{}
 		itemsToDelete := []MT{}
-		isUpdate := false
 		if newOK && oldOK {
 			for key, newDBItem := range newKeyToDBItem {
 				oldDBItem, exists := oldKeyToDBItem[key]
@@ -190,7 +192,6 @@ func (b *UpdaterComponent[MT, KT]) Refresh() bool {
 						if err != nil {
 							log.Errorf("failed to update %s: %s", b.resourceTypeName, err, db.LogPrefixORGID)
 						}
-						isUpdate = true
 					}
 				}
 			}
@@ -214,17 +215,8 @@ func (b *UpdaterComponent[MT, KT]) Refresh() bool {
 					log.Errorf("failed to delete %s: %s", b.resourceTypeName, err, db.LogPrefixORGID)
 				}
 			}
-
-			if len(itemsToDelete) > 0 && len(itemsToAdd) == 0 && !isUpdate {
-				b.ResourceUpdateAtInfoUpdated(db)
-			}
-			if (isUpdate || len(itemsToDelete) > 0 || len(itemsToAdd) > 0) && (b.resourceTypeName == RESOURCE_TYPE_CH_APP_LABEL || b.resourceTypeName == RESOURCE_TYPE_CH_TARGET_LABEL) {
-				return true
-			}
 		}
 	}
-
-	return false
 }
 
 func (b *UpdaterComponent[MT, KT]) generateOldData(db *metadb.DB) (map[KT]MT, bool) {
@@ -258,13 +250,4 @@ func (b *UpdaterComponent[MT, KT]) generateOneData(db *metadb.DB) (map[KT]MT, bo
 		idToItem[b.updaterDG.generateKey(item)] = item
 	}
 	return idToItem, true
-}
-
-// Update updated_at when resource is deleted
-func (b *UpdaterComponent[MT, KT]) ResourceUpdateAtInfoUpdated(db *metadb.DB) {
-	var updateItems []MT
-	err := db.Unscoped().First(&updateItems).Error
-	if err == nil {
-		db.Save(updateItems)
-	}
 }

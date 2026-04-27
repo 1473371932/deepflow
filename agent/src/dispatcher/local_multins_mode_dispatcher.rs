@@ -1,6 +1,8 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     ffi::CString,
+    mem,
     sync::{
         atomic::{AtomicBool, AtomicI64, Ordering},
         Arc, Mutex,
@@ -32,6 +34,7 @@ use crate::{
     config::handler::DispatcherAccess,
     exception::ExceptionHandler,
     flow_generator::{flow_map::Config, FlowMap},
+    liveness::{self, ComponentId, ComponentSpec, LivenessRegistry},
     rpc::get_timestamp,
     utils::stats::QueueStats,
 };
@@ -40,20 +43,23 @@ const PACKET_BATCH_SIZE: usize = 64;
 const SETNS_RETRIES: usize = 3;
 
 pub struct LocalMultinsModeDispatcher {
-    base: BaseDispatcher,
+    pub(super) base: BaseDispatcher,
 
-    receiver_manager: Option<JoinHandle<()>>,
+    pub(super) receiver_manager: Option<JoinHandle<()>>,
+    pub(super) liveness_registry: Option<LivenessRegistry>,
 }
 
 impl LocalMultinsModeDispatcher {
-    pub fn new(base: BaseDispatcher) -> Self {
-        Self {
-            base,
-            receiver_manager: None,
-        }
-    }
-
     pub fn run(&mut self) {
+        let liveness_handle = liveness::register(
+            self.liveness_registry.as_ref(),
+            ComponentSpec {
+                id: ComponentId::new("dispatcher", self.base.is.id as u32),
+                display_name: "dispatcher local multins".into(),
+                timeout_ms: BaseDispatcher::LIVENESS_TIMEOUT_MS,
+                ..Default::default()
+            },
+        );
         info!("Start local multi-namespace dispatcher");
 
         let base = &mut self.base.is;
@@ -83,6 +89,8 @@ impl LocalMultinsModeDispatcher {
             counter: base.counter.clone(),
             ntp_diff: base.ntp_diff.clone(),
             bpf_controls: bpf_controls.clone(),
+            liveness_registry: self.liveness_registry.clone(),
+            liveness_id: id as u32,
             output: packet_input,
         };
         self.receiver_manager.replace(
@@ -120,25 +128,39 @@ impl LocalMultinsModeDispatcher {
 
             if base.reset_whitelist.swap(false, Ordering::Relaxed) {
                 tap_interface_whitelists.clear();
-                for (_, bpf_control) in bpf_controls.lock().unwrap().iter() {
+                for (ns, bpf_control) in bpf_controls.lock().unwrap().iter() {
                     bpf_control.tap_whitelist.lock().unwrap().clear();
+                    trace!("trigger bpf update for {ns:?}");
                     bpf_control.need_update.store(true, Ordering::Relaxed);
                 }
             }
 
             match packet_output.recv_all(&mut batch, Some(Duration::from_secs(1))) {
-                Ok(_) => {}
+                Ok(_) => {
+                    liveness_handle.heartbeat();
+                }
                 Err(queue::Error::Timeout) => {
+                    liveness_handle.heartbeat();
                     flow_map.inject_flush_ticker(&config, Duration::ZERO);
-                    let need_update_bpf = base.need_update_bpf.swap(false, Ordering::Relaxed);
                     let mut bpf_controls = bpf_controls.lock().unwrap();
+                    if base.need_update_bpf.swap(false, Ordering::Relaxed) {
+                        for (ns, bpf_control) in bpf_controls.iter() {
+                            trace!("trigger bpf update for {ns:?}");
+                            bpf_control.need_update.store(true, Ordering::Relaxed);
+                        }
+                    }
                     tap_interface_whitelists.retain(|inode, whitelist| {
-                        let ns = NsFile::Proc(*inode);
+                        let ns = if *inode == 0 {
+                            NsFile::Root
+                        } else {
+                            NsFile::Proc(*inode)
+                        };
                         match bpf_controls.get_mut(&ns) {
                             Some(ctrl) => {
-                                if whitelist.next_sync(Duration::ZERO) || need_update_bpf {
+                                if whitelist.next_sync(Duration::ZERO) {
                                     *ctrl.tap_whitelist.lock().unwrap() =
                                         whitelist.as_set().clone();
+                                    trace!("trigger bpf update for {ns:?}");
                                     ctrl.need_update.store(true, Ordering::Relaxed);
                                 }
                                 true
@@ -186,14 +208,24 @@ impl LocalMultinsModeDispatcher {
                 last_timestamp = Some(meta_packet.lookup_key.timestamp);
             }
             if let Some(ts) = last_timestamp {
-                let need_update_bpf = base.need_update_bpf.swap(false, Ordering::Relaxed);
                 let mut bpf_controls = bpf_controls.lock().unwrap();
+                if base.need_update_bpf.swap(false, Ordering::Relaxed) {
+                    for (ns, bpf_control) in bpf_controls.iter() {
+                        trace!("trigger bpf update for {ns:?}");
+                        bpf_control.need_update.store(true, Ordering::Relaxed);
+                    }
+                }
                 tap_interface_whitelists.retain(|inode, whitelist| {
-                    let ns = NsFile::Proc(*inode);
+                    let ns = if *inode == 0 {
+                        NsFile::Root
+                    } else {
+                        NsFile::Proc(*inode)
+                    };
                     match bpf_controls.get_mut(&ns) {
                         Some(ctrl) => {
-                            if whitelist.next_sync(ts.into()) || need_update_bpf {
+                            if whitelist.next_sync(ts.into()) {
                                 *ctrl.tap_whitelist.lock().unwrap() = whitelist.as_set().clone();
+                                trace!("trigger bpf update for {ns:?}");
                                 ctrl.need_update.store(true, Ordering::Relaxed);
                             }
                             true
@@ -203,6 +235,7 @@ impl LocalMultinsModeDispatcher {
                 });
             }
         }
+        liveness_handle.pause();
         info!("Stopping local multi-namespace dispatcher");
         info!("Wait for receiver manager to stop");
         self.receiver_manager.take().unwrap().join().unwrap();
@@ -212,7 +245,7 @@ impl LocalMultinsModeDispatcher {
     pub(super) fn listener(&self) -> LocalMultinsModeDispatcherListener {
         LocalMultinsModeDispatcherListener::new(
             self.base.listener(),
-            &self.base.is.dispatcher_config.load(),
+            self.base.is.dispatcher_config.clone(),
         )
     }
 }
@@ -236,6 +269,7 @@ struct BpfControl {
 struct PktReceiver {
     pause: Arc<AtomicBool>,
     terminated: Arc<AtomicBool>,
+    dispatcher_id: u32,
     netns: NsFile,
 
     config: DispatcherAccess,
@@ -247,6 +281,7 @@ struct PktReceiver {
     exception_handler: ExceptionHandler,
     counter: Arc<PacketCounter>,
     ntp_diff: Arc<AtomicI64>,
+    liveness_registry: Option<LivenessRegistry>,
 
     bpf_control: Arc<BpfControl>,
 
@@ -254,6 +289,20 @@ struct PktReceiver {
 }
 
 impl PktReceiver {
+    fn liveness_id(dispatcher_id: u32, ns_ino: u32) -> u32 {
+        let _ = dispatcher_id;
+        ns_ino
+    }
+
+    fn liveness_display_name(netns: &NsFile) -> Cow<'static, str> {
+        match netns {
+            NsFile::Root => Cow::Borrowed("dispatcher local multins packet receiver (root)"),
+            _ => Cow::Owned(format!(
+                "dispatcher local multins packet receiver ({netns})"
+            )),
+        }
+    }
+
     fn check_and_update_bpf(
         is_root: bool,
         log_prefix: &str,
@@ -264,6 +313,7 @@ impl PktReceiver {
         bpf_options: &Mutex<BpfOptions>,
         promisc_if_indices: &mut Vec<i32>,
     ) -> Option<ExitStatus> {
+        debug!("{log_prefix} updating bpf");
         let if_regex = if is_root {
             &config.tap_interface_regex
         } else {
@@ -280,6 +330,7 @@ impl PktReceiver {
             info!("{log_prefix} no tap interfaces found, stop receiving thread");
             return Some(ExitStatus::NoTapInterfaces);
         }
+        trace!("{log_prefix} update bpf for tap interfaces: {links:?}");
 
         let options = options.lock().unwrap();
         let bpf_options = bpf_options.lock().unwrap();
@@ -328,8 +379,26 @@ impl PktReceiver {
         move || {
             super::set_cpu_affinity(&self.options);
 
-            let ns_ino = self.netns.get_inode().unwrap() as u32;
+            let ns_ino = if self.netns == NsFile::Root {
+                0
+            } else {
+                self.netns.get_inode().unwrap() as u32
+            };
+            let is_root = self.netns == NsFile::Root;
             let log_prefix = format!("pkt-rcv({}):", self.netns);
+            let liveness = liveness::register(
+                self.liveness_registry.as_ref(),
+                ComponentSpec {
+                    id: ComponentId::new(
+                        "dispatcher-local-multins-pkt-receiver",
+                        Self::liveness_id(self.dispatcher_id, ns_ino),
+                    ),
+                    display_name: Self::liveness_display_name(&self.netns),
+                    timeout_ms: BaseDispatcher::LIVENESS_TIMEOUT_MS,
+                    ..Default::default()
+                },
+            );
+            let mut last_liveness = Duration::ZERO;
             // try to setns a few times because this can fail when process terminates
             for i in 1..=SETNS_RETRIES {
                 let e = match self.netns.open_and_setns() {
@@ -387,6 +456,9 @@ impl PktReceiver {
             let mut batch = Vec::with_capacity(PACKET_BATCH_SIZE);
             let mut allocator = Allocator::new(cfg.raw_packet_buffer_block_size);
 
+            // avoid using this in loop because it will not update
+            mem::forget(cfg);
+
             info!("{log_prefix} started packet receive");
             while !self.terminated.load(Ordering::Relaxed) {
                 unsafe {
@@ -409,14 +481,15 @@ impl PktReceiver {
                     }
 
                     let Some((ref packet, timestamp)) = recved else {
+                        liveness.heartbeat();
                         drop(recved);
                         if self.bpf_control.need_update.swap(false, Ordering::Relaxed) {
                             Self::check_and_update_bpf(
-                                self.netns == NsFile::Root,
+                                is_root,
                                 &log_prefix,
                                 &self.bpf_control,
                                 &mut engine,
-                                &cfg,
+                                &self.config.load(),
                                 &self.options,
                                 &self.bpf_options,
                                 &mut promisc_if_indices,
@@ -428,11 +501,10 @@ impl PktReceiver {
                     if self.pause.load(Ordering::Relaxed) {
                         continue;
                     }
-
-                    self.counter.rx.fetch_add(1, Ordering::Relaxed);
-                    self.counter
-                        .rx_bytes
-                        .fetch_add(packet.capture_length as u64, Ordering::Relaxed);
+                    if timestamp >= last_liveness + BaseDispatcher::LIVENESS_HEARTBEAT_INTERVAL {
+                        liveness.heartbeat();
+                        last_liveness = timestamp;
+                    }
 
                     let buffer = allocator.allocate_with(&packet.data);
                     let info = Packet {
@@ -448,11 +520,11 @@ impl PktReceiver {
                     drop(recved);
                     if self.bpf_control.need_update.swap(false, Ordering::Relaxed) {
                         Self::check_and_update_bpf(
-                            self.netns == NsFile::Root,
+                            is_root,
                             &log_prefix,
                             &self.bpf_control,
                             &mut engine,
-                            &cfg,
+                            &self.config.load(),
                             &self.options,
                             &self.bpf_options,
                             &mut promisc_if_indices,
@@ -487,6 +559,8 @@ struct ReceiverManager {
     exception_handler: ExceptionHandler,
     counter: Arc<PacketCounter>,
     ntp_diff: Arc<AtomicI64>,
+    liveness_registry: Option<LivenessRegistry>,
+    liveness_id: u32,
 
     output: DebugSender<Packet>,
 }
@@ -525,6 +599,15 @@ impl ReceiverManager {
             super::set_cpu_affinity(&self.options);
 
             info!("Receiver manager started");
+            let liveness = liveness::register(
+                self.liveness_registry.as_ref(),
+                ComponentSpec {
+                    id: ComponentId::new("dispatcher-receiver-manager", self.liveness_id),
+                    display_name: "dispatcher receiver manager".into(),
+                    timeout_ms: BaseDispatcher::LIVENESS_TIMEOUT_MS,
+                    ..Default::default()
+                },
+            );
 
             let mut loop_count = 0;
             let mut zombie_threads = vec![];
@@ -537,6 +620,7 @@ impl ReceiverManager {
                     thread::sleep(Duration::from_secs(1));
                     continue;
                 }
+                liveness.heartbeat();
 
                 // check if pkt receiver threads are running
                 let mut bpf_controls = self.bpf_controls.lock().unwrap();
@@ -633,6 +717,8 @@ impl ReceiverManager {
                         exception_handler: self.exception_handler.clone(),
                         counter: self.counter.clone(),
                         ntp_diff: self.ntp_diff.clone(),
+                        liveness_registry: self.liveness_registry.clone(),
+                        dispatcher_id: self.liveness_id,
                         bpf_control: bpf_control.clone(),
                         output: self.output.clone(),
                     };
@@ -679,6 +765,27 @@ impl ReceiverManager {
                         Ok(inode) => !proc_cache.contains_key(&inode),
                         _ => true,
                     };
+                    let terminated = terminated || {
+                        // also check if there are matched tap interfaces
+                        let r = if *ns == NsFile::Root {
+                            netns::links_by_name_regex_in_netns(
+                                &config.tap_interface_regex,
+                                &NsFile::Root,
+                            )
+                        } else {
+                            netns::links_by_name_regex_in_netns(
+                                &config.inner_tap_interface_regex,
+                                &ns,
+                            )
+                        };
+                        match r {
+                            Err(e) => {
+                                warn!("get interfaces by name regex in {ns:?} failed: {e}");
+                                true
+                            }
+                            Ok(links) => links.is_empty(),
+                        }
+                    };
                     if terminated {
                         handle.terminated.store(true, Ordering::Relaxed);
                         let h = handle.join_handle.take().unwrap();
@@ -723,17 +830,16 @@ impl ReceiverManager {
 #[derive(Clone)]
 pub struct LocalMultinsModeDispatcherListener {
     pub(super) base: BaseDispatcherListener,
-
-    tap_interface_regex: String,
-    inner_tap_interface_regex: String,
+    config: DispatcherAccess,
+    interface_indices: Vec<u64>, // sorted (ns_inode << 32 | if_index) to detect tap interface changes
 }
 
 impl LocalMultinsModeDispatcherListener {
-    pub(super) fn new(base: BaseDispatcherListener, config: &DispatcherConfig) -> Self {
+    pub(super) fn new(base: BaseDispatcherListener, config: DispatcherAccess) -> Self {
         Self {
             base,
-            tap_interface_regex: config.tap_interface_regex.clone(),
-            inner_tap_interface_regex: config.inner_tap_interface_regex.clone(),
+            config,
+            interface_indices: Default::default(),
         }
     }
 
@@ -743,8 +849,6 @@ impl LocalMultinsModeDispatcherListener {
 
     pub(super) fn on_config_change(&mut self, config: &DispatcherConfig) {
         self.base.on_config_change(config);
-        self.tap_interface_regex = config.tap_interface_regex.clone();
-        self.inner_tap_interface_regex = config.inner_tap_interface_regex.clone();
     }
 
     pub fn on_vm_change(&self, _: &[MacAddr]) {}
@@ -759,16 +863,25 @@ impl LocalMultinsModeDispatcherListener {
         self.base.reset_whitelist.store(true, Ordering::Relaxed);
     }
 
-    pub fn on_tap_interface_change(&self, _: &[Link], _: IfMacSource, _: AgentType, _: &Vec<u64>) {
+    pub fn on_tap_interface_change(
+        &mut self,
+        _: &[Link],
+        _: IfMacSource,
+        _: AgentType,
+        _: &Vec<u64>,
+    ) {
         let (mut keys, mut macs) = (vec![], vec![]);
+        let config = self.config.load();
 
         trace!(
             "tap_interface_regex = /{}/, inner_tap_interface_regex = /{}/",
-            self.tap_interface_regex,
-            self.inner_tap_interface_regex
+            config.tap_interface_regex,
+            config.inner_tap_interface_regex
         );
 
-        match netns::links_by_name_regex_in_netns(&self.tap_interface_regex, &NsFile::Root) {
+        let mut new_interface_indices = vec![];
+
+        match netns::links_by_name_regex_in_netns(&config.tap_interface_regex, &NsFile::Root) {
             Err(e) => {
                 warn!(
                     "get interfaces by name regex in {:?} failed: {e}",
@@ -779,7 +892,7 @@ impl LocalMultinsModeDispatcherListener {
                 if links.is_empty() {
                     warn!(
                         "tap-interface-regex({}) do not match any interface in {:?}",
-                        self.tap_interface_regex,
+                        config.tap_interface_regex,
                         NsFile::Root,
                     );
                 } else {
@@ -790,6 +903,7 @@ impl LocalMultinsModeDispatcherListener {
                     );
                     links.sort_by_key(|link| link.if_index);
                     for link in links {
+                        new_interface_indices.push(link.if_index as u64);
                         keys.push(link.if_index as u64);
                         macs.push(link.mac_addr);
                     }
@@ -797,10 +911,10 @@ impl LocalMultinsModeDispatcherListener {
             }
         }
 
-        let Ok(inner_regex) = Regex::new(&self.inner_tap_interface_regex) else {
+        let Ok(inner_regex) = Regex::new(&config.inner_tap_interface_regex) else {
             warn!(
                 "Failed to compile inner tap interface regex /{}/",
-                self.inner_tap_interface_regex
+                config.inner_tap_interface_regex
             );
             return;
         };
@@ -855,12 +969,21 @@ impl LocalMultinsModeDispatcherListener {
             }
             links.sort_by_key(|link| link.if_index);
             for link in links {
-                keys.push(link.if_index as u64 | inode << 32);
+                let key = link.if_index as u64 | inode << 32;
+                new_interface_indices.push(key);
+                keys.push(key);
                 macs.push(link.mac_addr);
             }
         }
         let _ = netns::reset_netns();
 
         self.base.on_vm_change(&keys, &macs);
+
+        new_interface_indices.sort_unstable();
+        if self.interface_indices != new_interface_indices {
+            trace!("tap interface change cause bpf update");
+            self.base.need_update_bpf.store(true, Ordering::Relaxed);
+            self.interface_indices = new_interface_indices;
+        }
     }
 }

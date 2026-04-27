@@ -27,12 +27,12 @@ import (
 
 type ChNetwork struct {
 	SubscriberComponent[
-		*message.NetworkAdd,
-		message.NetworkAdd,
-		*message.NetworkFieldsUpdate,
-		message.NetworkFieldsUpdate,
-		*message.NetworkDelete,
-		message.NetworkDelete,
+		*message.AddedNetworks,
+		message.AddedNetworks,
+		*message.UpdatedNetwork,
+		message.UpdatedNetwork,
+		*message.DeletedNetworks,
+		message.DeletedNetworks,
 		metadbmodel.Network,
 		metadbmodel.ChNetwork,
 		IDKey,
@@ -43,12 +43,12 @@ type ChNetwork struct {
 func NewChNetwork(resourceTypeToIconID map[IconKey]int) *ChNetwork {
 	mng := &ChNetwork{
 		newSubscriberComponent[
-			*message.NetworkAdd,
-			message.NetworkAdd,
-			*message.NetworkFieldsUpdate,
-			message.NetworkFieldsUpdate,
-			*message.NetworkDelete,
-			message.NetworkDelete,
+			*message.AddedNetworks,
+			message.AddedNetworks,
+			*message.UpdatedNetwork,
+			message.UpdatedNetwork,
+			*message.DeletedNetworks,
+			message.DeletedNetworks,
 			metadbmodel.Network,
 			metadbmodel.ChNetwork,
 			IDKey,
@@ -58,7 +58,7 @@ func NewChNetwork(resourceTypeToIconID map[IconKey]int) *ChNetwork {
 		resourceTypeToIconID,
 	}
 	mng.subscriberDG = mng
-
+	mng.softDelete = true
 	return mng
 }
 
@@ -76,25 +76,16 @@ func (c *ChNetwork) sourceToTarget(md *message.Metadata, source *metadbmodel.Net
 		IconID: c.resourceTypeToIconID[IconKey{
 			NodeType: RESOURCE_TYPE_VL2,
 		}],
-		TeamID:      md.TeamID,
-		DomainID:    md.DomainID,
-		SubDomainID: md.SubDomainID,
+		TeamID:      md.GetTeamID(),
+		DomainID:    md.GetDomainID(),
+		SubDomainID: md.GetSubDomainID(),
 		L3EPCID:     source.VPCID,
 	})
 	return
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChNetwork) onResourceUpdated(sourceID int, fieldsUpdate *message.NetworkFieldsUpdate, db *metadb.DB) {
-	updateInfo := make(map[string]interface{})
-
-	if fieldsUpdate.Name.IsDifferent() {
-		updateInfo["name"] = fieldsUpdate.Name.GetNew()
-	}
-	if fieldsUpdate.VPCID.IsDifferent() {
-		updateInfo["l3_epc_id"] = fieldsUpdate.VPCID.GetNew()
-	}
-	c.updateOrSync(db, IDKey{ID: sourceID}, updateInfo)
+func (c *ChNetwork) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedNetwork) {
 }
 
 // softDeletedTargetsUpdated implements SubscriberDataGenerator

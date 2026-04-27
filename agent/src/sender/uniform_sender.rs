@@ -151,6 +151,7 @@ struct Encoder<T> {
     header: Header,
 
     buffer: Vec<u8>,
+    compressed_buffer: Vec<u8>,
     _marker: PhantomData<T>,
 }
 
@@ -160,6 +161,7 @@ impl<T: Sendable> Encoder<T> {
         Self {
             id,
             buffer: Vec::with_capacity(Self::BUFFER_LEN),
+            compressed_buffer: Vec::with_capacity(Self::BUFFER_LEN),
             header: Header {
                 msg_type,
                 frame_size: 0,
@@ -223,14 +225,20 @@ impl<T: Sendable> Encoder<T> {
     }
 
     pub fn compress_buffer(&mut self) {
+        self.compressed_buffer.clear();
         let buffer_len = self.buffer_len();
-        match SenderEncoder::from(self.header.encoder).encode(&self.buffer[Header::HEADER_LEN..]) {
-            Ok(result) => {
-                if let Some(data) = result {
-                    self.buffer.truncate(Header::HEADER_LEN);
-                    self.buffer.extend_from_slice(&data);
-                    debug!("compressed from {} to {}", buffer_len, data.len());
-                }
+        match SenderEncoder::from(self.header.encoder).encode(
+            &self.buffer[Header::HEADER_LEN..],
+            &mut self.compressed_buffer,
+        ) {
+            Ok(_) => {
+                self.buffer.truncate(Header::HEADER_LEN);
+                self.buffer.extend_from_slice(&self.compressed_buffer);
+                debug!(
+                    "compressed from {} to {}",
+                    buffer_len,
+                    self.compressed_buffer.len()
+                );
             }
             Err(e) => {
                 error!("compression failed {}", e);
@@ -534,7 +542,9 @@ impl<T: Sendable> UniformSender<T> {
             self.counter
                 .raw_bytes
                 .fetch_add(self.encoder.buffer_len() as u64, Ordering::Relaxed);
-            self.encoder.compress_buffer();
+            if SenderEncoder::from(self.encoder.header.encoder) != SenderEncoder::Raw {
+                self.encoder.compress_buffer();
+            }
             self.encoder.set_header_frame_size();
             self.send_buffer(config);
             self.encoder.reset_buffer();
@@ -594,14 +604,19 @@ impl<T: Sendable> UniformSender<T> {
                 conn.reconnect_interval = 0;
             } else {
                 if self.counter.dropped.load(Ordering::Relaxed) == 0 {
-                    self.exception_handler.set(Exception::AnalyzerSocketError);
                     if conn.dest_ip.is_empty() || conn.dest_ip == "0.0.0.0" {
-                        warn!("'analyzer_ip' is not assigned, please check whether the Agent is successfully registered");
+                        let error_msg = "'analyzer_ip' is not assigned, please check whether the Agent is successfully registered".into();
+                        warn!("{}", error_msg);
+                        self.exception_handler
+                            .set(Exception::AnalyzerSocketError, Some(error_msg));
                     } else {
-                        error!(
+                        let error_msg = format!(
                             "{} sender tcp connection to {}:{} failed",
-                            self.name, conn.dest_ip, conn.dest_port,
+                            self.name, conn.dest_ip, conn.dest_port
                         );
+                        error!("{}", error_msg);
+                        self.exception_handler
+                            .set(Exception::AnalyzerSocketError, Some(error_msg));
                     }
                 }
                 self.counter.dropped.fetch_add(1, Ordering::Relaxed);
@@ -634,11 +649,13 @@ impl<T: Sendable> UniformSender<T> {
                 }
                 Err(e) => {
                     if self.counter.dropped.load(Ordering::Relaxed) == 0 {
-                        self.exception_handler.set(Exception::AnalyzerSocketError);
-                        error!(
+                        let error_msg = format!(
                             "{} sender tcp stream write data to {}:{} failed: {}",
                             self.name, conn.dest_ip, conn.dest_port, e
                         );
+                        error!("{}", error_msg);
+                        self.exception_handler
+                            .set(Exception::AnalyzerSocketError, Some(error_msg));
                     }
                     self.counter.dropped.fetch_add(1, Ordering::Relaxed);
                     conn.tcp_stream.take();
@@ -693,7 +710,7 @@ impl<T: Sendable> UniformSender<T> {
         if overflow || self.input.total_overwritten_count() > self.overwritten_count {
             self.overwritten_count = self.input.total_overwritten_count();
             self.exception_handler
-                .set(Exception::DataBpsThresholdExceeded);
+                .set(Exception::DataBpsThresholdExceeded, None);
             self.log_when_traffic_overflow(config);
         }
         overflow

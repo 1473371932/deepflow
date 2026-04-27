@@ -29,9 +29,10 @@ func NewConfigMap() *ConfigMap {
 	operater := &ConfigMap{
 		newOperatorBase[*metadbmodel.ConfigMap](
 			ctrlrcommon.RESOURCE_TYPE_CONFIG_MAP_EN,
-			true,
+			false,
 			false,
 		),
 	}
+	operater.toLoggable = true
 	return operater
 }

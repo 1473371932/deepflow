@@ -19,10 +19,7 @@ package message
 import (
 	"time"
 
-	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
-	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
-	"github.com/deepflowio/deepflow/server/controller/recorder/constraint"
 )
 
 type Key struct {
@@ -98,90 +95,60 @@ func (d *fieldDetail[T]) SetOld(old T) {
 }
 
 // TODO rename to metadb
-type MySQLData[MT constraint.MySQLModel] struct {
+type MetadbData[MT metadbmodel.AssetResourceConstraint] struct {
 	new *MT
 	old *MT
 }
 
-func (m *MySQLData[MT]) GetNewMySQLItem() interface{} {
+func (m *MetadbData[MT]) GetNewMetadbItem() interface{} {
 	return m.new
 }
 
-func (m *MySQLData[MT]) SetNewMySQLItem(new interface{}) {
+func (m *MetadbData[MT]) SetNewMetadbItem(new interface{}) {
 	m.new = new.(*MT)
 }
 
-func (m *MySQLData[MT]) GetOldMySQLItem() interface{} {
+func (m *MetadbData[MT]) GetOldMetadbItem() interface{} {
 	return m.old
 }
 
-func (m *MySQLData[MT]) SetOldMySQLItem(old interface{}) {
+func (m *MetadbData[MT]) SetOldMetadbItem(old interface{}) {
 	m.old = old.(*MT)
 }
 
-type DiffBase[DT constraint.DiffBase] struct {
-	data DT
-}
-
-func (d *DiffBase[DT]) GetDiffBase() interface{} {
-	return d.data
-}
-
-func (d *DiffBase[DT]) SetDiffBase(data interface{}) {
-	d.data = data.(DT)
-}
-
-type CloudItem[CT constraint.CloudModel] struct {
-	data *CT
-}
-
-func (c *CloudItem[CT]) GetCloudItem() interface{} {
-	return c.data
-}
-
-func (c *CloudItem[CT]) SetCloudItem(data interface{}) {
-	c.data = data.(*CT)
-}
-
-type RegionFieldsUpdate struct {
+type UpdatedRegionFields struct {
 	Key
 	Name  fieldDetail[string]
 	Label fieldDetail[string]
 }
 
-type RegionUpdate struct {
-	Fields[RegionFieldsUpdate]
-	CloudItem[cloudmodel.Region]
-	DiffBase[*diffbase.Region]
-	MySQLData[metadbmodel.Region]
+type UpdatedRegion struct {
+	Fields[UpdatedRegionFields]
+	MetadbData[metadbmodel.Region]
 }
 
-type AZFieldsUpdate struct {
+type UpdatedAZFields struct {
 	Key
 	Name         fieldDetail[string]
 	Label        fieldDetail[string]
 	RegionLcuuid fieldDetail[string]
 }
 
-type AZUpdate struct {
-	Fields[AZFieldsUpdate]
-	CloudItem[cloudmodel.AZ]
-	DiffBase[*diffbase.AZ]
-	MySQLData[metadbmodel.AZ]
+type UpdatedAZ struct {
+	Fields[UpdatedAZFields]
+	MetadbData[metadbmodel.AZ]
 }
 
-type SubDomainFieldsUpdate struct {
+type UpdatedSubDomainFields struct {
 	Key
 	Name fieldDetail[string]
 }
-type SubDomainUpdate struct {
-	Fields[SubDomainFieldsUpdate]
-	CloudItem[cloudmodel.SubDomain] // TODO tmp, delete later
-	DiffBase[*diffbase.SubDomain]
-	MySQLData[metadbmodel.SubDomain]
+type UpdatedSubDomain struct {
+	Fields[UpdatedSubDomainFields]
+	MetadbData[metadbmodel.SubDomain]
 }
 
-type HostFieldsUpdate struct {
+type UpdatedHostFields struct {
 	Key
 	Name         fieldDetail[string]
 	IP           fieldDetail[string]
@@ -195,69 +162,63 @@ type HostFieldsUpdate struct {
 	RegionLcuuid fieldDetail[string]
 }
 
-type HostUpdate struct {
-	Fields[HostFieldsUpdate]
-	CloudItem[cloudmodel.Host]
-	DiffBase[*diffbase.Host]
-	MySQLData[metadbmodel.Host]
+type UpdatedHost struct {
+	Fields[UpdatedHostFields]
+	MetadbData[metadbmodel.Host]
 }
 
-type VMFieldsUpdate struct {
+type UpdatedVMFields struct {
 	Key
-	Name          fieldDetail[string]
-	IP            fieldDetail[string]
-	Label         fieldDetail[string]
-	State         fieldDetail[int]
-	HType         fieldDetail[int]
-	LaunchServer  fieldDetail[string]
-	CloudTags     fieldDetail[map[string]string]
-	HostID        fieldDetail[int]
-	UID           fieldDetail[string]
-	Hostname      fieldDetail[string]
-	VPCID         fieldDetail[int]
-	VPCLcuuid     fieldDetail[string]
-	AZLcuuid      fieldDetail[string]
-	RegionLcuuid  fieldDetail[string]
-	NetworkID     fieldDetail[int]
-	NetworkLcuuid fieldDetail[string]
+	Name             fieldDetail[string]
+	IP               fieldDetail[string]
+	Label            fieldDetail[string]
+	State            fieldDetail[int]
+	HType            fieldDetail[int]
+	LaunchServer     fieldDetail[string]
+	LearnedCloudTags fieldDetail[map[string]string]
+	CustomCloudTags  fieldDetail[map[string]string]
+	HostID           fieldDetail[int]
+	UID              fieldDetail[string]
+	Hostname         fieldDetail[string]
+	VPCID            fieldDetail[int]
+	VPCLcuuid        fieldDetail[string]
+	AZLcuuid         fieldDetail[string]
+	RegionLcuuid     fieldDetail[string]
+	NetworkID        fieldDetail[int]
+	NetworkLcuuid    fieldDetail[string]
 }
 
-type VMUpdate struct {
-	Fields[VMFieldsUpdate]
-	CloudItem[cloudmodel.VM]
-	DiffBase[*diffbase.VM]
-	MySQLData[metadbmodel.VM]
+type UpdatedVM struct {
+	Fields[UpdatedVMFields]
+	MetadbData[metadbmodel.VM]
 }
 
-type VMPodNodeConnectionFieldsUpdate struct {
+type UpdatedVMPodNodeConnectionFields struct {
 	Key
 }
 
-type VMPodNodeConnectionUpdate struct {
-	Fields[VMPodNodeConnectionFieldsUpdate]
-	CloudItem[cloudmodel.VMPodNodeConnection]
-	DiffBase[*diffbase.VMPodNodeConnection]
-	MySQLData[metadbmodel.VMPodNodeConnection]
+type UpdatedVMPodNodeConnection struct {
+	Fields[UpdatedVMPodNodeConnectionFields]
+	MetadbData[metadbmodel.VMPodNodeConnection]
 }
 
-type VPCFieldsUpdate struct {
+type UpdatedVPCFields struct {
 	Key
 	Name         fieldDetail[string]
 	Label        fieldDetail[string]
+	Owner        fieldDetail[string]
 	CIDR         fieldDetail[string]
 	TunnelID     fieldDetail[int]
 	RegionLcuuid fieldDetail[string]
 	UID          fieldDetail[string]
 }
 
-type VPCUpdate struct {
-	Fields[VPCFieldsUpdate]
-	CloudItem[cloudmodel.VPC]
-	DiffBase[*diffbase.VPC]
-	MySQLData[metadbmodel.VPC]
+type UpdatedVPC struct {
+	Fields[UpdatedVPCFields]
+	MetadbData[metadbmodel.VPC]
 }
 
-type NetworkFieldsUpdate struct {
+type UpdatedNetworkFields struct {
 	Key
 	Name           fieldDetail[string]
 	Label          fieldDetail[string]
@@ -270,27 +231,23 @@ type NetworkFieldsUpdate struct {
 	RegionLcuuid   fieldDetail[string]
 }
 
-type NetworkUpdate struct {
-	Fields[NetworkFieldsUpdate]
-	CloudItem[cloudmodel.Network]
-	DiffBase[*diffbase.Network]
-	MySQLData[metadbmodel.Network]
+type UpdatedNetwork struct {
+	Fields[UpdatedNetworkFields]
+	MetadbData[metadbmodel.Network]
 }
 
-type SubnetFieldsUpdate struct {
+type UpdatedSubnetFields struct {
 	Key
 	Name  fieldDetail[string]
 	Label fieldDetail[string]
 }
 
-type SubnetUpdate struct {
-	Fields[SubnetFieldsUpdate]
-	CloudItem[cloudmodel.Subnet]
-	DiffBase[*diffbase.Subnet]
-	MySQLData[metadbmodel.Subnet]
+type UpdatedSubnet struct {
+	Fields[UpdatedSubnetFields]
+	MetadbData[metadbmodel.Subnet]
 }
 
-type VRouterFieldsUpdate struct {
+type UpdatedVRouterFields struct {
 	Key
 	Name         fieldDetail[string]
 	Label        fieldDetail[string]
@@ -299,28 +256,24 @@ type VRouterFieldsUpdate struct {
 	RegionLcuuid fieldDetail[string]
 }
 
-type VRouterUpdate struct {
-	Fields[VRouterFieldsUpdate]
-	CloudItem[cloudmodel.VRouter]
-	DiffBase[*diffbase.VRouter]
-	MySQLData[metadbmodel.VRouter]
+type UpdatedVRouter struct {
+	Fields[UpdatedVRouterFields]
+	MetadbData[metadbmodel.VRouter]
 }
 
-type RoutingTableFieldsUpdate struct {
+type UpdatedRoutingTableFields struct {
 	Key
 	Destination fieldDetail[string]
 	NexthopType fieldDetail[string]
 	Nexthop     fieldDetail[string]
 }
 
-type RoutingTableUpdate struct {
-	Fields[RoutingTableFieldsUpdate]
-	CloudItem[cloudmodel.RoutingTable]
-	DiffBase[*diffbase.RoutingTable]
-	MySQLData[metadbmodel.RoutingTable]
+type UpdatedRoutingTable struct {
+	Fields[UpdatedRoutingTableFields]
+	MetadbData[metadbmodel.RoutingTable]
 }
 
-type DHCPPortFieldsUpdate struct {
+type UpdatedDHCPPortFields struct {
 	Key
 	Name         fieldDetail[string]
 	VPCID        fieldDetail[int]
@@ -329,14 +282,12 @@ type DHCPPortFieldsUpdate struct {
 	RegionLcuuid fieldDetail[string]
 }
 
-type DHCPPortUpdate struct {
-	Fields[DHCPPortFieldsUpdate]
-	CloudItem[cloudmodel.DHCPPort]
-	DiffBase[*diffbase.DHCPPort]
-	MySQLData[metadbmodel.DHCPPort]
+type UpdatedDHCPPort struct {
+	Fields[UpdatedDHCPPortFields]
+	MetadbData[metadbmodel.DHCPPort]
 }
 
-type VInterfaceFieldsUpdate struct {
+type UpdatedVInterfaceFields struct {
 	Key
 	Name          fieldDetail[string]
 	TapMac        fieldDetail[string]
@@ -348,97 +299,81 @@ type VInterfaceFieldsUpdate struct {
 	RegionLcuuid  fieldDetail[string]
 }
 
-type VInterfaceUpdate struct {
-	Fields[VInterfaceFieldsUpdate]
-	CloudItem[cloudmodel.VInterface]
-	DiffBase[*diffbase.VInterface]
-	MySQLData[metadbmodel.VInterface]
+type UpdatedVInterface struct {
+	Fields[UpdatedVInterfaceFields]
+	MetadbData[metadbmodel.VInterface]
 }
 
-type FloatingIPFieldsUpdate struct {
+type UpdatedFloatingIPFields struct {
 	Key
 	VPCID        fieldDetail[int]
 	VPCLcuuid    fieldDetail[string]
 	RegionLcuuid fieldDetail[string]
 }
 
-type FloatingIPUpdate struct {
-	Fields[FloatingIPFieldsUpdate]
-	CloudItem[cloudmodel.FloatingIP]
-	DiffBase[*diffbase.FloatingIP]
-	MySQLData[metadbmodel.FloatingIP]
+type UpdatedFloatingIP struct {
+	Fields[UpdatedFloatingIPFields]
+	MetadbData[metadbmodel.FloatingIP]
 }
 
-type LANIPFieldsUpdate struct {
+type UpdatedLANIPFields struct {
 	Key
 	SubnetID     fieldDetail[int]
 	SubnetLcuuid fieldDetail[string]
 }
-type LANIPUpdate struct {
-	Fields[LANIPFieldsUpdate]
-	CloudItem[cloudmodel.IP]
-	DiffBase[*diffbase.LANIP]
-	MySQLData[metadbmodel.LANIP]
+type UpdatedLANIP struct {
+	Fields[UpdatedLANIPFields]
+	MetadbData[metadbmodel.LANIP]
 }
-type WANIPFieldsUpdate struct {
+type UpdatedWANIPFields struct {
 	Key
 	SubnetID     fieldDetail[int]
 	SubnetLcuuid fieldDetail[string]
 	RegionLcuuid fieldDetail[string]
 }
-type WANIPUpdate struct {
-	Fields[WANIPFieldsUpdate]
-	CloudItem[cloudmodel.IP]
-	DiffBase[*diffbase.WANIP]
-	MySQLData[metadbmodel.WANIP]
+type UpdatedWANIP struct {
+	Fields[UpdatedWANIPFields]
+	MetadbData[metadbmodel.WANIP]
 }
-type VIPFieldsUpdate struct {
+type UpdatedVIPFields struct {
 	Key
 	IP     fieldDetail[string]
 	VTapID fieldDetail[uint32]
 }
-type VIPUpdate struct {
-	Fields[VIPFieldsUpdate]
-	CloudItem[cloudmodel.IP]
-	DiffBase[*diffbase.VIP]
-	MySQLData[metadbmodel.VIP]
+type UpdatedVIP struct {
+	Fields[UpdatedVIPFields]
+	MetadbData[metadbmodel.VIP]
 }
 
-type NATGatewayFieldsUpdate struct {
+type UpdatedNATGatewayFields struct {
 	Key
 	Name         fieldDetail[string]
 	FloatingIPs  fieldDetail[string]
 	RegionLcuuid fieldDetail[string]
 	UID          fieldDetail[string]
 }
-type NATGatewayUpdate struct {
-	Fields[NATGatewayFieldsUpdate]
-	CloudItem[cloudmodel.NATGateway]
-	DiffBase[*diffbase.NATGateway]
-	MySQLData[metadbmodel.NATGateway]
+type UpdatedNATGateway struct {
+	Fields[UpdatedNATGatewayFields]
+	MetadbData[metadbmodel.NATGateway]
 }
 
-type NATRuleFieldsUpdate struct {
+type UpdatedNATRuleFields struct {
 	Key
 }
-type NATRuleUpdate struct {
-	Fields[NATRuleFieldsUpdate]
-	CloudItem[cloudmodel.NATRule]
-	DiffBase[*diffbase.NATRule]
-	MySQLData[metadbmodel.NATRule]
+type UpdatedNATRule struct {
+	Fields[UpdatedNATRuleFields]
+	MetadbData[metadbmodel.NATRule]
 }
 
-type NATVMConnectionFieldsUpdate struct {
+type UpdatedNATVMConnectionFields struct {
 	Key
 }
-type NATVMConnectionUpdate struct {
-	Fields[NATVMConnectionFieldsUpdate]
-	CloudItem[cloudmodel.NATVMConnection]
-	DiffBase[*diffbase.NATVMConnection]
-	MySQLData[metadbmodel.NATVMConnection]
+type UpdatedNATVMConnection struct {
+	Fields[UpdatedNATVMConnectionFields]
+	MetadbData[metadbmodel.NATVMConnection]
 }
 
-type LBFieldsUpdate struct {
+type UpdatedLBFields struct {
 	Key
 	Name         fieldDetail[string]
 	UID          fieldDetail[string]
@@ -446,14 +381,12 @@ type LBFieldsUpdate struct {
 	VIP          fieldDetail[string]
 	RegionLcuuid fieldDetail[string]
 }
-type LBUpdate struct {
-	Fields[LBFieldsUpdate]
-	CloudItem[cloudmodel.LB]
-	DiffBase[*diffbase.LB]
-	MySQLData[metadbmodel.LB]
+type UpdatedLB struct {
+	Fields[UpdatedLBFields]
+	MetadbData[metadbmodel.LB]
 }
 
-type LBListenerFieldsUpdate struct {
+type UpdatedLBListenerFields struct {
 	Key
 	Name     fieldDetail[string]
 	IPs      fieldDetail[string]
@@ -461,61 +394,51 @@ type LBListenerFieldsUpdate struct {
 	Port     fieldDetail[int]
 	Protocol fieldDetail[string]
 }
-type LBListenerUpdate struct {
-	Fields[LBListenerFieldsUpdate]
-	CloudItem[cloudmodel.LBListener]
-	DiffBase[*diffbase.LBListener]
-	MySQLData[metadbmodel.LBListener]
+type UpdatedLBListener struct {
+	Fields[UpdatedLBListenerFields]
+	MetadbData[metadbmodel.LBListener]
 }
 
-type LBTargetServerFieldsUpdate struct {
+type UpdatedLBTargetServerFields struct {
 	Key
 	IP       fieldDetail[string]
 	Port     fieldDetail[int]
 	Protocol fieldDetail[string]
 }
-type LBTargetServerUpdate struct {
-	Fields[LBTargetServerFieldsUpdate]
-	CloudItem[cloudmodel.LBTargetServer]
-	DiffBase[*diffbase.LBTargetServer]
-	MySQLData[metadbmodel.LBTargetServer]
+type UpdatedLBTargetServer struct {
+	Fields[UpdatedLBTargetServerFields]
+	MetadbData[metadbmodel.LBTargetServer]
 }
 
-type LBVMConnectionFieldsUpdate struct {
+type UpdatedLBVMConnectionFields struct {
 	Key
 }
-type LBVMConnectionUpdate struct {
-	Fields[LBVMConnectionFieldsUpdate]
-	CloudItem[cloudmodel.LBVMConnection]
-	DiffBase[*diffbase.LBVMConnection]
-	MySQLData[metadbmodel.LBVMConnection]
+type UpdatedLBVMConnection struct {
+	Fields[UpdatedLBVMConnectionFields]
+	MetadbData[metadbmodel.LBVMConnection]
 }
 
-type PeerConnectionFieldsUpdate struct {
+type UpdatedPeerConnectionFields struct {
 	Key
 	Name fieldDetail[string]
 }
-type PeerConnectionUpdate struct {
-	Fields[PeerConnectionFieldsUpdate]
-	CloudItem[cloudmodel.PeerConnection]
-	DiffBase[*diffbase.PeerConnection]
-	MySQLData[metadbmodel.PeerConnection]
+type UpdatedPeerConnection struct {
+	Fields[UpdatedPeerConnectionFields]
+	MetadbData[metadbmodel.PeerConnection]
 }
 
-type CENFieldsUpdate struct {
+type UpdatedCENFields struct {
 	Key
 	Name       fieldDetail[string]
 	VPCIDs     fieldDetail[[]int]
 	VPCLcuuids fieldDetail[[]string]
 }
-type CENUpdate struct {
-	Fields[CENFieldsUpdate]
-	CloudItem[cloudmodel.CEN]
-	DiffBase[*diffbase.CEN]
-	MySQLData[metadbmodel.CEN]
+type UpdatedCEN struct {
+	Fields[UpdatedCENFields]
+	MetadbData[metadbmodel.CEN]
 }
 
-type RDSInstanceFieldsUpdate struct {
+type UpdatedRDSInstanceFields struct {
 	Key
 	Name         fieldDetail[string]
 	UID          fieldDetail[string]
@@ -525,14 +448,12 @@ type RDSInstanceFieldsUpdate struct {
 	AZLcuuid     fieldDetail[string]
 	RegionLcuuid fieldDetail[string]
 }
-type RDSInstanceUpdate struct {
-	Fields[RDSInstanceFieldsUpdate]
-	CloudItem[cloudmodel.RDSInstance]
-	DiffBase[*diffbase.RDSInstance]
-	MySQLData[metadbmodel.RDSInstance]
+type UpdatedRDSInstance struct {
+	Fields[UpdatedRDSInstanceFields]
+	MetadbData[metadbmodel.RDSInstance]
 }
 
-type RedisInstanceFieldsUpdate struct {
+type UpdatedRedisInstanceFields struct {
 	Key
 	Name         fieldDetail[string]
 	UID          fieldDetail[string]
@@ -541,43 +462,38 @@ type RedisInstanceFieldsUpdate struct {
 	AZLcuuid     fieldDetail[string]
 	RegionLcuuid fieldDetail[string]
 }
-type RedisInstanceUpdate struct {
-	Fields[RedisInstanceFieldsUpdate]
-	CloudItem[cloudmodel.RedisInstance]
-	DiffBase[*diffbase.RedisInstance]
-	MySQLData[metadbmodel.RedisInstance]
+type UpdatedRedisInstance struct {
+	Fields[UpdatedRedisInstanceFields]
+	MetadbData[metadbmodel.RedisInstance]
 }
 
-type PodClusterFieldsUpdate struct {
+type UpdatedPodClusterFields struct {
 	Key
 	Name         fieldDetail[string]
 	ClusterName  fieldDetail[string]
 	AZLcuuid     fieldDetail[string]
 	RegionLcuuid fieldDetail[string]
 }
-type PodClusterUpdate struct {
-	Fields[PodClusterFieldsUpdate]
-	CloudItem[cloudmodel.PodCluster]
-	DiffBase[*diffbase.PodCluster]
-	MySQLData[metadbmodel.PodCluster]
+type UpdatedPodCluster struct {
+	Fields[UpdatedPodClusterFields]
+	MetadbData[metadbmodel.PodCluster]
 }
 
-type PodNamespaceFieldsUpdate struct {
+type UpdatedPodNamespaceFields struct {
 	Key
-	CloudTags    fieldDetail[map[string]string]
-	AZLcuuid     fieldDetail[string]
-	RegionLcuuid fieldDetail[string]
-	Name         fieldDetail[string]
-	PodClusterID fieldDetail[int]
+	LearnedCloudTags fieldDetail[map[string]string]
+	CustomCloudTags  fieldDetail[map[string]string]
+	AZLcuuid         fieldDetail[string]
+	RegionLcuuid     fieldDetail[string]
+	Name             fieldDetail[string]
+	PodClusterID     fieldDetail[int]
 }
-type PodNamespaceUpdate struct {
-	Fields[PodNamespaceFieldsUpdate]
-	CloudItem[cloudmodel.PodNamespace]
-	DiffBase[*diffbase.PodNamespace]
-	MySQLData[metadbmodel.PodNamespace]
+type UpdatedPodNamespace struct {
+	Fields[UpdatedPodNamespaceFields]
+	MetadbData[metadbmodel.PodNamespace]
 }
 
-type PodNodeFieldsUpdate struct {
+type UpdatedPodNodeFields struct {
 	Key
 	Type         fieldDetail[int]
 	State        fieldDetail[int]
@@ -589,47 +505,39 @@ type PodNodeFieldsUpdate struct {
 	RegionLcuuid fieldDetail[string]
 	Name         fieldDetail[string]
 }
-type PodNodeUpdate struct {
-	Fields[PodNodeFieldsUpdate]
-	CloudItem[cloudmodel.PodNode]
-	DiffBase[*diffbase.PodNode]
-	MySQLData[metadbmodel.PodNode]
+type UpdatedPodNode struct {
+	Fields[UpdatedPodNodeFields]
+	MetadbData[metadbmodel.PodNode]
 }
 
-type PodIngressFieldsUpdate struct {
+type UpdatedPodIngressFields struct {
 	Key
 	Name         fieldDetail[string]
 	AZLcuuid     fieldDetail[string]
 	RegionLcuuid fieldDetail[string]
 }
-type PodIngressUpdate struct {
-	Fields[PodIngressFieldsUpdate]
-	CloudItem[cloudmodel.PodIngress]
-	DiffBase[*diffbase.PodIngress]
-	MySQLData[metadbmodel.PodIngress]
+type UpdatedPodIngress struct {
+	Fields[UpdatedPodIngressFields]
+	MetadbData[metadbmodel.PodIngress]
 }
 
-type PodIngressRuleFieldsUpdate struct {
+type UpdatedPodIngressRuleFields struct {
 	Key
 }
-type PodIngressRuleUpdate struct {
-	Fields[PodIngressRuleFieldsUpdate]
-	CloudItem[cloudmodel.PodIngressRule]
-	DiffBase[*diffbase.PodIngressRule]
-	MySQLData[metadbmodel.PodIngressRule]
+type UpdatedPodIngressRule struct {
+	Fields[UpdatedPodIngressRuleFields]
+	MetadbData[metadbmodel.PodIngressRule]
 }
 
-type PodIngressRuleBackendFieldsUpdate struct {
+type UpdatedPodIngressRuleBackendFields struct {
 	Key
 }
-type PodIngressRuleBackendUpdate struct {
-	Fields[PodIngressRuleBackendFieldsUpdate]
-	CloudItem[cloudmodel.PodIngressRuleBackend]
-	DiffBase[*diffbase.PodIngressRuleBackend]
-	MySQLData[metadbmodel.PodIngressRuleBackend]
+type UpdatedPodIngressRuleBackend struct {
+	Fields[UpdatedPodIngressRuleBackendFields]
+	MetadbData[metadbmodel.PodIngressRuleBackend]
 }
 
-type PodServiceFieldsUpdate struct {
+type UpdatedPodServiceFields struct {
 	Key
 	Name             fieldDetail[string]
 	Label            fieldDetail[string]
@@ -647,28 +555,25 @@ type PodServiceFieldsUpdate struct {
 	VPCID            fieldDetail[int]
 	PodClusterID     fieldDetail[int]
 }
-type PodServiceUpdate struct {
-	Fields[PodServiceFieldsUpdate]
-	CloudItem[cloudmodel.PodService]
-	DiffBase[*diffbase.PodService]
-	MySQLData[metadbmodel.PodService]
+type UpdatedPodService struct {
+	Fields[UpdatedPodServiceFields]
+	MetadbData[metadbmodel.PodService]
 }
 
-type PodServicePortFieldsUpdate struct {
+type UpdatedPodServicePortFields struct {
 	Key
 	Name fieldDetail[string]
 }
-type PodServicePortUpdate struct {
-	Fields[PodServicePortFieldsUpdate]
-	CloudItem[cloudmodel.PodServicePort]
-	DiffBase[*diffbase.PodServicePort]
-	MySQLData[metadbmodel.PodServicePort]
+type UpdatedPodServicePort struct {
+	Fields[UpdatedPodServicePortFields]
+	MetadbData[metadbmodel.PodServicePort]
 }
 
-type PodGroupFieldsUpdate struct {
+type UpdatedPodGroupFields struct {
 	Key
 	Name           fieldDetail[string]
 	Label          fieldDetail[string]
+	NetworkMode    fieldDetail[int]
 	Type           fieldDetail[int]
 	PodNum         fieldDetail[int]
 	Metadata       fieldDetail[string]
@@ -678,49 +583,41 @@ type PodGroupFieldsUpdate struct {
 	PodClusterID   fieldDetail[int]
 	PodNamespaceID fieldDetail[int]
 }
-type PodGroupUpdate struct {
-	Fields[PodGroupFieldsUpdate]
-	CloudItem[cloudmodel.PodGroup]
-	DiffBase[*diffbase.PodGroup]
-	MySQLData[metadbmodel.PodGroup]
+type UpdatedPodGroup struct {
+	Fields[UpdatedPodGroupFields]
+	MetadbData[metadbmodel.PodGroup]
 }
 
-type ConfigMapFieldsUpdate struct {
+type UpdatedConfigMapFields struct {
 	Key
 	Name fieldDetail[string]
 	Data fieldDetail[string]
 }
 
-type ConfigMapUpdate struct {
-	Fields[ConfigMapFieldsUpdate]
-	CloudItem[cloudmodel.ConfigMap]
-	DiffBase[*diffbase.ConfigMap]
-	MySQLData[metadbmodel.ConfigMap]
+type UpdatedConfigMap struct {
+	Fields[UpdatedConfigMapFields]
+	MetadbData[metadbmodel.ConfigMap]
 }
 
-type PodGroupConfigMapConnectionFieldsUpdate struct {
+type UpdatedPodGroupConfigMapConnectionFields struct {
 	Key
 }
 
-type PodGroupConfigMapConnectionUpdate struct {
-	Fields[PodGroupConfigMapConnectionFieldsUpdate]
-	CloudItem[cloudmodel.PodGroupConfigMapConnection]
-	DiffBase[*diffbase.PodGroupConfigMapConnection]
-	MySQLData[metadbmodel.PodGroupConfigMapConnection]
+type UpdatedPodGroupConfigMapConnection struct {
+	Fields[UpdatedPodGroupConfigMapConnectionFields]
+	MetadbData[metadbmodel.PodGroupConfigMapConnection]
 }
 
-type PodGroupPortFieldsUpdate struct {
+type UpdatedPodGroupPortFields struct {
 	Key
 	Name fieldDetail[string]
 }
-type PodGroupPortUpdate struct {
-	Fields[PodGroupPortFieldsUpdate]
-	CloudItem[cloudmodel.PodGroupPort]
-	DiffBase[*diffbase.PodGroupPort]
-	MySQLData[metadbmodel.PodGroupPort]
+type UpdatedPodGroupPort struct {
+	Fields[UpdatedPodGroupPortFields]
+	MetadbData[metadbmodel.PodGroupPort]
 }
 
-type PodReplicaSetFieldsUpdate struct {
+type UpdatedPodReplicaSetFields struct {
 	Key
 	Name         fieldDetail[string]
 	Label        fieldDetail[string]
@@ -728,14 +625,12 @@ type PodReplicaSetFieldsUpdate struct {
 	AZLcuuid     fieldDetail[string]
 	RegionLcuuid fieldDetail[string]
 }
-type PodReplicaSetUpdate struct {
-	Fields[PodReplicaSetFieldsUpdate]
-	CloudItem[cloudmodel.PodReplicaSet]
-	DiffBase[*diffbase.PodReplicaSet]
-	MySQLData[metadbmodel.PodReplicaSet]
+type UpdatedPodReplicaSet struct {
+	Fields[UpdatedPodReplicaSetFields]
+	MetadbData[metadbmodel.PodReplicaSet]
 }
 
-type PodFieldsUpdate struct {
+type UpdatedPodFields struct {
 	Key
 	Name                fieldDetail[string]
 	Label               fieldDetail[string]
@@ -759,14 +654,12 @@ type PodFieldsUpdate struct {
 	PodNamespaceID      fieldDetail[int]
 	PodClusterID        fieldDetail[int]
 }
-type PodUpdate struct {
-	Fields[PodFieldsUpdate]
-	CloudItem[cloudmodel.Pod]
-	DiffBase[*diffbase.Pod]
-	MySQLData[metadbmodel.Pod]
+type UpdatedPod struct {
+	Fields[UpdatedPodFields]
+	MetadbData[metadbmodel.Pod]
 }
 
-type ProcessFieldsUpdate struct {
+type UpdatedProcessFields struct {
 	Key
 	Name        fieldDetail[string]
 	ProcessName fieldDetail[string]
@@ -776,18 +669,16 @@ type ProcessFieldsUpdate struct {
 	VPCID       fieldDetail[int]
 	GID         fieldDetail[uint32]
 }
-type ProcessUpdate struct {
-	Fields[ProcessFieldsUpdate]
-	CloudItem[cloudmodel.Process]
-	DiffBase[*diffbase.Process]
-	MySQLData[metadbmodel.Process]
+type UpdatedProcess struct {
+	Fields[UpdatedProcessFields]
+	MetadbData[metadbmodel.Process]
 }
 
-type CustomServiceFieldsUpdate struct {
+type UpdatedCustomServiceFields struct {
 	Key
 	Name fieldDetail[string]
 }
-type CustomServiceUpdate struct {
-	Fields[CustomServiceFieldsUpdate]
-	MySQLData[metadbmodel.CustomService]
+type UpdatedCustomService struct {
+	Fields[UpdatedCustomServiceFields]
+	MetadbData[metadbmodel.CustomService]
 }

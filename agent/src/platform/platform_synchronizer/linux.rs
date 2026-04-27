@@ -62,6 +62,7 @@ static mut PIDS: Option<Arc<SysRwLock<Vec<u32>>>> = None;
 
 pub fn get_socket_pids() -> Vec<u32> {
     unsafe {
+        #[allow(static_mut_refs)]
         if let Some(pids) = PIDS.as_ref() {
             pids.read().unwrap().clone()
         } else {
@@ -111,6 +112,7 @@ impl SocketSynchronizer {
 
     fn set_socket_pids(pids: &Vec<u32>, _: &Vec<ProcessData>) {
         unsafe {
+            #[allow(static_mut_refs)]
             if let Some(last) = PIDS.as_ref() {
                 *last.write().unwrap() = pids.clone();
             } else {
@@ -203,7 +205,7 @@ impl SocketSynchronizer {
 
             // wait for config from server
             if !conf_guard.os_proc_scan_conf.os_proc_sync_enabled {
-                if !Self::wait_timeout(&running, &stop_notify, sync_interval) {
+                if !Self::wait_for_running(&running, &stop_notify, sync_interval) {
                     return;
                 }
                 continue;
@@ -211,7 +213,11 @@ impl SocketSynchronizer {
 
             let (ctrl_ip, ctrl_mac, team_id) = {
                 let id = agent_id.read();
-                (id.ip.to_string(), id.mac.to_string(), id.team_id.clone())
+                (
+                    id.ipmac.ip.to_string(),
+                    id.ipmac.mac.to_string(),
+                    id.team_id.clone(),
+                )
             };
             let mut policy_getter = policy_getter.lock().unwrap();
             let pids = get_socket_pids();
@@ -223,7 +229,7 @@ impl SocketSynchronizer {
             ) {
                 Err(e) => {
                     error!("fetch socket info fail: {}", e);
-                    if !Self::wait_timeout(&running, &stop_notify, sync_interval) {
+                    if !Self::wait_for_running(&running, &stop_notify, sync_interval) {
                         return;
                     }
                     continue;
@@ -294,7 +300,7 @@ impl SocketSynchronizer {
                 }
             }
 
-            if !Self::wait_timeout(&running, &stop_notify, sync_interval) {
+            if !Self::wait_for_running(&running, &stop_notify, sync_interval) {
                 return;
             }
         }
@@ -317,12 +323,13 @@ impl SocketSynchronizer {
         info!("socket info sync stop");
     }
 
-    fn wait_timeout(running: &Mutex<bool>, stop_notify: &Condvar, timeout: Duration) -> bool {
+    // returns running status
+    fn wait_for_running(running: &Mutex<bool>, stop_notify: &Condvar, timeout: Duration) -> bool {
         let guard = running.lock().unwrap();
         if !*guard {
-            return true;
+            return *guard;
         }
-        !*stop_notify.wait_timeout(guard, timeout).unwrap().0
+        *stop_notify.wait_timeout(guard, timeout).unwrap().0
     }
 
     fn sync_toa(

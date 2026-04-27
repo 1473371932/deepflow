@@ -48,9 +48,12 @@ use num_enum::IntoPrimitive;
 use regex::Regex;
 use thiserror::Error;
 
-use super::utils::net::{
-    self, addr_list, link_by_name, link_list, links_by_name_regex, route_list, rule_list, Addr,
-    Link, MacAddr, IF_TYPE_IPVLAN,
+use crate::{
+    proto::agent as pb,
+    utils::net::{
+        self, addr_list, link_by_name, link_list, links_by_name_regex, route_list, rule_list, Addr,
+        Link, MacAddr, IF_TYPE_IPVLAN,
+    },
 };
 
 #[derive(Debug, Error)]
@@ -137,6 +140,22 @@ impl Ord for InterfaceInfo {
     }
 }
 
+impl From<&InterfaceInfo> for pb::InterfaceInfo {
+    fn from(info: &InterfaceInfo) -> Self {
+        Self {
+            mac: Some(info.mac.into()),
+            name: Some(info.name.to_string()),
+            device_id: Some(info.device_id.to_string()),
+            tap_index: Some(info.tap_idx),
+            ip: info.ips.iter().map(ToString::to_string).collect(),
+            netns: Some(info.tap_ns.to_string()),
+            netns_id: Some(info.ns_inode as u32),
+            if_type: info.if_type.clone(),
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(IntoPrimitive)]
 #[repr(u16)]
 pub enum Netnsa {
@@ -187,6 +206,11 @@ impl NsFile {
             debug!("open {} and setns failed: {:?}", path.display(), e);
         }
         r
+    }
+
+    pub fn from_pid_with_root(root: &str, pid: u32) -> Result<Self> {
+        let path: PathBuf = [root, &pid.to_string(), "ns", "net"].iter().collect();
+        Ok(Self::Proc(fs::metadata(path)?.ino()))
     }
 }
 

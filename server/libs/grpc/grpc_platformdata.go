@@ -52,7 +52,7 @@ const (
 	LruCap                = 1 << 17
 	GROUPID_MAX           = 1 << 16
 
-	MASTER_TABLE_MOUDLE_NANE = "ingester"
+	MASTER_TABLE_MODULE_NAME = "ingester"
 	MAX_ORG_COUNT            = ckdb.MAX_ORG_ID + 1
 )
 
@@ -382,14 +382,14 @@ func (t *PlatformInfoTable) QueryPodIdInfo(orgId uint16, podId uint32) *Info {
 }
 
 func (t *PlatformInfoTable) QueryPodService(orgId uint16, podID, podNodeID, podClusterID, podGroupID uint32, epcID int32, isIPv6 bool, ipv4 uint32, ipv6 net.IP, protocol layers.IPProtocol, serverPort uint16) uint32 {
-	return t.ServiceTable[orgId].QueryPodService(podID, podNodeID, podClusterID, podGroupID, epcID, isIPv6, ipv4, ipv6, protocol, serverPort)
+	return t.ServiceTable[orgId].QueryPodService(t, orgId, podID, podNodeID, podClusterID, podGroupID, epcID, isIPv6, ipv4, ipv6, protocol, serverPort)
 }
 
-func (t *PlatformInfoTable) QueryCustomService(orgId uint16, epcID int32, isIPv6 bool, ipv4 uint32, ipv6 net.IP, serverPort uint16) uint32 {
-	return t.ServiceTable[orgId].QueryCustomService(epcID, isIPv6, ipv4, ipv6, serverPort)
+func (t *PlatformInfoTable) QueryCustomService(orgId uint16, epcID int32, isIPv6 bool, ipv4 uint32, ipv6 net.IP, serverPort, podClusterId uint16, podServiceId, podGroupId, l3DeviceId, podId uint32, l3DeviceType uint8, protocol layers.IPProtocol) uint32 {
+	return t.ServiceTable[orgId].QueryCustomService(epcID, isIPv6, ipv4, ipv6, serverPort, podServiceId, podGroupId, l3DeviceId, podId, uint32(podClusterId), l3DeviceType, protocol)
 }
 
-func (t *PlatformInfoTable) QueryResourceInfo(orgId uint16, resourceType uint32, resourceID uint32) *Info {
+func (t *PlatformInfoTable) QueryResourceInfo(orgId uint16, resourceType, resourceID, podID uint32) *Info {
 	switch trident.DeviceType(resourceType) {
 	case trident.DeviceType_DEVICE_TYPE_POD:
 		return t.podIDInfos[orgId][resourceID]
@@ -399,6 +399,14 @@ func (t *PlatformInfoTable) QueryResourceInfo(orgId uint16, resourceType uint32,
 		return t.hostInfos[orgId][resourceID]
 	case trident.DeviceType_DEVICE_TYPE_VM:
 		return t.vmInfos[orgId][resourceID]
+	case trident.DeviceType_DEVICE_TYPE_PROCESS:
+		if podID > 0 {
+			return t.QueryPodIdInfo(orgId, podID)
+		}
+		if _, podId := t.QueryGprocessInfo(orgId, resourceID); podId > 0 {
+			return t.QueryPodIdInfo(orgId, podId)
+		}
+		return nil
 	default:
 		return t.resourceInfos[orgId][uint64(resourceType)<<32|uint64(resourceID)]
 	}
@@ -436,29 +444,29 @@ func NewPlatformDataManager(ips []net.IP, port, maxSlaveTableSize, rpcMaxMsgSize
 	return platformDataManager
 }
 
-func (m *PlatformDataManager) NewPlatformInfoTable(moudleName string) (*PlatformInfoTable, error) {
+func (m *PlatformDataManager) NewPlatformInfoTable(moduleName string) (*PlatformInfoTable, error) {
 	m.tableLock.Lock()
 	if m.masterTable == nil {
-		// the master table moudleName must be 'ingester', the Controller adds datanode information according to the name of the request is 'ingester'.
-		m.masterTable = NewPlatformInfoTable(m.ips, m.port, 0, m.rpcMaxMsgSize, MASTER_TABLE_MOUDLE_NANE, m.nodeIP, m.receiver, true, m)
+		// the master table moduleName must be 'ingester', the Controller adds datanode information according to the name of the request is 'ingester'.
+		m.masterTable = NewPlatformInfoTable(m.ips, m.port, 0, m.rpcMaxMsgSize, MASTER_TABLE_MODULE_NAME, m.nodeIP, m.receiver, true, m)
 		m.masterTable.Start()
-		if moudleName == MASTER_TABLE_MOUDLE_NANE {
+		if moduleName == MASTER_TABLE_MODULE_NAME {
 			m.tableLock.Unlock()
 			return m.masterTable, nil
 		}
 	}
 	m.tableLock.Unlock()
-	if moudleName == MASTER_TABLE_MOUDLE_NANE {
+	if moduleName == MASTER_TABLE_MODULE_NAME {
 		return m.masterTable, nil
 	}
 
 	index := int(atomic.AddUint32(&m.slaveCount, 1)) - 1
 	if index >= m.maxSlaveTableSize {
-		err := fmt.Errorf("new platformData table %s failed, slave talbes has reached the maximum capacity(%d) and cannot be added", moudleName, m.maxSlaveTableSize)
+		err := fmt.Errorf("new platformData table %s failed, slave tables has reached the maximum capacity(%d) and cannot be added", moduleName, m.maxSlaveTableSize)
 		log.Error(err)
 		return nil, err
 	}
-	m.slaveTables[index] = NewPlatformInfoTable(m.ips, m.port, index, m.rpcMaxMsgSize, moudleName, m.nodeIP, m.receiver, false, m)
+	m.slaveTables[index] = NewPlatformInfoTable(m.ips, m.port, index, m.rpcMaxMsgSize, moduleName, m.nodeIP, m.receiver, false, m)
 	return m.slaveTables[index], nil
 }
 
@@ -466,7 +474,7 @@ func (m *PlatformDataManager) GetMasterPlatformInfoTable() *PlatformInfoTable {
 	if m.masterTable != nil {
 		return m.masterTable
 	}
-	m.NewPlatformInfoTable(MASTER_TABLE_MOUDLE_NANE)
+	m.NewPlatformInfoTable(MASTER_TABLE_MODULE_NAME)
 	return m.masterTable
 }
 

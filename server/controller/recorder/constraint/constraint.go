@@ -18,40 +18,10 @@
 package constraint
 
 import (
-	"time"
-
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 )
-
-type MySQLModelPtr[T MySQLModel] interface {
-	*T
-
-	GetLcuuid() string
-	GetID() int
-
-	SetID(int)
-	SetUpdatedAt(time.Time)
-	GetUpdatedAt() time.Time
-}
-
-// 资源的MySQL orm对象
-type MySQLModel interface {
-	metadbmodel.Region | metadbmodel.AZ | metadbmodel.SubDomain | metadbmodel.Host | metadbmodel.VM |
-		metadbmodel.VPC | metadbmodel.Network | metadbmodel.Subnet | metadbmodel.VRouter | metadbmodel.RoutingTable |
-		metadbmodel.DHCPPort | metadbmodel.VInterface | metadbmodel.WANIP | metadbmodel.LANIP | metadbmodel.FloatingIP |
-		metadbmodel.NATGateway | metadbmodel.NATRule | metadbmodel.NATVMConnection | metadbmodel.LB |
-		metadbmodel.LBListener | metadbmodel.LBTargetServer | metadbmodel.LBVMConnection | metadbmodel.CEN |
-		metadbmodel.PeerConnection | metadbmodel.RDSInstance | metadbmodel.RedisInstance | metadbmodel.PodCluster |
-		metadbmodel.PodNode | metadbmodel.VMPodNodeConnection | metadbmodel.PodNamespace | metadbmodel.PodIngress |
-		metadbmodel.PodIngressRule | metadbmodel.PodIngressRuleBackend | metadbmodel.PodService |
-		metadbmodel.PodServicePort | metadbmodel.PodGroup | metadbmodel.ConfigMap | metadbmodel.PodGroupConfigMapConnection |
-		metadbmodel.PodGroupPort | metadbmodel.PodReplicaSet | metadbmodel.Pod | metadbmodel.Process | metadbmodel.VIP | metadbmodel.CustomService
-
-	GetID() int
-	GetUpdatedAt() time.Time
-}
 
 // 资源的原始数据结构
 type CloudModel interface {
@@ -65,6 +35,8 @@ type CloudModel interface {
 		cloudmodel.PodIngressRule | cloudmodel.PodIngressRuleBackend | cloudmodel.PodService |
 		cloudmodel.PodServicePort | cloudmodel.PodGroup | cloudmodel.ConfigMap | cloudmodel.PodGroupConfigMapConnection |
 		cloudmodel.PodGroupPort | cloudmodel.PodReplicaSet | cloudmodel.Pod | cloudmodel.Process | cloudmodel.VIP
+
+	GetLcuuid() string
 }
 
 // 资源用于比对的缓存对象
@@ -85,8 +57,8 @@ type DiffBase interface {
 	GetLcuuid() string
 }
 
-// 软删除资源的MySQL orm对象
-type MySQLSoftDeleteModel interface {
+// 软删除资源的 Metadb orm对象
+type MetadbSoftDeleteModel interface {
 	metadbmodel.Region | metadbmodel.AZ | metadbmodel.Host | metadbmodel.VM | metadbmodel.VPC | metadbmodel.Network |
 		metadbmodel.VRouter | metadbmodel.DHCPPort | metadbmodel.NATGateway |
 		metadbmodel.LB | metadbmodel.LBListener | metadbmodel.CEN | metadbmodel.PeerConnection | metadbmodel.RDSInstance |

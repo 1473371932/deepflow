@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -51,7 +52,7 @@ const (
 	DefaultByconityService          = "deepflow-byconity-server"
 	DefaultCKDBServicePort          = 9000
 	DefaultListenPort               = 20033
-	DefaultGrpcBufferSize           = 41943040
+	DefaultGrpcBufferSize           = 104857600
 	DefaultServiceLabelerLruCap     = 1 << 22
 	DefaultCKDBEndpointTCPPortName  = "tcp-port"
 	DefaultStatsInterval            = 10      // s
@@ -67,6 +68,7 @@ const (
 	// the maximum number of endpoints for a server corresponding to ClickHouse;
 	//   any endpoints beyond this limit will be ignored
 	MaxClickHouseEndpointsPerServer = 128
+	DefaultDatasourceListenPort     = 20106
 )
 
 type DatabaseTable struct {
@@ -183,6 +185,7 @@ type Config struct {
 	StatsInterval            int    `yaml:"stats-interval"`
 	FlowTagCacheFlushTimeout uint32 `yaml:"flow-tag-cache-flush-timeout"`
 	FlowTagCacheMaxSize      uint32 `yaml:"flow-tag-cache-max-size"`
+	DatasourceListenPort     uint16 `yaml:"datasource-listen-port"`
 	LogFile                  string
 	LogLevel                 string
 	MyNodeName               string
@@ -301,7 +304,7 @@ func (c *Config) Validate() error {
 		}
 		// in standalone mode, only supports one ClickHouse node
 		var actualAddrs []string
-		actualAddrs = append(actualAddrs, fmt.Sprintf("%s:%d", c.CKDB.Host, c.CKDB.Port))
+		actualAddrs = append(actualAddrs, net.JoinHostPort(c.CKDB.Host, strconv.Itoa(c.CKDB.Port)))
 		c.CKDB.ActualAddrs = &actualAddrs
 	} else {
 		if c.NodeIP == "" && c.ControllerIPs[0] == DefaultLocalIP {
@@ -524,7 +527,7 @@ func Load(path string) *Config {
 						0,
 					},
 				},
-				[]DatabaseTable{{"flow_log", ""}, {"flow_metrics", "1s_local"}, {"profile", ""}, {"application_log", ""}},
+				[]DatabaseTable{{"flow_log", ""}, {"flow_metrics", "1s_local"}, {"profile", ""}, {"application_log", ""}, {"event", "file_event_local"}},
 			},
 			ListenPort:               DefaultListenPort,
 			GrpcBufferSize:           DefaultGrpcBufferSize,
@@ -532,6 +535,7 @@ func Load(path string) *Config {
 			StatsInterval:            DefaultStatsInterval,
 			FlowTagCacheFlushTimeout: DefaultFlowTagCacheFlushTimeout,
 			FlowTagCacheMaxSize:      DefaultFlowTagCacheMaxSize,
+			DatasourceListenPort:     DefaultDatasourceListenPort,
 		},
 	}
 	if err != nil {

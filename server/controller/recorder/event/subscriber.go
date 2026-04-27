@@ -72,6 +72,7 @@ func (c *SubscriberManager) getSubscribers(q *queue.OverwriteQueue) []Subscriber
 		NewPodGroup(c.cfg, q),
 		NewPod(q),
 		NewConfigMap(c.cfg, q),
+		NewPodGroupConfigMapConnection(q),
 		NewProcess(q),
 	}
 	return subscribers
@@ -110,7 +111,9 @@ func (s *SubscriberComponent) GetSubResourceType() string {
 func (s *SubscriberComponent) Subscribe() {
 	for _, topic := range s.subTopics {
 		log.Info("subscribe topic: ", topic, " from resource type: ", s.subResourceTypeName)
-		pubsub.Subscribe(s.subResourceTypeName, topic, s.subscriberSelf)
+		pubsub.Subscribe(
+			s.subscriberSelf,
+			pubsub.NewSubscriptionSpec(s.subResourceTypeName, topic))
 	}
 }
 
@@ -126,7 +129,7 @@ func newChangedSubscriberComponent(
 	}
 	s.subTopics = append(
 		s.subTopics,
-		pubsub.TopicPlatformResourceChanged,
+		pubsub.TopicPlatformChanged,
 	)
 	return s
 }
@@ -143,12 +146,13 @@ func newCUDSubscriberComponent(
 	}
 	s.subTopics = append(
 		s.subTopics,
-		pubsub.TopicResourceBatchAddedMySQL,
-		pubsub.TopicResourceBatchDeletedMySQL,
+		pubsub.TopicResourceBatchAddedMetadbItems,
+		pubsub.TopicResourceBatchDeletedMetadbItems,
 	)
 	return s
 }
 
+// TODO remove
 func (s *CUDSubscriberComponent) OnResourceBatchDeleted(md *message.Metadata, msg interface{}) {
 }
 

@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strings"
@@ -90,6 +91,24 @@ func CURLPerform(method string, url string, body map[string]interface{}, options
 	return doRequest(req, url, options...)
 }
 
+// CURLPerform2 调用 deepflow 其他服务, 如 querier API 并获取返回结果，Content-Type 为 application/x-www-form-urlencoded
+func CURLPerform2(method string, url string, postData map[string]string, options ...HeaderOption) (*simplejson.Json, error) {
+	log.Debugf("curl perform: %s %s %+v", method, url, postData)
+	body := new(bytes.Buffer)
+	w := multipart.NewWriter(body)
+	for k, v := range postData {
+		w.WriteField(k, v)
+	}
+	w.Close()
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		log.Error(err)
+		return errResponse, err
+	}
+	req.Header.Set(HEADER_KEY_CONTENT_TYPE, w.FormDataContentType())
+	return doRequest(req, url, options...)
+}
+
 func doRequest(req *http.Request, url string, options ...HeaderOption) (*simplejson.Json, error) {
 	for _, option := range options {
 		option(req)
@@ -126,7 +145,7 @@ func doRequest(req *http.Request, url string, options ...HeaderOption) (*simplej
 
 	response, err := simplejson.NewJson(respBytes)
 	if err != nil {
-		log.Errorf("parse (%s) body failed, (%v)", url, err)
+		log.Errorf("parse (%s) body failed; error: %v; res: %s", url, err, string(respBytes))
 		return errResponse, err
 	}
 

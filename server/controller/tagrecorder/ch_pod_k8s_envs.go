@@ -25,12 +25,12 @@ import (
 
 type ChPodK8sEnvs struct {
 	SubscriberComponent[
-		*message.PodAdd,
-		message.PodAdd,
-		*message.PodFieldsUpdate,
-		message.PodFieldsUpdate,
-		*message.PodDelete,
-		message.PodDelete,
+		*message.AddedPods,
+		message.AddedPods,
+		*message.UpdatedPod,
+		message.UpdatedPod,
+		*message.DeletedPods,
+		message.DeletedPods,
 		metadbmodel.Pod,
 		metadbmodel.ChPodK8sEnvs,
 		IDKey,
@@ -40,12 +40,12 @@ type ChPodK8sEnvs struct {
 func NewChPodK8sEnvs() *ChPodK8sEnvs {
 	mng := &ChPodK8sEnvs{
 		newSubscriberComponent[
-			*message.PodAdd,
-			message.PodAdd,
-			*message.PodFieldsUpdate,
-			message.PodFieldsUpdate,
-			*message.PodDelete,
-			message.PodDelete,
+			*message.AddedPods,
+			message.AddedPods,
+			*message.UpdatedPod,
+			message.UpdatedPod,
+			*message.DeletedPods,
+			message.DeletedPods,
 			metadbmodel.Pod,
 			metadbmodel.ChPodK8sEnvs,
 			IDKey,
@@ -58,27 +58,7 @@ func NewChPodK8sEnvs() *ChPodK8sEnvs {
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChPodK8sEnvs) onResourceUpdated(sourceID int, fieldsUpdate *message.PodFieldsUpdate, db *metadb.DB) {
-	updateInfo := make(map[string]interface{})
-
-	if fieldsUpdate.ENV.IsDifferent() {
-		envs, _ := common.StrToJsonAndMap(fieldsUpdate.ENV.GetNew())
-		updateInfo["envs"] = envs
-	}
-	targetKey := IDKey{ID: sourceID}
-	if len(updateInfo) > 0 {
-		var chItem metadbmodel.ChPodK8sEnvs
-		db.Where("id = ?", sourceID).First(&chItem)
-		if chItem.ID == 0 {
-			c.SubscriberComponent.dbOperator.add(
-				[]IDKey{targetKey},
-				[]metadbmodel.ChPodK8sEnvs{{
-					ChIDBase: metadbmodel.ChIDBase{ID: sourceID}, Envs: updateInfo["envs"].(string)}},
-				db,
-			)
-		}
-	}
-	c.updateOrSync(db, targetKey, updateInfo)
+func (c *ChPodK8sEnvs) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedPod) {
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
@@ -86,13 +66,13 @@ func (c *ChPodK8sEnvs) sourceToTarget(md *message.Metadata, source *metadbmodel.
 	if source.ENV == "" {
 		return
 	}
-	envs, _ := common.StrToJsonAndMap(source.ENV)
+	envs, _ := StrToJsonAndMap(source.ENV)
 	return []IDKey{{ID: source.ID}}, []metadbmodel.ChPodK8sEnvs{{
 		ChIDBase:    metadbmodel.ChIDBase{ID: source.ID},
 		Envs:        envs,
-		TeamID:      md.TeamID,
-		DomainID:    md.DomainID,
-		SubDomainID: md.SubDomainID,
+		TeamID:      md.GetTeamID(),
+		DomainID:    md.GetDomainID(),
+		SubDomainID: md.GetSubDomainID(),
 	}}
 }
 

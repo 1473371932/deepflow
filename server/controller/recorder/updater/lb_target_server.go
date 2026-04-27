@@ -24,7 +24,27 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
+
+// LBTargetServerMessageFactory LBTargetServer资源的消息工厂
+type LBTargetServerMessageFactory struct{}
+
+func (f *LBTargetServerMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedLBTargetServers{}
+}
+
+func (f *LBTargetServerMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedLBTargetServer{}
+}
+
+func (f *LBTargetServerMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedLBTargetServers{}
+}
+
+func (f *LBTargetServerMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedLBTargetServerFields{}
+}
 
 type LBTargetServer struct {
 	UpdaterBase[
@@ -32,36 +52,12 @@ type LBTargetServer struct {
 		*diffbase.LBTargetServer,
 		*metadbmodel.LBTargetServer,
 		metadbmodel.LBTargetServer,
-		*message.LBTargetServerAdd,
-		message.LBTargetServerAdd,
-		message.AddNoneAddition,
-		*message.LBTargetServerUpdate,
-		message.LBTargetServerUpdate,
-		*message.LBTargetServerFieldsUpdate,
-		message.LBTargetServerFieldsUpdate,
-		*message.LBTargetServerDelete,
-		message.LBTargetServerDelete,
-		message.DeleteNoneAddition]
+	]
 }
 
 func NewLBTargetServer(wholeCache *cache.Cache, cloudData []cloudmodel.LBTargetServer) *LBTargetServer {
 	updater := &LBTargetServer{
-		newUpdaterBase[
-			cloudmodel.LBTargetServer,
-			*diffbase.LBTargetServer,
-			*metadbmodel.LBTargetServer,
-			metadbmodel.LBTargetServer,
-			*message.LBTargetServerAdd,
-			message.LBTargetServerAdd,
-			message.AddNoneAddition,
-			*message.LBTargetServerUpdate,
-			message.LBTargetServerUpdate,
-			*message.LBTargetServerFieldsUpdate,
-			message.LBTargetServerFieldsUpdate,
-			*message.LBTargetServerDelete,
-			message.LBTargetServerDelete,
-			message.DeleteNoneAddition,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_LB_TARGET_SERVER_EN,
 			wholeCache,
 			db.NewLBTargetServer().SetMetadata(wholeCache.GetMetadata()),
@@ -69,13 +65,13 @@ func NewLBTargetServer(wholeCache *cache.Cache, cloudData []cloudmodel.LBTargetS
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
-	return updater
-}
+	updater.setDataGenerator(updater)
 
-func (s *LBTargetServer) getDiffBaseByCloudItem(cloudItem *cloudmodel.LBTargetServer) (diffBase *diffbase.LBTargetServer, exists bool) {
-	diffBase, exists = s.diffBaseData[cloudItem.Lcuuid]
-	return
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &LBTargetServerMessageFactory{})
+	}
+
+	return updater
 }
 
 func (s *LBTargetServer) generateDBItemToAdd(cloudItem *cloudmodel.LBTargetServer) (*metadbmodel.LBTargetServer, bool) {
@@ -113,13 +109,12 @@ func (s *LBTargetServer) generateDBItemToAdd(cloudItem *cloudmodel.LBTargetServe
 			ctrlrcommon.RESOURCE_TYPE_LB_TARGET_SERVER_EN, cloudItem.Lcuuid,
 		), s.metadata.LogPrefixes)
 	}
-
 	dbItem := &metadbmodel.LBTargetServer{
 		LBID:         lbID,
 		LBListenerID: lbListenerID,
 		VMID:         vmID,
 		VPCID:        vpcID,
-		Domain:       s.metadata.Domain.Lcuuid,
+		Domain:       s.metadata.GetDomainLcuuid(),
 		Type:         cloudItem.Type,
 		IP:           cloudItem.IP,
 		Port:         cloudItem.Port,
@@ -129,8 +124,8 @@ func (s *LBTargetServer) generateDBItemToAdd(cloudItem *cloudmodel.LBTargetServe
 	return dbItem, true
 }
 
-func (s *LBTargetServer) generateUpdateInfo(diffBase *diffbase.LBTargetServer, cloudItem *cloudmodel.LBTargetServer) (*message.LBTargetServerFieldsUpdate, map[string]interface{}, bool) {
-	structInfo := new(message.LBTargetServerFieldsUpdate)
+func (s *LBTargetServer) generateUpdateInfo(diffBase *diffbase.LBTargetServer, cloudItem *cloudmodel.LBTargetServer) (types.UpdatedFields, map[string]interface{}, bool) {
+	structInfo := new(message.UpdatedLBTargetServerFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.IP != cloudItem.IP {
 		mapInfo["ip"] = cloudItem.IP

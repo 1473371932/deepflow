@@ -17,7 +17,7 @@
 use std::{
     cell::OnceCell,
     env::{self, VarError},
-    fs,
+    fs, io,
     iter::Iterator,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::Path,
@@ -26,6 +26,7 @@ use std::{
 };
 
 use bytesize::ByteSize;
+use fs2::{free_space, total_space};
 use log::{error, warn};
 use sysinfo::{DiskExt, System, SystemExt};
 
@@ -119,7 +120,7 @@ pub fn free_space_check<P: AsRef<Path>>(
     }
 
     if required > disk_free_usage {
-        exception_handler.set(Exception::DiskNotEnough);
+        exception_handler.set(Exception::DiskNotEnough, None);
         return Err(Error::Environment(format!(
             "insufficient free space at {}, at least {} required",
             path.as_ref().display(),
@@ -377,7 +378,7 @@ pub fn get_ctrl_ip_and_mac(dest: &IpAddr) -> Result<(IpAddr, MacAddr)> {
     }
 
     // FIXME: Getting ctrl_ip and ctrl_mac sometimes fails, increase three retry opportunities to ensure access to ctrl_ip and ctrl_mac
-    'outer: for _ in 0..3 {
+    for _ in 0..3 {
         let tuple = get_route_src_ip_and_mac(dest);
         if tuple.is_err() {
             warn!(
@@ -411,7 +412,10 @@ pub fn get_ctrl_ip_and_mac(dest: &IpAddr) -> Result<(IpAddr, MacAddr)> {
                     let tuple = get_route_src_ip_and_mac(&dest);
                     if tuple.is_err() {
                         warn!("failed getting control ip and mac from {}, because: {:?}, wait 1 second", dest, tuple);
-                        continue 'outer;
+                        thread::sleep(Duration::from_secs(1));
+                        // There are scenarios where multiple network cards use the same MAC address, so it is necessary to
+                        // continue checking the other network cards.
+                        continue;
                     }
                     return Ok(tuple.unwrap());
                 }
@@ -424,4 +428,19 @@ pub fn get_ctrl_ip_and_mac(dest: &IpAddr) -> Result<(IpAddr, MacAddr)> {
     Err(Error::Environment(
         "failed getting control ip and mac, deepflow-agent restart...".to_owned(),
     ))
+}
+
+pub fn get_disk_usage(directory: &str) -> io::Result<(u64, u64)> {
+    let path = std::path::Path::new(directory);
+    if !path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("path does not exist: {}", path.display()),
+        ));
+    }
+
+    let total = total_space(path)?;
+    let free = free_space(path)?;
+
+    Ok((total, free))
 }

@@ -40,11 +40,15 @@ func (t *Tencent) getNetworks(region string) ([]model.Network, []model.Subnet, [
 		}
 		vpcID := nData.Get("VpcId").MustString()
 		subnetID := nData.Get("SubnetId").MustString()
-		azID := nData.Get("Zone").MustString()
+		zone := nData.Get("Zone").MustString()
 		networkLcuuid := common.GetUUIDByOrgID(t.orgID, subnetID)
 		vpcLcuuid := common.GetUUIDByOrgID(t.orgID, vpcID)
-		azLcuuid := common.GetUUIDByOrgID(t.orgID, t.uuidGenerate+"_"+azID)
 		networkName := nData.Get("SubnetName").MustString()
+		azLcuuid, ok := t.zoneToLcuuid[zone]
+		if !ok {
+			log.Infof("subnet (%s) az (id:%s) not in available zones", networkName, zone, logger.NewORGPrefix(t.orgID))
+			continue
+		}
 		networks = append(networks, model.Network{
 			Lcuuid:         networkLcuuid,
 			Name:           networkName,
@@ -59,14 +63,25 @@ func (t *Tencent) getNetworks(region string) ([]model.Network, []model.Subnet, [
 		t.azLcuuidMap[azLcuuid] = 0
 
 		cidr4 := nData.Get("CidrBlock").MustString()
+		if cidr4 != "" {
+			subnets = append(subnets, model.Subnet{
+				Lcuuid:        common.GetUUIDByOrgID(t.orgID, networkLcuuid+"_v4"),
+				Name:          networkName + "_v4",
+				CIDR:          cidr4,
+				NetworkLcuuid: networkLcuuid,
+				VPCLcuuid:     vpcLcuuid,
+			})
+		}
 		cidr6 := nData.Get("Ipv6CidrBlock").MustString()
-		subnets = append(subnets, model.Subnet{
-			Lcuuid:        common.GetUUIDByOrgID(t.orgID, networkLcuuid),
-			Name:          networkName,
-			CIDR:          cidr4 + cidr6,
-			NetworkLcuuid: networkLcuuid,
-			VPCLcuuid:     vpcLcuuid,
-		})
+		if cidr6 != "" {
+			subnets = append(subnets, model.Subnet{
+				Lcuuid:        common.GetUUIDByOrgID(t.orgID, networkLcuuid+"_v6"),
+				Name:          networkName + "_v6",
+				CIDR:          cidr6,
+				NetworkLcuuid: networkLcuuid,
+				VPCLcuuid:     vpcLcuuid,
+			})
+		}
 
 		routeTableID := nData.Get("RouteTableId").MustString()
 		if routeTableID != "" {

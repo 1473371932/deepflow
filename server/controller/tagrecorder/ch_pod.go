@@ -27,12 +27,12 @@ import (
 
 type ChPod struct {
 	SubscriberComponent[
-		*message.PodAdd,
-		message.PodAdd,
-		*message.PodFieldsUpdate,
-		message.PodFieldsUpdate,
-		*message.PodDelete,
-		message.PodDelete,
+		*message.AddedPods,
+		message.AddedPods,
+		*message.UpdatedPod,
+		message.UpdatedPod,
+		*message.DeletedPods,
+		message.DeletedPods,
 		metadbmodel.Pod,
 		metadbmodel.ChPod,
 		IDKey,
@@ -43,12 +43,12 @@ type ChPod struct {
 func NewChPod(resourceTypeToIconID map[IconKey]int) *ChPod {
 	mng := &ChPod{
 		newSubscriberComponent[
-			*message.PodAdd,
-			message.PodAdd,
-			*message.PodFieldsUpdate,
-			message.PodFieldsUpdate,
-			*message.PodDelete,
-			message.PodDelete,
+			*message.AddedPods,
+			message.AddedPods,
+			*message.UpdatedPod,
+			message.UpdatedPod,
+			*message.DeletedPods,
+			message.DeletedPods,
 			metadbmodel.Pod,
 			metadbmodel.ChPod,
 			IDKey,
@@ -58,6 +58,7 @@ func NewChPod(resourceTypeToIconID map[IconKey]int) *ChPod {
 		resourceTypeToIconID,
 	}
 	mng.subscriberDG = mng
+	mng.softDelete = true
 	return mng
 }
 
@@ -81,36 +82,15 @@ func (c *ChPod) sourceToTarget(md *message.Metadata, source *metadbmodel.Pod) (k
 		PodGroupID:   source.PodGroupID,
 		IconID:       iconID,
 		PodServiceID: source.PodServiceID,
-		TeamID:       md.TeamID,
-		DomainID:     md.DomainID,
-		SubDomainID:  md.SubDomainID,
+		TeamID:       md.GetTeamID(),
+		DomainID:     md.GetDomainID(),
+		SubDomainID:  md.GetSubDomainID(),
 	})
 	return
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChPod) onResourceUpdated(sourceID int, fieldsUpdate *message.PodFieldsUpdate, db *metadb.DB) {
-	updateInfo := make(map[string]interface{})
-
-	if fieldsUpdate.Name.IsDifferent() {
-		updateInfo["name"] = fieldsUpdate.Name.GetNew()
-	}
-	if fieldsUpdate.PodClusterID.IsDifferent() {
-		updateInfo["pod_cluster_id"] = fieldsUpdate.PodClusterID.GetNew()
-	}
-	if fieldsUpdate.PodNamespaceID.IsDifferent() {
-		updateInfo["pod_ns_id"] = fieldsUpdate.PodNamespaceID.GetNew()
-	}
-	if fieldsUpdate.PodNodeID.IsDifferent() {
-		updateInfo["pod_node_id"] = fieldsUpdate.PodNodeID.GetNew()
-	}
-	if fieldsUpdate.PodGroupID.IsDifferent() {
-		updateInfo["pod_group_id"] = fieldsUpdate.PodGroupID.GetNew()
-	}
-	if fieldsUpdate.PodServiceID.IsDifferent() {
-		updateInfo["pod_service_id"] = fieldsUpdate.PodServiceID.GetNew()
-	}
-	c.updateOrSync(db, IDKey{ID: sourceID}, updateInfo)
+func (c *ChPod) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedPod) {
 }
 
 // softDeletedTargetsUpdated implements SubscriberDataGenerator

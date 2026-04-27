@@ -18,9 +18,9 @@ package event
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/pmezard/go-difflib/difflib"
+	"gopkg.in/yaml.v2"
 
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/db/metadb"
@@ -249,7 +249,7 @@ func (i *IPTool) getPodServiceOptionsByID(md *message.Metadata, id int) ([]event
 		eventapi.TagL3DeviceID(id),
 		eventapi.TagPodClusterID(info.PodClusterID),
 		eventapi.TagPodNSID(info.PodNamespaceID),
-		eventapi.TagPodServiceID(id),
+		eventapi.TagPodServiceID(id), // TODO 此字段在 ingester 中并未被使用，待删除
 	}...)
 	return opts, nil
 }
@@ -379,7 +379,7 @@ func (i *IPTool) getDeviceNameFromAllByID(md *message.Metadata, deviceType, devi
 	return ""
 }
 
-func findFromAllByID[MT constraint.MySQLSoftDeleteModel](db *metadb.DB, id int) *MT {
+func findFromAllByID[MT constraint.MetadbSoftDeleteModel](db *metadb.DB, id int) *MT {
 	var item *MT
 	res := db.Unscoped().Where("id = ?", id).Find(&item)
 	if res.Error != nil {
@@ -396,27 +396,52 @@ func CompareConfig(old, new string, context int) string {
 	diff := difflib.UnifiedDiff{
 		A:        difflib.SplitLines(old),
 		B:        difflib.SplitLines(new),
-		FromFile: "Old",
-		ToFile:   "New",
+		FromFile: "old",
+		ToFile:   "new",
 		Context:  context,
 	}
 
 	result, err := difflib.GetUnifiedDiffString(diff)
 	if err != nil {
 		log.Errorf("compare config error: %v, new: %s, old: %s", err, new, old)
+	}
+	return result
+}
+
+func JoinMetadataAndSpec(metadata, spec string) string {
+	if metadata == "" && spec == "" {
 		return ""
 	}
-
-	var filtered []string
-	for _, line := range strings.Split(result, "\n") {
-		if strings.HasPrefix(line, "--- ") || strings.HasPrefix(line, "+++ ") {
-			continue
-		}
-		if strings.HasPrefix(line, "@@ ") {
-			continue
-		}
-		filtered = append(filtered, line)
+	if metadata == "" {
+		return spec
+	}
+	if spec == "" {
+		return metadata
 	}
 
-	return strings.Join(filtered, "\n")
+	metadataYAML := metadata
+	specYAML := spec
+
+	var jsonMetadata, jsonSpec map[string]interface{}
+	err := yaml.Unmarshal([]byte(metadata), &jsonMetadata)
+	if err != nil {
+		log.Errorf("failed to convert metadata YAML to JSON: %s, error: %v", metadata, err)
+	}
+	newMetadata, err := yaml.Marshal(map[string]interface{}{"metadata": jsonMetadata})
+	if err != nil {
+		log.Errorf("failed to convert metadata JSON to YAML: %s, error: %v", metadata, err)
+	} else {
+		metadataYAML = string(newMetadata)
+	}
+	err = yaml.Unmarshal([]byte(spec), &jsonSpec)
+	if err != nil {
+		log.Errorf("failed to convert spec YAML to JSON: %s, error: %v", spec, err)
+	}
+	newSpec, err := yaml.Marshal(map[string]interface{}{"spec": jsonSpec})
+	if err != nil {
+		log.Errorf("failed to convert spec JSON to YAML: %s, error: %v", spec, err)
+	} else {
+		specYAML = string(newSpec)
+	}
+	return metadataYAML + specYAML
 }

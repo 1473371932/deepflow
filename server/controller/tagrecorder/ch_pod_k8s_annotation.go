@@ -25,12 +25,12 @@ import (
 
 type ChPodK8sAnnotation struct {
 	SubscriberComponent[
-		*message.PodAdd,
-		message.PodAdd,
-		*message.PodFieldsUpdate,
-		message.PodFieldsUpdate,
-		*message.PodDelete,
-		message.PodDelete,
+		*message.AddedPods,
+		message.AddedPods,
+		*message.UpdatedPod,
+		message.UpdatedPod,
+		*message.DeletedPods,
+		message.DeletedPods,
 		metadbmodel.Pod,
 		metadbmodel.ChPodK8sAnnotation,
 		IDKeyKey,
@@ -40,12 +40,12 @@ type ChPodK8sAnnotation struct {
 func NewChPodK8sAnnotation() *ChPodK8sAnnotation {
 	mng := &ChPodK8sAnnotation{
 		newSubscriberComponent[
-			*message.PodAdd,
-			message.PodAdd,
-			*message.PodFieldsUpdate,
-			message.PodFieldsUpdate,
-			*message.PodDelete,
-			message.PodDelete,
+			*message.AddedPods,
+			message.AddedPods,
+			*message.UpdatedPod,
+			message.UpdatedPod,
+			*message.DeletedPods,
+			message.DeletedPods,
 			metadbmodel.Pod,
 			metadbmodel.ChPodK8sAnnotation,
 			IDKeyKey,
@@ -58,45 +58,18 @@ func NewChPodK8sAnnotation() *ChPodK8sAnnotation {
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChPodK8sAnnotation) onResourceUpdated(sourceID int, fieldsUpdate *message.PodFieldsUpdate, db *metadb.DB) {
-	keysToAdd := make([]IDKeyKey, 0)
-	targetsToAdd := make([]metadbmodel.ChPodK8sAnnotation, 0)
+func (c *ChPodK8sAnnotation) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedPod) {
+	db := md.GetDB()
+	fieldsUpdate := updateMessage.GetFields().(*message.UpdatedPodFields)
+	newSource := updateMessage.GetNewMetadbItem().(*metadbmodel.Pod)
+	sourceID := newSource.ID
 	keysToDelete := make([]IDKeyKey, 0)
 	targetsToDelete := make([]metadbmodel.ChPodK8sAnnotation, 0)
 
 	if fieldsUpdate.Annotation.IsDifferent() {
-		_, new := common.StrToJsonAndMap(fieldsUpdate.Annotation.GetNew())
-		_, old := common.StrToJsonAndMap(fieldsUpdate.Annotation.GetOld())
+		_, new := StrToJsonAndMap(fieldsUpdate.Annotation.GetNew())
+		_, old := StrToJsonAndMap(fieldsUpdate.Annotation.GetOld())
 
-		for k, v := range new {
-			targetKey := NewIDKeyKey(sourceID, k)
-			oldV, ok := old[k]
-			if !ok {
-				keysToAdd = append(keysToAdd, targetKey)
-				targetsToAdd = append(targetsToAdd, metadbmodel.ChPodK8sAnnotation{
-					ChIDBase: metadbmodel.ChIDBase{ID: sourceID},
-					Key:      k,
-					Value:    v,
-				})
-				continue
-			}
-			updateInfo := make(map[string]interface{})
-			if oldV != v {
-				var chItem metadbmodel.ChPodK8sAnnotation
-				db.Where("id = ? and `key` = ?", sourceID, k).First(&chItem)
-				if chItem.ID == 0 {
-					keysToAdd = append(keysToAdd, targetKey)
-					targetsToAdd = append(targetsToAdd, metadbmodel.ChPodK8sAnnotation{
-						ChIDBase: metadbmodel.ChIDBase{ID: sourceID},
-						Key:      k,
-						Value:    v,
-					})
-					continue
-				}
-				updateInfo["value"] = v
-			}
-			c.updateOrSync(db, targetKey, updateInfo)
-		}
 		for k := range old {
 			if _, ok := new[k]; !ok {
 				keysToDelete = append(keysToDelete, NewIDKeyKey(sourceID, k))
@@ -107,9 +80,7 @@ func (c *ChPodK8sAnnotation) onResourceUpdated(sourceID int, fieldsUpdate *messa
 			}
 		}
 	}
-	if len(keysToAdd) > 0 {
-		c.SubscriberComponent.dbOperator.add(keysToAdd, targetsToAdd, db)
-	}
+
 	if len(keysToDelete) > 0 {
 		c.SubscriberComponent.dbOperator.delete(keysToDelete, targetsToDelete, db)
 	}
@@ -117,7 +88,7 @@ func (c *ChPodK8sAnnotation) onResourceUpdated(sourceID int, fieldsUpdate *messa
 
 // onResourceUpdated implements SubscriberDataGenerator
 func (c *ChPodK8sAnnotation) sourceToTarget(md *message.Metadata, source *metadbmodel.Pod) (keys []IDKeyKey, targets []metadbmodel.ChPodK8sAnnotation) {
-	_, annotationMap := common.StrToJsonAndMap(source.Annotation)
+	_, annotationMap := StrToJsonAndMap(source.Annotation)
 
 	for k, v := range annotationMap {
 		keys = append(keys, NewIDKeyKey(source.ID, k))
@@ -125,9 +96,9 @@ func (c *ChPodK8sAnnotation) sourceToTarget(md *message.Metadata, source *metadb
 			ChIDBase:    metadbmodel.ChIDBase{ID: source.ID},
 			Key:         k,
 			Value:       v,
-			TeamID:      md.TeamID,
-			DomainID:    md.DomainID,
-			SubDomainID: md.SubDomainID,
+			TeamID:      md.GetTeamID(),
+			DomainID:    md.GetDomainID(),
+			SubDomainID: md.GetSubDomainID(),
 		})
 	}
 	return

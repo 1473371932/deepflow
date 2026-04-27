@@ -39,17 +39,18 @@ func (b *DataSet) AddPodService(dbItem *metadbmodel.PodService, seq int, toolDat
 		Label:            dbItem.Label,
 		Annotation:       dbItem.Annotation,
 		Selector:         dbItem.Selector,
+		ExternalIP:       dbItem.ExternalIP,
 		ServiceClusterIP: dbItem.ServiceClusterIP,
-		Metadata:         dbItem.Metadata,
+		Metadata:         string(dbItem.Metadata),
 		MetadataHash:     dbItem.MetadataHash,
-		Spec:             dbItem.Spec,
+		Spec:             string(dbItem.Spec),
 		SpecHash:         dbItem.SpecHash,
 		PodIngressLcuuid: podIngressLcuuid,
 		RegionLcuuid:     dbItem.Region,
 		AZLcuuid:         dbItem.AZ,
 		SubDomainLcuuid:  dbItem.SubDomain,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN, b.PodServices[dbItem.Lcuuid]), b.metadata.LogPrefixes)
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN, b.PodServices[dbItem.Lcuuid].ToLoggable()), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeletePodService(lcuuid string) {
@@ -75,11 +76,20 @@ type PodService struct {
 	SubDomainLcuuid  string `json:"sub_domain_lcuuid"`
 }
 
+// ToLoggable converts PodService to a loggable format, excluding fields Spec and Metadata
+func (p PodService) ToLoggable() interface{} {
+	copied := p
+	copied.Metadata = "**HIDDEN**"
+	copied.Spec = "**HIDDEN**"
+	return copied
+}
+
 func (p *PodService) Update(cloudItem *cloudmodel.PodService, toolDataSet *tool.DataSet) {
 	p.Name = cloudItem.Name
 	p.Label = cloudItem.Label
 	p.Annotation = cloudItem.Annotation
 	p.Selector = cloudItem.Selector
+	p.ExternalIP = cloudItem.ExternalIP
 	p.ServiceClusterIP = cloudItem.ServiceClusterIP
 
 	yamlMetadata, err := yaml.JSONToYAML([]byte(cloudItem.Metadata))
@@ -101,5 +111,5 @@ func (p *PodService) Update(cloudItem *cloudmodel.PodService, toolDataSet *tool.
 	p.PodIngressLcuuid = cloudItem.PodIngressLcuuid
 	p.RegionLcuuid = cloudItem.RegionLcuuid
 	p.AZLcuuid = cloudItem.AZLcuuid
-	log.Info(updateDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN, p))
+	log.Info(updateDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN, p.ToLoggable()))
 }

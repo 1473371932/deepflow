@@ -382,7 +382,7 @@ type ChIntEnum struct {
 }
 
 type ChNodeType struct {
-	ResourceType int       `gorm:"primaryKey;column:resource_type;type:int;not null" json:"RESOURCE_TYPE"`
+	ResourceType *int      `gorm:"primaryKey;column:resource_type;type:int;not null" json:"RESOURCE_TYPE"`
 	NodeType     string    `gorm:"column:node_type;type:varchar(256);default:null" json:"NODE_TYPE"`
 	UpdatedAt    time.Time `gorm:"column:updated_at;autoUpdateTime:now,type:timestamp" json:"UPDATED_AT"`
 }
@@ -436,38 +436,30 @@ func (ChPodNSCloudTags) TableName() string {
 }
 
 type ChOSAppTag struct {
-	ChUpdatedAtBase `gorm:"embedded"`
-	PID             int    `gorm:"primaryKey;column:pid;type:int;not null" json:"PID"`
-	Key             string `gorm:"primaryKey;column:key;type:varchar(256);default:null" json:"KEY"`
-	Value           string `gorm:"column:value;type:varchar(256);default:null" json:"VALUE"`
-	TeamID          int    `gorm:"column:team_id;type:int;not null" json:"TEAM_ID"`
-	DomainID        int    `gorm:"column:domain_id;type:int;not null" json:"DOMAIN_ID"`
-	SubDomainID     int    `gorm:"column:sub_domain_id;type:int;default:0" json:"SUB_DOMAIN_ID"`
+	ID          int       `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
+	Key         string    `gorm:"primaryKey;column:key;type:varchar(256);default:null" json:"KEY"`
+	Value       string    `gorm:"column:value;type:varchar(256);default:null" json:"VALUE"`
+	TeamID      int       `gorm:"column:team_id;type:int;not null" json:"TEAM_ID"`
+	DomainID    int       `gorm:"column:domain_id;type:int;not null" json:"DOMAIN_ID"`
+	SubDomainID int       `gorm:"column:sub_domain_id;type:int;default:0" json:"SUB_DOMAIN_ID"`
+	UpdatedAt   time.Time `gorm:"column:updated_at;autoUpdateTime:now,type:timestamp" json:"UPDATED_AT"`
 }
 
 func (ChOSAppTag) TableName() string {
 	return "ch_os_app_tag"
 }
 
-func (c ChOSAppTag) GetID() int {
-	return c.PID
-}
-
 type ChOSAppTags struct {
-	ChUpdatedAtBase `gorm:"embedded"`
-	PID             int    `gorm:"primaryKey;column:pid;type:int;not null" json:"PID"`
-	OSAPPTags       string `gorm:"column:os_app_tags;type:text;default:null" json:"OS_APP_TAGS"`
-	TeamID          int    `gorm:"column:team_id;type:int;not null" json:"TEAM_ID"`
-	DomainID        int    `gorm:"column:domain_id;type:int;not null" json:"DOMAIN_ID"`
-	SubDomainID     int    `gorm:"column:sub_domain_id;type:int;default:0" json:"SUB_DOMAIN_ID"`
+	ID          int       `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
+	OSAPPTags   string    `gorm:"column:os_app_tags;type:text;default:null" json:"OS_APP_TAGS"`
+	TeamID      int       `gorm:"column:team_id;type:int;not null" json:"TEAM_ID"`
+	DomainID    int       `gorm:"column:domain_id;type:int;not null" json:"DOMAIN_ID"`
+	SubDomainID int       `gorm:"column:sub_domain_id;type:int;default:0" json:"SUB_DOMAIN_ID"`
+	UpdatedAt   time.Time `gorm:"column:updated_at;autoUpdateTime:now,type:timestamp" json:"UPDATED_AT"`
 }
 
 func (ChOSAppTags) TableName() string {
 	return "ch_os_app_tags"
-}
-
-func (c ChOSAppTags) GetID() int {
-	return c.PID
 }
 
 type ChGProcess struct {
@@ -647,6 +639,7 @@ type ChNpbTunnel struct {
 type ChAlarmPolicy struct {
 	ID        int       `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
 	Name      string    `gorm:"column:name;type:char(128)" json:"NAME"`
+	Info      string    `gorm:"column:info;type:text" json:"INFO"`
 	UserID    int       `gorm:"column:user_id;type:int" json:"USER_ID"`
 	TeamID    int       `gorm:"column:team_id;type:int;default:1" json:"TEAM_ID"`
 	UpdatedAt time.Time `gorm:"column:updated_at;autoUpdateTime:now,type:timestamp" json:"UPDATED_AT"`
@@ -662,7 +655,40 @@ type ChUser struct {
 	UpdatedAt time.Time `gorm:"column:updated_at;autoUpdateTime:now,type:timestamp" json:"UPDATED_AT"`
 }
 
-type ChTagLastUpdatedAt struct {
-	TableName string    `gorm:"primaryKey;column:table_name;type:varchar(64);not null" json:"NAME"`
+type ChCustomBizService struct {
+	ID        int       `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
+	Name      string    `gorm:"column:name;type:varchar(256)" json:"NAME"`
+	IconID    int       `gorm:"column:icon_id;type:int;default:null" json:"ICON_ID"`
+	UID       string    `gorm:"column:uid;type:char(64);default:null" json:"UID"`
+	TeamID    int       `gorm:"column:team_id;type:int;default:1" json:"TEAM_ID"`
 	UpdatedAt time.Time `gorm:"column:updated_at;autoUpdateTime:now,type:timestamp" json:"UPDATED_AT"`
+}
+
+func (ChCustomBizService) TableName() string {
+	return "ch_custom_biz_service"
+}
+
+type ChCustomBizServiceFilter struct {
+	ID           int       `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
+	ClientFilter string    `gorm:"column:client_filter;type:text" json:"CLIENT_FILTER"`
+	ServerFilter string    `gorm:"column:server_filter;type:text" json:"SERVER_FILTER"`
+	UpdatedAt    time.Time `gorm:"column:updated_at;autoUpdateTime:now,type:timestamp" json:"UPDATED_AT"`
+}
+
+func (ChCustomBizServiceFilter) TableName() string {
+	return "ch_custom_biz_service_filter"
+}
+
+type ChBizService struct {
+	ChIDBase         `gorm:"embedded"`
+	ChUpdatedAtBase  `gorm:"embedded"`
+	Name             string `gorm:"column:name;type:varchar(256)" json:"NAME"`
+	ServiceGroupName string `gorm:"column:service_group_name;type:varchar(256)" json:"SERVICE_GROUP_NAME"`
+	IconID           int    `gorm:"column:icon_id;type:int;default:null" json:"ICON_ID"`
+	TeamID           int    `gorm:"column:team_id;type:int;not null" json:"TEAM_ID"`
+	DomainID         int    `gorm:"column:domain_id;type:int;not null" json:"DOMAIN_ID"`
+}
+
+func (ChBizService) TableName() string {
+	return "ch_biz_service"
 }

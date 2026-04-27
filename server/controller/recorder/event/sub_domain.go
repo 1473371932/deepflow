@@ -48,7 +48,7 @@ func NewWholeSubDomain(q *queue.OverwriteQueue) *WholeSubDomain {
 // If the population fails, incomplete resource events are also written to the queue.
 func (r *WholeSubDomain) OnAnyChanged(md *message.Metadata) {
 	var dbItems []metadbmodel.ResourceEvent // TODO use domain_id, sub_domain_id
-	err := md.GetDB().Where("domain = ? AND sub_domain = ?", md.GetDomainLcuuid(), md.GetSubDomainLcuuid()).Find(&dbItems).Error
+	err := md.GetDB().Where(map[string]interface{}{"domain": md.GetDomainLcuuid(), "sub_domain": md.GetSubDomainLcuuid()}).Find(&dbItems).Error
 	if err != nil {
 		log.Errorf("db query resource_event failed: %s", err.Error(), md.LogPrefixes)
 		return
@@ -65,15 +65,25 @@ func (r *WholeSubDomain) OnAnyChanged(md *message.Metadata) {
 		if event.Type == eventapi.RESOURCE_EVENT_TYPE_RECREATE {
 			r.fillRecreatePodEvent(md, event)
 			r.convertAndEnqueue(md, item.ResourceLcuuid, event)
-		} else if common.Contains([]string{eventapi.RESOURCE_EVENT_TYPE_CREATE, eventapi.RESOURCE_EVENT_TYPE_ADD_IP}, event.Type) {
+		} else if slices.Contains([]string{eventapi.RESOURCE_EVENT_TYPE_CREATE, eventapi.RESOURCE_EVENT_TYPE_ATTACH_IP}, event.Type) {
 			r.fillL3DeviceInfo(md, event)
 			r.convertAndEnqueue(md, item.ResourceLcuuid, event)
 		} else if slices.Contains([]string{
-			eventapi.RESOURCE_EVENT_TYPE_ADD_CONFIG_MAP,
-			eventapi.RESOURCE_EVENT_TYPE_UPDATE_CONFIG_MAP,
-			eventapi.RESOURCE_EVENT_TYPE_DELETE_CONFIG_MAP}, event.Type) {
-			for _, podGroupID := range md.GetToolDataSet().GetPodGroupIDsByConfigMapID(int(event.ConfigMapID)) {
+			eventapi.RESOURCE_EVENT_TYPE_ATTACH_CONFIG_MAP,
+			eventapi.RESOURCE_EVENT_TYPE_MODIFY_CONFIG_MAP,
+			eventapi.RESOURCE_EVENT_TYPE_DETACH_CONFIG_MAP}, event.Type) {
+			podGroupIDs := md.GetToolDataSet().GetPodGroupIDsByConfigMapID(int(event.ConfigMapID))
+			if len(podGroupIDs) != 0 {
+				log.Infof("pod group ids: %v connected to config map (id: %d)", podGroupIDs, event.ConfigMapID, md.LogPrefixes)
+			}
+			for _, podGroupID := range podGroupIDs {
+				gtype, ok := md.GetToolDataSet().GetPodGroupTypeByID(podGroupID)
+				if !ok {
+					log.Errorf("get pod group (id: %d) type failed", podGroupID, md.LogPrefixes)
+				}
+				event.PodGroupType = uint8(common.RESOURCE_POD_GROUP_TYPE_MAP[gtype])
 				event.PodGroupID = uint32(podGroupID)
+				event.InstanceType = uint32(common.VIF_DEVICE_TYPE_POD) // 此处如此赋值原因同 RESOURCE_EVENT_TYPE_MODIFY 类型变更事件
 				r.convertAndEnqueue(md, item.ResourceLcuuid, event)
 			}
 		}

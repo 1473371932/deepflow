@@ -17,8 +17,8 @@
 package tagrecorder
 
 import (
-	"encoding/json"
 	"errors"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -52,12 +52,14 @@ func NewChVTapPort() *ChVTapPort {
 		),
 	}
 	updater.updaterDG = updater
+	updater.dbOperator.setUpdateMode(UpdateByCondition)
 	return updater
 }
 
 func (v *ChVTapPort) generateNewData(db *metadb.DB) (map[VtapPortKey]metadbmodel.ChVTapPort, bool) {
+	log.Infof("generate data for %s", v.resourceTypeName, db.LogPrefixORGID)
 	var vTaps []metadbmodel.VTap
-	err := db.Where("type = ?", common.VTAP_TYPE_DEDICATED).Unscoped().Find(&vTaps).Error
+	err := db.Where("type = ?", common.VTAP_TYPE_DEDICATED).Unscoped().Select("type", "id", "region", "az").Find(&vTaps).Error
 	if err != nil {
 		log.Errorf(dbQueryResourceFailed(v.resourceTypeName, err), db.LogPrefixORGID)
 		return nil, false
@@ -69,7 +71,7 @@ func (v *ChVTapPort) generateNewData(db *metadb.DB) (map[VtapPortKey]metadbmodel
 		return nil, false
 	}
 	var vInterfaces []metadbmodel.VInterface
-	err = db.Where("devicetype = ?", common.VIF_DEVICE_TYPE_HOST).Unscoped().Find(&vInterfaces).Error
+	err = db.Select("deviceid", "mac", "name").Where("devicetype = ?", common.VIF_DEVICE_TYPE_HOST).Unscoped().Find(&vInterfaces).Error
 	if err != nil {
 		log.Errorf(dbQueryResourceFailed(v.resourceTypeName, err), db.LogPrefixORGID)
 		return nil, false
@@ -159,6 +161,12 @@ func (v *ChVTapPort) generateNewData(db *metadb.DB) (map[VtapPortKey]metadbmodel
 				vTapPort.DeviceType = data.DeviceType
 				vTapPort.DeviceName = data.DeviceName
 				vTapPort.IconID = deviceKeyToIconID[DeviceKey{DeviceID: data.DeviceID, DeviceType: data.DeviceType}]
+				vTapPort.HostID = data.DeviceHostID
+				vTapPort.HostName = data.DeviceHostName
+				vTapPort.CHostID = data.DeviceCHostID
+				vTapPort.CHostName = data.DeviceCHostName
+				vTapPort.PodNodeID = data.DevicePodNodeID
+				vTapPort.PodNodeName = data.DevicePodNodeName
 				log.Debugf("device id: %d, device type: %d, device name: %s", data.DeviceID, data.DeviceType, data.DeviceName, db.LogPrefixORGID)
 			} else {
 				log.Debugf("pass device id: %d, device type: %d, device name: %s", data.DeviceID, data.DeviceType, data.DeviceName, db.LogPrefixORGID)
@@ -217,6 +225,12 @@ func (v *ChVTapPort) generateNewData(db *metadb.DB) (map[VtapPortKey]metadbmodel
 					vTapPort.DeviceType = data.DeviceType
 					vTapPort.DeviceName = data.DeviceName
 					vTapPort.IconID = deviceKeyToIconID[DeviceKey{DeviceID: data.DeviceID, DeviceType: data.DeviceType}]
+					vTapPort.HostID = data.DeviceHostID
+					vTapPort.HostName = data.DeviceHostName
+					vTapPort.CHostID = data.DeviceCHostID
+					vTapPort.CHostName = data.DeviceCHostName
+					vTapPort.PodNodeID = data.DevicePodNodeID
+					vTapPort.PodNodeName = data.DevicePodNodeName
 					log.Debugf("device id: %d, device type: %d, device name: %s", data.DeviceID, data.DeviceType, data.DeviceName, db.LogPrefixORGID)
 				} else {
 					log.Debugf("pass device id: %d, device type: %d, device name: %s", data.DeviceID, data.DeviceType, data.DeviceName, db.LogPrefixORGID)
@@ -261,7 +275,7 @@ func (v *ChVTapPort) generateNewData(db *metadb.DB) (map[VtapPortKey]metadbmodel
 				if !strings.Contains(vTapPort.Name, ", ...") {
 					vTapPort.Name = vTapPort.Name + ", ..."
 				}
-			} else if !common.Contains(nameSlice, "lo") {
+			} else if !slices.Contains(nameSlice, "lo") {
 				vTapPort.Name = strings.Join([]string{"lo", vTapPort.Name}, ", ")
 			}
 			if len(vTapPort.Name) > vTapPortNameLength {
@@ -367,7 +381,7 @@ func (v *ChVTapPort) generateVtapDeviceInfo(db *metadb.DB) (map[int]DeviceInfo, 
 		return vTapIDToDeviceInfo, false
 	}
 	var vTaps []metadbmodel.VTap
-	err = db.Unscoped().Find(&vTaps).Error
+	err = db.Unscoped().Select("launch_server_id", "id", "type").Find(&vTaps).Error
 	if err != nil {
 		log.Errorf(dbQueryResourceFailed(v.resourceTypeName, err), db.LogPrefixORGID)
 		return vTapIDToDeviceInfo, false
@@ -445,30 +459,41 @@ func (v *ChVTapPort) generateKey(dbItem metadbmodel.ChVTapPort) VtapPortKey {
 
 func (v *ChVTapPort) generateUpdateInfo(oldItem, newItem metadbmodel.ChVTapPort) (map[string]interface{}, bool) {
 	updateInfo := make(map[string]interface{})
-	oldItemMap := make(map[string]interface{})
-	newItemMap := make(map[string]interface{})
-	oldItemStr, err := json.Marshal(oldItem)
-	if err != nil {
-		return nil, false
+	if oldItem.Name != newItem.Name {
+		updateInfo["name"] = newItem.Name
 	}
-	newItemStr, err := json.Marshal(newItem)
-	if err != nil {
-		return nil, false
+	if oldItem.MacType != newItem.MacType {
+		updateInfo["mac_type"] = newItem.MacType
 	}
-	err = json.Unmarshal(oldItemStr, &oldItemMap)
-	if err != nil {
-		return nil, false
+	if oldItem.HostID != newItem.HostID {
+		updateInfo["host_id"] = newItem.HostID
 	}
-	err = json.Unmarshal(newItemStr, &newItemMap)
-	if err != nil {
-		return nil, false
+	if oldItem.HostName != newItem.HostName {
+		updateInfo["host_name"] = newItem.HostName
 	}
-	for oldKey, oldValue := range oldItemMap {
-		if strings.ToLower(oldKey) != "updated_at" {
-			if oldValue != newItemMap[oldKey] {
-				updateInfo[strings.ToLower(oldKey)] = newItemMap[oldKey]
-			}
-		}
+	if oldItem.CHostID != newItem.CHostID {
+		updateInfo["chost_id"] = newItem.CHostID
+	}
+	if oldItem.CHostName != newItem.CHostName {
+		updateInfo["chost_name"] = newItem.CHostName
+	}
+	if oldItem.PodNodeID != newItem.PodNodeID {
+		updateInfo["pod_node_id"] = newItem.PodNodeID
+	}
+	if oldItem.PodNodeName != newItem.PodNodeName {
+		updateInfo["pod_node_name"] = newItem.PodNodeName
+	}
+	if oldItem.DeviceID != newItem.DeviceID {
+		updateInfo["device_id"] = newItem.DeviceID
+	}
+	if oldItem.DeviceType != newItem.DeviceType {
+		updateInfo["device_type"] = newItem.DeviceType
+	}
+	if oldItem.DeviceName != newItem.DeviceName {
+		updateInfo["device_name"] = newItem.DeviceName
+	}
+	if oldItem.IconID != newItem.IconID {
+		updateInfo["icon_id"] = newItem.IconID
 	}
 	if len(updateInfo) > 0 {
 		return updateInfo, true

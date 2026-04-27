@@ -28,8 +28,8 @@ import (
 
 func (k *KubernetesGather) getConfigMaps() (configMaps []model.ConfigMap, err error) {
 	log.Debug("get configmaps starting", logger.NewORGPrefix(k.orgID))
-	for _, c := range k.k8sInfo["*v1.ConfigMap"] {
-		cData, cErr := simplejson.NewJson([]byte(c))
+	for _, c := range k.k8sEntries["*v1.ConfigMap"] {
+		cData, cErr := simplejson.NewJson(c)
 		if cErr != nil {
 			err = cErr
 			log.Errorf("configmap initialization simplejson error: (%s)", cErr.Error(), logger.NewORGPrefix(k.orgID))
@@ -65,9 +65,10 @@ func (k *KubernetesGather) getConfigMaps() (configMaps []model.ConfigMap, err er
 				created = localTime.Local()
 			}
 		}
+		dataStr := k.simpleJsonMarshal(cData.Get("data"))
 		configMaps = append(configMaps, model.ConfigMap{
-			Data:               c,
-			DataHash:           cloudcommon.GenerateMD5Sum(c),
+			Data:               dataStr,
+			DataHash:           cloudcommon.GenerateMD5Sum(dataStr),
 			Lcuuid:             uLcuuid,
 			Name:               name,
 			PodNamespaceLcuuid: namespaceLcuuid,

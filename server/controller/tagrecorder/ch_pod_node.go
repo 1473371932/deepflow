@@ -27,12 +27,12 @@ import (
 
 type ChPodNode struct {
 	SubscriberComponent[
-		*message.PodNodeAdd,
-		message.PodNodeAdd,
-		*message.PodNodeFieldsUpdate,
-		message.PodNodeFieldsUpdate,
-		*message.PodNodeDelete,
-		message.PodNodeDelete,
+		*message.AddedPodNodes,
+		message.AddedPodNodes,
+		*message.UpdatedPodNode,
+		message.UpdatedPodNode,
+		*message.DeletedPodNodes,
+		message.DeletedPodNodes,
 		metadbmodel.PodNode,
 		metadbmodel.ChPodNode,
 		IDKey,
@@ -43,12 +43,12 @@ type ChPodNode struct {
 func NewChPodNode(resourceTypeToIconID map[IconKey]int) *ChPodNode {
 	mng := &ChPodNode{
 		newSubscriberComponent[
-			*message.PodNodeAdd,
-			message.PodNodeAdd,
-			*message.PodNodeFieldsUpdate,
-			message.PodNodeFieldsUpdate,
-			*message.PodNodeDelete,
-			message.PodNodeDelete,
+			*message.AddedPodNodes,
+			message.AddedPodNodes,
+			*message.UpdatedPodNode,
+			message.UpdatedPodNode,
+			*message.DeletedPodNodes,
+			message.DeletedPodNodes,
 			metadbmodel.PodNode,
 			metadbmodel.ChPodNode,
 			IDKey,
@@ -58,6 +58,7 @@ func NewChPodNode(resourceTypeToIconID map[IconKey]int) *ChPodNode {
 		resourceTypeToIconID,
 	}
 	mng.subscriberDG = mng
+	mng.softDelete = true
 	return mng
 }
 
@@ -77,21 +78,15 @@ func (c *ChPodNode) sourceToTarget(md *message.Metadata, source *metadbmodel.Pod
 		Name:         sourceName,
 		PodClusterID: source.PodClusterID,
 		IconID:       iconID,
-		TeamID:       md.TeamID,
-		DomainID:     md.DomainID,
-		SubDomainID:  md.SubDomainID,
+		TeamID:       md.GetTeamID(),
+		DomainID:     md.GetDomainID(),
+		SubDomainID:  md.GetSubDomainID(),
 	})
 	return
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChPodNode) onResourceUpdated(sourceID int, fieldsUpdate *message.PodNodeFieldsUpdate, db *metadb.DB) {
-	updateInfo := make(map[string]interface{})
-
-	if fieldsUpdate.Name.IsDifferent() {
-		updateInfo["name"] = fieldsUpdate.Name.GetNew()
-	}
-	c.updateOrSync(db, IDKey{ID: sourceID}, updateInfo)
+func (c *ChPodNode) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedPodNode) {
 }
 
 // softDeletedTargetsUpdated implements SubscriberDataGenerator

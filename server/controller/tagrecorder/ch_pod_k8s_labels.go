@@ -25,12 +25,12 @@ import (
 
 type ChPodK8sLabels struct {
 	SubscriberComponent[
-		*message.PodAdd,
-		message.PodAdd,
-		*message.PodFieldsUpdate,
-		message.PodFieldsUpdate,
-		*message.PodDelete,
-		message.PodDelete,
+		*message.AddedPods,
+		message.AddedPods,
+		*message.UpdatedPod,
+		message.UpdatedPod,
+		*message.DeletedPods,
+		message.DeletedPods,
 		metadbmodel.Pod,
 		metadbmodel.ChPodK8sLabels,
 		IDKey,
@@ -40,12 +40,12 @@ type ChPodK8sLabels struct {
 func NewChPodK8sLabels() *ChPodK8sLabels {
 	mng := &ChPodK8sLabels{
 		newSubscriberComponent[
-			*message.PodAdd,
-			message.PodAdd,
-			*message.PodFieldsUpdate,
-			message.PodFieldsUpdate,
-			*message.PodDelete,
-			message.PodDelete,
+			*message.AddedPods,
+			message.AddedPods,
+			*message.UpdatedPod,
+			message.UpdatedPod,
+			*message.DeletedPods,
+			message.DeletedPods,
 			metadbmodel.Pod,
 			metadbmodel.ChPodK8sLabels,
 			IDKey,
@@ -58,27 +58,7 @@ func NewChPodK8sLabels() *ChPodK8sLabels {
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChPodK8sLabels) onResourceUpdated(sourceID int, fieldsUpdate *message.PodFieldsUpdate, db *metadb.DB) {
-	updateInfo := make(map[string]interface{})
-
-	if fieldsUpdate.Label.IsDifferent() {
-		labels, _ := common.StrToJsonAndMap(fieldsUpdate.Label.GetNew())
-		updateInfo["labels"] = labels
-	}
-	targetKey := IDKey{ID: sourceID}
-	if len(updateInfo) > 0 {
-		var chItem metadbmodel.ChPodK8sLabels
-		db.Where("id = ?", sourceID).First(&chItem)
-		if chItem.ID == 0 {
-			c.SubscriberComponent.dbOperator.add(
-				[]IDKey{targetKey},
-				[]metadbmodel.ChPodK8sLabels{{
-					ChIDBase: metadbmodel.ChIDBase{ID: sourceID}, Labels: updateInfo["labels"].(string)}},
-				db,
-			)
-		}
-	}
-	c.updateOrSync(db, targetKey, updateInfo)
+func (c *ChPodK8sLabels) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedPod) {
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
@@ -86,13 +66,13 @@ func (c *ChPodK8sLabels) sourceToTarget(md *message.Metadata, source *metadbmode
 	if source.Label == "" {
 		return
 	}
-	labels, _ := common.StrToJsonAndMap(source.Label)
+	labels, _ := StrToJsonAndMap(source.Label)
 	return []IDKey{{ID: source.ID}}, []metadbmodel.ChPodK8sLabels{{
 		ChIDBase:    metadbmodel.ChIDBase{ID: source.ID},
 		Labels:      labels,
-		TeamID:      md.TeamID,
-		DomainID:    md.DomainID,
-		SubDomainID: md.SubDomainID,
+		TeamID:      md.GetTeamID(),
+		DomainID:    md.GetDomainID(),
+		SubDomainID: md.GetSubDomainID(),
 	}}
 }
 

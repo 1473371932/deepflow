@@ -27,12 +27,12 @@ import (
 
 type ChVPC struct {
 	SubscriberComponent[
-		*message.VPCAdd,
-		message.VPCAdd,
-		*message.VPCFieldsUpdate,
-		message.VPCFieldsUpdate,
-		*message.VPCDelete,
-		message.VPCDelete,
+		*message.AddedVPCs,
+		message.AddedVPCs,
+		*message.UpdatedVPC,
+		message.UpdatedVPC,
+		*message.DeletedVPCs,
+		message.DeletedVPCs,
 		metadbmodel.VPC,
 		metadbmodel.ChVPC,
 		IDKey,
@@ -43,12 +43,12 @@ type ChVPC struct {
 func NewChVPC(resourceTypeToIconID map[IconKey]int) *ChVPC {
 	mng := &ChVPC{
 		newSubscriberComponent[
-			*message.VPCAdd,
-			message.VPCAdd,
-			*message.VPCFieldsUpdate,
-			message.VPCFieldsUpdate,
-			*message.VPCDelete,
-			message.VPCDelete,
+			*message.AddedVPCs,
+			message.AddedVPCs,
+			*message.UpdatedVPC,
+			message.UpdatedVPC,
+			*message.DeletedVPCs,
+			message.DeletedVPCs,
 			metadbmodel.VPC,
 			metadbmodel.ChVPC,
 			IDKey,
@@ -58,6 +58,7 @@ func NewChVPC(resourceTypeToIconID map[IconKey]int) *ChVPC {
 		resourceTypeToIconID,
 	}
 	mng.subscriberDG = mng
+	mng.softDelete = true
 	return mng
 }
 
@@ -77,27 +78,14 @@ func (c *ChVPC) sourceToTarget(md *message.Metadata, source *metadbmodel.VPC) (k
 		Name:     sourceName,
 		UID:      source.UID,
 		IconID:   iconID,
-		TeamID:   md.TeamID,
-		DomainID: md.DomainID,
+		TeamID:   md.GetTeamID(),
+		DomainID: md.GetDomainID(),
 	})
 	return
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChVPC) onResourceUpdated(sourceID int, fieldsUpdate *message.VPCFieldsUpdate, db *metadb.DB) {
-	updateInfo := make(map[string]interface{})
-
-	if fieldsUpdate.Name.IsDifferent() {
-		updateInfo["name"] = fieldsUpdate.Name.GetNew()
-	}
-	if fieldsUpdate.UID.IsDifferent() {
-		updateInfo["uid"] = fieldsUpdate.UID.GetNew()
-	}
-	if len(updateInfo) > 0 {
-		var chItem metadbmodel.ChVPC
-		db.Where("id = ?", sourceID).First(&chItem)
-		c.SubscriberComponent.dbOperator.update(chItem, updateInfo, IDKey{ID: sourceID}, db)
-	}
+func (c *ChVPC) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedVPC) {
 }
 
 // softDeletedTargetsUpdated implements SubscriberDataGenerator

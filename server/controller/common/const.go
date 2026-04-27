@@ -192,7 +192,7 @@ var VTapExceptionChinese = map[int64]string{
 	1 << 10:                                "采集器进程数超限",
 	1 << 11:                                "",
 	1 << 12:                                "采集器编译生成的分发和PCAP策略数量超限",
-	1 << 13:                                "空闲内存超限",
+	1 << 13:                                "系统空闲内存触发熔断",
 	1 << 14:                                "日志文件大小超限",
 	1 << 15:                                "控制SOCKET错误",
 	1 << 16:                                "数据SOCKET错误",
@@ -201,6 +201,8 @@ var VTapExceptionChinese = map[int64]string{
 	1 << 19:                                "CGROUPS配置错误",
 	1 << 20:                                "系统负载超限触发熔断",
 	1 << 21:                                "数据流量达到限速",
+	1 << 22:                                "磁盘空闲空间触发熔断",
+	1 << 23:                                "内核版本触发熔断",
 	VTAP_EXCEPTION_ALLOC_ANALYZER_FAILED:   "分配数据节点失败",
 	VTAP_EXCEPTION_ALLOC_CONTROLLER_FAILED: "分配控制器失败",
 	VTAP_EXCEPTION_PRODUCT_NOT_SUPPORTED:   "当前产品不支持此类采集器",
@@ -301,6 +303,7 @@ const (
 
 const (
 	ACL_STATE_ENABLE = 1
+	ACL_STATE_VALID  = 1
 )
 
 const (
@@ -317,7 +320,7 @@ const (
 	DEFAULT_ENCRYPTION_PASSWORD = "******"
 	DEFAULT_ALL_MATCH_REGEX     = ".*"
 	DEFAULT_NOT_MATCH_REGEX     = "^$"
-	DEFAULT_PORT_NAME_REGEX     = "^(cni|flannel|vxlan.calico|tunl|en[ospx])"
+	DEFAULT_PORT_NAME_REGEX     = "^(cni|flannel|vxlan.calico|tunl|eth|en[ospx])"
 
 	OPENSTACK         = 1
 	VSPHERE           = 2
@@ -349,6 +352,8 @@ const (
 	VOLCENGINE        = 30
 	H3C               = 31
 	FUSIONCOMPUTE     = 32
+	SCP               = 33
+	RUIJIE            = 34
 
 	OPENSTACK_EN         = "openstack"
 	VSPHERE_EN           = "vsphere"
@@ -381,6 +386,8 @@ const (
 	VOLCENGINE_EN        = "volcengine"
 	H3C_EN               = "h3c"
 	FUSIONCOMPUTE_EN     = "fusioncompute"
+	SCP_EN               = "scp"
+	RUIJIE_EN            = "ruijie"
 
 	TENCENT_CH          = "腾讯云"
 	ALIYUN_CH           = "阿里云"
@@ -394,6 +401,7 @@ const (
 	SUGON_CH            = "曙光云"
 	VOLCENGINE_CH       = "火山云"
 	H3C_CH              = "华三云"
+	RUIJIE_CH           = "锐捷云"
 
 	OPENSTACK_CH     = "OpenStack"
 	VSPHERE_CH       = "vSphere"
@@ -403,6 +411,7 @@ const (
 	KUBERNETES_CH    = "Kubernetes"
 	CLOUD_TOWER_CH   = "CloudTower"
 	FUSIONCOMPUTE_CH = "FusionCompute"
+	SCP_CH           = "SCP"
 )
 
 var DomainTypeToIconID = map[int]int{
@@ -480,6 +489,15 @@ const (
 	VIF_DEVICE_TYPE_IP                              = 255
 )
 
+var RESOURCE_POD_GROUP_TYPE_MAP = map[int]int{
+	POD_GROUP_DEPLOYMENT:            VIF_DEVICE_TYPE_POD_GROUP_DEPLOYMENT,
+	POD_GROUP_STATEFULSET:           VIF_DEVICE_TYPE_POD_GROUP_STATEFULSET,
+	POD_GROUP_RC:                    VIF_DEVICE_TYPE_POD_GROUP_RC,
+	POD_GROUP_DAEMON_SET:            VIF_DEVICE_TYPE_POD_GROUP_DAEMON_SET,
+	POD_GROUP_REPLICASET_CONTROLLER: VIF_DEVICE_TYPE_POD_GROUP_REPLICASET_CONTROLLER,
+	POD_GROUP_CLONESET:              VIF_DEVICE_TYPE_POD_GROUP_CLONESET,
+}
+
 const (
 	CREATE_METHOD_LEARN         = 0
 	CREATE_METHOD_USER_DEFINE   = 1
@@ -512,6 +530,7 @@ const (
 	RDS_TYPE_PPAS       = 3
 	RDS_TYPE_PSQL       = 4 // PostgreSQL
 	RDS_TYPE_MARIADB    = 5
+	RDS_TYPE_ORACLE     = 6 // oracle
 
 	RDS_STATE_RUNNING   = 1
 	RDS_STATE_RESTORING = 2
@@ -527,7 +546,8 @@ const (
 )
 
 const (
-	REDIS_STATE_RUNNING = 1
+	REDIS_STATE_RUNNING    = 1
+	REDIS_STATE_RECOVERING = 2
 )
 
 const (
@@ -557,6 +577,10 @@ const (
 )
 
 const (
+	DEFAULT_POD_NAMESPACE = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+)
+
+const (
 	POD_NODE_TYPE_MASTER = 1
 	POD_NODE_TYPE_NODE   = 2
 
@@ -565,6 +589,11 @@ const (
 
 	POD_NODE_SERVER_TYPE_HOST = 1
 	POD_NODE_SERVER_TYPE_VM   = 2
+)
+
+const (
+	POD_GROUP_POD_NETWORK  = 1
+	POD_GROUP_HOST_NETWORK = 2
 )
 
 const (
@@ -680,14 +709,15 @@ var VTapToChangeTapModes = map[int][]int{
 type DataChanged string
 
 const (
-	DATA_CHANGED_VTAP          DataChanged = "vtap"
-	DATA_CHANGED_ANALYZER      DataChanged = "analyzer"
-	DATA_CHANGED_PLATFORM_DATA DataChanged = "platform_data"
-	DATA_CHANGED_FLOW_ACL      DataChanged = "flow_acl"
-	DATA_CHANGED_GROUP         DataChanged = "group"
-	DATA_CHANGED_TAP_TYPE      DataChanged = "tap_type"
-	DATA_CHANGED_SERVICE       DataChanged = "service"
-	DATA_CHANGED_IMAGE         DataChanged = "image"
+	DATA_CHANGED_VTAP              DataChanged = "vtap"
+	DATA_CHANGED_ANALYZER          DataChanged = "analyzer"
+	DATA_CHANGED_PLATFORM_DATA     DataChanged = "platform_data"
+	DATA_CHANGED_FLOW_ACL          DataChanged = "flow_acl"
+	DATA_CHANGED_GROUP             DataChanged = "group"
+	DATA_CHANGED_TAP_TYPE          DataChanged = "tap_type"
+	DATA_CHANGED_SERVICE           DataChanged = "service"
+	DATA_CHANGED_IMAGE             DataChanged = "image"
+	DATA_CHANGED_CUSTOM_APP_CONFIG DataChanged = "custom_app_config"
 )
 
 const (
@@ -771,6 +801,18 @@ const CLICK_HOUSE_VERSION = "24"
 const TAP_TYPE_VALUE_CLOUD_NETWORK = 3
 
 const (
-	CUSTOM_SERVICE_TYPE_IP   = 1
-	CUSTOM_SERVICE_TYPE_PORT = 2
+	CUSTOM_SERVICE_TYPE_IP          = 1
+	CUSTOM_SERVICE_TYPE_PORT        = 2
+	CUSTOM_SERVICE_TYPE_CHOST       = 3
+	CUSTOM_SERVICE_TYPE_POD_SERVICE = 4
+	CUSTOM_SERVICE_TYPE_POD_GROUP   = 5
+	CUSTOM_SERVICE_TYPE_POD         = 6
+	CUSTOM_SERVICE_TYPE_HOST        = 7
+
+	CUSTOM_SERVICE_MATCH_TYPE_NAME = 1
+	CUSTOM_SERVICE_MATCH_TYPE_UID  = 2
+)
+
+const (
+	SYS_CONFIG_MASTER_COMMIT_ID = "master_commit_id"
 )

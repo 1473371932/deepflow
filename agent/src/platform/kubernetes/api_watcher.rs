@@ -51,10 +51,7 @@ use crate::{
         stats,
     },
 };
-use public::proto::{
-    agent::{Exception, KubernetesApiSyncRequest},
-    common::KubernetesApiInfo,
-};
+use public::proto::agent::{Exception, KubernetesApiInfo, KubernetesApiSyncRequest};
 
 /*
  * K8s API同步功能
@@ -665,7 +662,7 @@ impl ApiWatcher {
                 cluster_id: Some(config_guard.kubernetes_cluster_id.to_string()),
                 version: pb_version,
                 agent_id: Some(config_guard.agent_id as u32),
-                source_ip: Some(id.ip.to_string()),
+                source_ip: Some(id.ipmac.ip.to_string()),
                 team_id: Some(id.team_id.clone()),
                 error_msg: Some(
                     err_msgs
@@ -702,8 +699,8 @@ impl ApiWatcher {
             }
             Err(e) => {
                 let err = format!("kubernetes_api_sync grpc call failed: {}", e);
-                exception_handler.set(Exception::ControllerSocketError);
                 error!("{}", err);
+                exception_handler.set(Exception::ControllerSocketError, Some(err.clone()));
                 err_msgs.lock().unwrap().push(err);
                 return;
             }
@@ -739,8 +736,8 @@ impl ApiWatcher {
             .block_on(session.grpc_kubernetes_api_sync_with_statsd(msg))
         {
             let err = format!("kubernetes_api_sync grpc call failed: {}", e);
-            exception_handler.set(Exception::ControllerSocketError);
             error!("{}", err);
+            exception_handler.set(Exception::ControllerSocketError, Some(err.clone()));
             err_msgs.lock().unwrap().push(err);
         }
     }
@@ -772,23 +769,19 @@ impl ApiWatcher {
     ) {
         info!("kubernetes api watcher starting");
 
-        let config = context.config.load();
-
-        let namespace = config.namespace.clone();
-        let ns = namespace.as_ref().map(|ns| ns.as_str());
-        let watcher_config = WatcherConfig {
-            list_limit: config.kubernetes_api_list_limit,
-            list_interval: config.kubernetes_api_list_interval,
-            max_memory: config.max_memory,
-        };
-
         let (resource_watchers, task_handles) = loop {
+            let config = context.config.load();
+            let watcher_config = WatcherConfig {
+                list_limit: config.kubernetes_api_list_limit,
+                list_interval: config.kubernetes_api_list_interval,
+                max_memory: config.max_memory,
+            };
             match context.runtime.block_on(Self::set_up(
-                &context.config.load().kubernetes_resources,
+                &config.kubernetes_resources,
                 &context.runtime,
                 &apiserver_version,
                 &err_msgs,
-                ns,
+                config.namespace.as_ref().map(|ns| ns.as_str()),
                 &stats_collector,
                 &watcher_config,
             )) {
@@ -802,7 +795,7 @@ impl ApiWatcher {
                             cluster_id: Some(config_guard.kubernetes_cluster_id.to_string()),
                             version: Some(context.version.load(Ordering::SeqCst)),
                             agent_id: Some(config_guard.agent_id as u32),
-                            source_ip: Some(id.ip.to_string()),
+                            source_ip: Some(id.ipmac.ip.to_string()),
                             team_id: Some(id.team_id.clone()),
                             error_msg: Some(e.to_string()),
                             entries: vec![],

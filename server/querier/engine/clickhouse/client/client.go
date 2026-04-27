@@ -19,6 +19,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"net"
 	"reflect"
 	"strconv"
 	"strings"
@@ -62,9 +63,10 @@ type Client struct {
 	DB         string
 	Context    context.Context
 	Debug      *Debug
+	Version    string
 }
 
-func (c *Client) init(query_uuid string) error {
+func (c *Client) Init(query_uuid string) error {
 	if query_uuid == "" {
 		query_uuid = uuid.NewString()
 	}
@@ -76,7 +78,7 @@ func (c *Client) init(query_uuid string) error {
 	}
 	if connection == nil { // FIXME: add a RWLock
 		conn, err := clickhouse.Open(&clickhouse.Options{
-			Addr: []string{fmt.Sprintf("%s:%d", c.Host, c.Port)},
+			Addr: []string{net.JoinHostPort(c.Host, strconv.Itoa(c.Port))},
 			Auth: clickhouse.Auth{
 				Database: "default",
 				Username: c.UserName,
@@ -103,6 +105,7 @@ func (c *Client) init(query_uuid string) error {
 	c.connection = connection
 	if version == "" {
 		version, _ = c.GetVersion()
+		c.Version = version
 	}
 	return nil
 }
@@ -140,7 +143,7 @@ func (c *Client) DoQuery(params *QueryParams) (result *common.Result, err error)
 		sqlstr = strings.ReplaceAll(sqlstr, "target_label_live_view", "target_label_map")
 	}
 
-	err = c.init(query_uuid)
+	err = c.Init(query_uuid)
 	if err != nil {
 		return nil, err
 	}

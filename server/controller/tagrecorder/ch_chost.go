@@ -27,12 +27,12 @@ import (
 
 type ChChost struct {
 	SubscriberComponent[
-		*message.VMAdd,
-		message.VMAdd,
-		*message.VMFieldsUpdate,
-		message.VMFieldsUpdate,
-		*message.VMDelete,
-		message.VMDelete,
+		*message.AddedVMs,
+		message.AddedVMs,
+		*message.UpdatedVM,
+		message.UpdatedVM,
+		*message.DeletedVMs,
+		message.DeletedVMs,
 		metadbmodel.VM,
 		metadbmodel.ChChost,
 		IDKey,
@@ -42,12 +42,12 @@ type ChChost struct {
 func NewChChost() *ChChost {
 	mng := &ChChost{
 		newSubscriberComponent[
-			*message.VMAdd,
-			message.VMAdd,
-			*message.VMFieldsUpdate,
-			message.VMFieldsUpdate,
-			*message.VMDelete,
-			message.VMDelete,
+			*message.AddedVMs,
+			message.AddedVMs,
+			*message.UpdatedVM,
+			message.UpdatedVM,
+			*message.DeletedVMs,
+			message.DeletedVMs,
 			metadbmodel.VM,
 			metadbmodel.ChChost,
 			IDKey,
@@ -56,6 +56,7 @@ func NewChChost() *ChChost {
 		),
 	}
 	mng.subscriberDG = mng
+	mng.softDelete = true
 	return mng
 }
 
@@ -74,35 +75,15 @@ func (c *ChChost) sourceToTarget(md *message.Metadata, source *metadbmodel.VM) (
 		HostID:   source.HostID,
 		Hostname: source.Hostname,
 		IP:       source.IP,
-		TeamID:   md.TeamID,
-		DomainID: md.DomainID,
+		TeamID:   md.GetTeamID(),
+		DomainID: md.GetDomainID(),
 		SubnetID: source.NetworkID,
 	})
 	return
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChChost) onResourceUpdated(sourceID int, fieldsUpdate *message.VMFieldsUpdate, db *metadb.DB) {
-	updateInfo := make(map[string]interface{})
-	if fieldsUpdate.Name.IsDifferent() {
-		updateInfo["name"] = fieldsUpdate.Name.GetNew()
-	}
-	if fieldsUpdate.VPCID.IsDifferent() {
-		updateInfo["l3_epc_id"] = fieldsUpdate.VPCID.GetNew()
-	}
-	if fieldsUpdate.HostID.IsDifferent() {
-		updateInfo["host_id"] = fieldsUpdate.HostID.GetNew()
-	}
-	if fieldsUpdate.Hostname.IsDifferent() {
-		updateInfo["hostname"] = fieldsUpdate.Hostname.GetNew()
-	}
-	if fieldsUpdate.IP.IsDifferent() {
-		updateInfo["ip"] = fieldsUpdate.IP.GetNew()
-	}
-	if fieldsUpdate.NetworkID.IsDifferent() {
-		updateInfo["subnet_id"] = fieldsUpdate.NetworkID.GetNew()
-	}
-	c.updateOrSync(db, IDKey{ID: sourceID}, updateInfo)
+func (c *ChChost) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedVM) {
 }
 
 // softDeletedTargetsUpdated implements SubscriberDataGenerator

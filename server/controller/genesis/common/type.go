@@ -20,19 +20,25 @@ import (
 	"time"
 
 	"github.com/deepflowio/deepflow/message/agent"
-	"github.com/deepflowio/deepflow/message/common"
 	"github.com/deepflowio/deepflow/server/controller/model"
 )
 
+type GenesisSync interface {
+	Start()
+	GetGenesisSyncData(orgID int) GenesisSyncDataResponse
+	GetGenesisSyncResponse(orgID int) (GenesisSyncDataResponse, error)
+}
+
 type GenesisSyncType interface {
-	model.GenesisVinterface | model.GenesisVpc | model.GenesisHost | model.GenesisVM | model.GenesisVIP | model.GenesisNetwork | model.GenesisPort | model.GenesisLldp | model.GenesisIP | model.GenesisProcess
+	GetLcuuid() string
+	GetVtapID() uint32
 }
 
 type GenesisSyncData struct {
 	IPLastSeens map[int][]model.GenesisIP
 	VIPs        map[int][]model.GenesisVIP
 	VMs         map[int][]model.GenesisVM
-	VPCs        map[int][]model.GenesisVpc
+	VPCs        map[int][]model.GenesisVPC
 	Hosts       map[int][]model.GenesisHost
 	Lldps       map[int][]model.GenesisLldp
 	Ports       map[int][]model.GenesisPort
@@ -45,7 +51,7 @@ type GenesisSyncDataResponse struct {
 	IPLastSeens []model.GenesisIP
 	VIPs        []model.GenesisVIP
 	VMs         []model.GenesisVM
-	VPCs        []model.GenesisVpc
+	VPCs        []model.GenesisVPC
 	Hosts       []model.GenesisHost
 	Lldps       []model.GenesisLldp
 	Ports       []model.GenesisPort
@@ -55,12 +61,12 @@ type GenesisSyncDataResponse struct {
 }
 
 type KubernetesInfo struct {
-	ORGID     int
-	ClusterID string
-	ErrorMSG  string
-	Version   uint64
-	Epoch     time.Time
-	Entries   []*common.KubernetesAPIInfo
+	ORGID       int
+	ClusterID   string
+	ErrorMSG    string
+	Version     uint64
+	Epoch       time.Time
+	EntriesJson []byte
 }
 
 type K8SRPCMessage struct {
@@ -78,7 +84,14 @@ type VIFRPCMessage struct {
 	VtapID                  uint32
 	Peer                    string
 	K8SClusterID            string
+	Key                     string
 	StorageRefresh          bool
 	WorkloadResourceEnabled bool
 	Message                 *agent.GenesisSyncRequest
+}
+
+type ClusterDest struct {
+	Endpoint        string
+	DomainLcuuid    string
+	SubDomainLcuuid string
 }

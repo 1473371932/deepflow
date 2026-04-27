@@ -18,7 +18,8 @@ package tagrecorder
 
 const (
 	SQL_CREATE_DICT               = "CREATE DICTIONARY %s.%s\n"
-	SQL_SOURCE_MYSQL              = "SOURCE(%s(%sPORT %d USER '%s' PASSWORD '%s' %sDB %s TABLE %s INVALIDATE_QUERY 'select(select updated_at from %s order by updated_at desc limit 1) as updated_at'))\n"
+	SQL_SOURCE_MYSQL              = "SOURCE(%s(%sPORT %d USER '%s' PASSWORD '%s' %sDB %s TABLE %s UPDATE_FIELD 'updated_at' INVALIDATE_QUERY 'select max(updated_at) from %s'))\n"
+	SQL_SOURCE_DM                 = "SOURCE(ODBC(CONNECTION_STRING 'DSN=%s' DB %s TABLE %s INVALIDATE_QUERY 'select max(updated_at) from %s.%s'))\n"
 	SQL_LIFETIME                  = "LIFETIME(MIN 30 MAX %d)\n"
 	SQL_LAYOUT_FLAT               = "LAYOUT(FLAT())"
 	SQL_LAYOUT_COMPLEX_KEY_HASHED = "LAYOUT(COMPLEX_KEY_HASHED())"
@@ -26,8 +27,6 @@ const (
 
 // sqls to create dict using subscriber framework
 const (
-	SQL_SOURCE = "SOURCE(%s(%sPORT %d USER '%s' PASSWORD '%s' %sDB %s TABLE %s INVALIDATE_QUERY 'SELECT updated_at FROM ch_tag_last_updated_at WHERE table_name = %s'))\n"
-
 	CREATE_DEVICE_DICTIONARY_SQL = SQL_CREATE_DICT +
 		"(\n" +
 		"    `devicetype` UInt64,\n" +
@@ -42,7 +41,7 @@ const (
 		"    `sub_domain_id` UInt64\n" +
 		")\n" +
 		"PRIMARY KEY devicetype, deviceid\n" +
-		SQL_SOURCE +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_COMPLEX_KEY_HASHED
 	CREATE_AZ_DICTIONARY_SQL = SQL_CREATE_DICT +
@@ -54,7 +53,7 @@ const (
 		"    `domain_id` UInt64\n" +
 		")\n" +
 		"PRIMARY KEY id\n" +
-		SQL_SOURCE +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_FLAT
 	CREATE_CHOST_DICTIONARY_SQL = SQL_CREATE_DICT +
@@ -70,7 +69,20 @@ const (
 		"    `domain_id` UInt64\n" +
 		")\n" +
 		"PRIMARY KEY id\n" +
-		SQL_SOURCE +
+		"%s" +
+		SQL_LIFETIME +
+		SQL_LAYOUT_FLAT
+	CREATE_BIZ_SERVICE_DICTIONARY_SQL = SQL_CREATE_DICT +
+		"(\n" +
+		"    `id` UInt64,\n" +
+		"    `name` String,\n" +
+		"    `service_group_name` String,\n" +
+		"    `icon_id` Int64,\n" +
+		"    `team_id` UInt64,\n" +
+		"    `domain_id` UInt64\n" +
+		")\n" +
+		"PRIMARY KEY id\n" +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_FLAT
 	CREATE_VPC_DICTIONARY_SQL = SQL_CREATE_DICT +
@@ -83,7 +95,7 @@ const (
 		"    `domain_id` UInt64\n" +
 		")\n" +
 		"PRIMARY KEY id\n" +
-		SQL_SOURCE +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_FLAT
 	CREATE_VL2_DICTIONARY_SQL = SQL_CREATE_DICT +
@@ -97,7 +109,7 @@ const (
 		"    `l3_epc_id` UInt64\n" +
 		")\n" +
 		"PRIMARY KEY id\n" +
-		SQL_SOURCE +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_FLAT
 	CREATE_POD_CLUSTER_DICTIONARY_SQL = SQL_CREATE_DICT +
@@ -110,7 +122,7 @@ const (
 		"    `sub_domain_id` UInt64\n" +
 		")\n" +
 		"PRIMARY KEY id\n" +
-		SQL_SOURCE +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_FLAT
 	CREATE_POD_NODE_DICTIONARY_SQL = SQL_CREATE_DICT +
@@ -124,7 +136,7 @@ const (
 		"    `pod_cluster_id` UInt64\n" +
 		")\n" +
 		"PRIMARY KEY id\n" +
-		SQL_SOURCE +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_FLAT
 	CREATE_POD_NS_DICTIONARY_SQL = SQL_CREATE_DICT +
@@ -138,7 +150,7 @@ const (
 		"    `sub_domain_id` UInt64\n" +
 		")\n" +
 		"PRIMARY KEY id\n" +
-		SQL_SOURCE +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_FLAT
 	CREATE_POD_INGRESS_DICTIONARY_SQL = SQL_CREATE_DICT +
@@ -152,7 +164,7 @@ const (
 		"    `pod_cluster_id` UInt64\n" +
 		")\n" +
 		"PRIMARY KEY id\n" +
-		SQL_SOURCE +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_FLAT
 	CREATE_POD_SERVICE_DICTIONARY_SQL = SQL_CREATE_DICT +
@@ -166,7 +178,7 @@ const (
 		"    `sub_domain_id` UInt64\n" +
 		")\n" +
 		"PRIMARY KEY id\n" +
-		SQL_SOURCE +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_FLAT
 	CREATE_POD_GROUP_DICTIONARY_SQL = SQL_CREATE_DICT +
@@ -182,7 +194,7 @@ const (
 		"    `sub_domain_id` UInt64\n" +
 		")\n" +
 		"PRIMARY KEY id\n" +
-		SQL_SOURCE +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_FLAT
 	CREATE_POD_DICTIONARY_SQL = SQL_CREATE_DICT +
@@ -200,7 +212,7 @@ const (
 		"    `sub_domain_id` UInt64\n" +
 		")\n" +
 		"PRIMARY KEY id\n" +
-		SQL_SOURCE +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_FLAT
 	CREATE_GPROCESS_DICTIONARY_SQL = SQL_CREATE_DICT +
@@ -215,7 +227,7 @@ const (
 		"    `sub_domain_id` UInt64\n" +
 		")\n" +
 		"PRIMARY KEY id\n" +
-		SQL_SOURCE +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_FLAT
 
@@ -231,7 +243,7 @@ const (
 		"    `sub_domain_id` UInt64\n" +
 		")\n" +
 		"PRIMARY KEY id, key\n" +
-		SQL_SOURCE +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_COMPLEX_KEY_HASHED
 	CREATE_K8S_ANNOTATIONS_DICTIONARY_SQL = SQL_CREATE_DICT +
@@ -245,7 +257,7 @@ const (
 		"    `sub_domain_id` UInt64\n" +
 		")\n" +
 		"PRIMARY KEY id\n" +
-		SQL_SOURCE +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_FLAT
 	CREATE_K8S_ENV_DICTIONARY_SQL = SQL_CREATE_DICT +
@@ -260,7 +272,7 @@ const (
 		"    `sub_domain_id` UInt64\n" +
 		")\n" +
 		"PRIMARY KEY id, key\n" +
-		SQL_SOURCE +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_COMPLEX_KEY_HASHED
 	CREATE_K8S_ENVS_DICTIONARY_SQL = SQL_CREATE_DICT +
@@ -274,7 +286,7 @@ const (
 		"    `sub_domain_id` UInt64\n" +
 		")\n" +
 		"PRIMARY KEY id\n" +
-		SQL_SOURCE +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_FLAT
 	CREATE_K8S_LABEL_DICTIONARY_SQL = SQL_CREATE_DICT +
@@ -289,7 +301,7 @@ const (
 		"    `sub_domain_id` UInt64\n" +
 		")\n" +
 		"PRIMARY KEY id, key\n" +
-		SQL_SOURCE +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_COMPLEX_KEY_HASHED
 	CREATE_K8S_LABELS_DICTIONARY_SQL = SQL_CREATE_DICT +
@@ -303,7 +315,7 @@ const (
 		"    `sub_domain_id` UInt64\n" +
 		")\n" +
 		"PRIMARY KEY id\n" +
-		SQL_SOURCE +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_FLAT
 	CREATE_POD_NS_CLOUD_TAG_DICTIONARY_SQL = SQL_CREATE_DICT +
@@ -316,7 +328,7 @@ const (
 		"    `sub_domain_id` UInt64\n" +
 		")\n" +
 		"PRIMARY KEY id, key\n" +
-		SQL_SOURCE +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_COMPLEX_KEY_HASHED
 	CREATE_POD_NS_CLOUD_TAGS_DICTIONARY_SQL = SQL_CREATE_DICT +
@@ -328,7 +340,7 @@ const (
 		"    `sub_domain_id` UInt64\n" +
 		")\n" +
 		"PRIMARY KEY id\n" +
-		SQL_SOURCE +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_FLAT
 	CREATE_CHOST_CLOUD_TAG_DICTIONARY_SQL = SQL_CREATE_DICT +
@@ -340,7 +352,7 @@ const (
 		"    `domain_id` UInt64\n" +
 		")\n" +
 		"PRIMARY KEY id, key\n" +
-		SQL_SOURCE +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_COMPLEX_KEY_HASHED
 	CREATE_CHOST_CLOUD_TAGS_DICTIONARY_SQL = SQL_CREATE_DICT +
@@ -351,32 +363,32 @@ const (
 		"    `domain_id` UInt64\n" +
 		")\n" +
 		"PRIMARY KEY id\n" +
-		SQL_SOURCE +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_FLAT
 	CREATE_OS_APP_TAG_DICTIONARY_SQL = SQL_CREATE_DICT +
 		"(\n" +
-		"    `pid` UInt64,\n" +
+		"    `id` UInt64,\n" +
 		"    `key` String,\n" +
 		"    `value` String,\n" +
 		"    `team_id` UInt64,\n" +
 		"    `domain_id` UInt64,\n" +
 		"    `sub_domain_id` UInt64\n" +
 		")\n" +
-		"PRIMARY KEY pid, key\n" +
-		SQL_SOURCE +
+		"PRIMARY KEY id, key\n" +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_COMPLEX_KEY_HASHED
 	CREATE_OS_APP_TAGS_DICTIONARY_SQL = SQL_CREATE_DICT +
 		"(\n" +
-		"    `pid` UInt64,\n" +
+		"    `id` UInt64,\n" +
 		"    `os_app_tags` String,\n" +
 		"    `team_id` UInt64,\n" +
 		"    `domain_id` UInt64,\n" +
 		"    `sub_domain_id` UInt64\n" +
 		")\n" +
-		"PRIMARY KEY pid\n" +
-		SQL_SOURCE +
+		"PRIMARY KEY id\n" +
+		"%s" +
 		SQL_LIFETIME +
 		SQL_LAYOUT_FLAT
 )

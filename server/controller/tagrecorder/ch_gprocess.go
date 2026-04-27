@@ -29,12 +29,12 @@ import (
 
 type ChGProcess struct {
 	SubscriberComponent[
-		*message.ProcessAdd,
-		message.ProcessAdd,
-		*message.ProcessFieldsUpdate,
-		message.ProcessFieldsUpdate,
-		*message.ProcessDelete,
-		message.ProcessDelete,
+		*message.AddedProcesses,
+		message.AddedProcesses,
+		*message.UpdatedProcess,
+		message.UpdatedProcess,
+		*message.DeletedProcesses,
+		message.DeletedProcesses,
 		metadbmodel.Process,
 		metadbmodel.ChGProcess,
 		IDKey,
@@ -45,12 +45,12 @@ type ChGProcess struct {
 func NewChGProcess(resourceTypeToIconID map[IconKey]int) *ChGProcess {
 	mng := &ChGProcess{
 		newSubscriberComponent[
-			*message.ProcessAdd,
-			message.ProcessAdd,
-			*message.ProcessFieldsUpdate,
-			message.ProcessFieldsUpdate,
-			*message.ProcessDelete,
-			message.ProcessDelete,
+			*message.AddedProcesses,
+			message.AddedProcesses,
+			*message.UpdatedProcess,
+			message.UpdatedProcess,
+			*message.DeletedProcesses,
+			message.DeletedProcesses,
 			metadbmodel.Process,
 			metadbmodel.ChGProcess,
 			IDKey,
@@ -61,6 +61,7 @@ func NewChGProcess(resourceTypeToIconID map[IconKey]int) *ChGProcess {
 	}
 	mng.subscriberDG = mng
 	mng.hookers[hookerDeletePage] = mng
+	mng.softDelete = true
 	return mng
 }
 
@@ -81,27 +82,15 @@ func (c *ChGProcess) sourceToTarget(md *message.Metadata, source *metadbmodel.Pr
 		CHostID:     source.VMID,
 		L3EPCID:     source.VPCID,
 		IconID:      iconID,
-		TeamID:      md.TeamID,
-		DomainID:    md.DomainID,
-		SubDomainID: md.SubDomainID,
+		TeamID:      md.GetTeamID(),
+		DomainID:    md.GetDomainID(),
+		SubDomainID: md.GetSubDomainID(),
 	})
 	return
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChGProcess) onResourceUpdated(sourceID int, fieldsUpdate *message.ProcessFieldsUpdate, db *metadb.DB) {
-	updateInfo := make(map[string]interface{})
-
-	if fieldsUpdate.Name.IsDifferent() {
-		updateInfo["name"] = fieldsUpdate.Name.GetNew()
-	}
-	if fieldsUpdate.VMID.IsDifferent() {
-		updateInfo["chost_id"] = fieldsUpdate.VMID.GetNew()
-	}
-	if fieldsUpdate.VPCID.IsDifferent() {
-		updateInfo["l3_epc_id"] = fieldsUpdate.VPCID.GetNew()
-	}
-	c.updateOrSync(db, IDKey{ID: int(fieldsUpdate.GID.GetNew())}, updateInfo)
+func (c *ChGProcess) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedProcess) {
 }
 
 // softDeletedTargetsUpdated implements SubscriberDataGenerator
@@ -112,7 +101,7 @@ func (c *ChGProcess) softDeletedTargetsUpdated(targets []metadbmodel.ChGProcess,
 	}).Create(&targets)
 }
 
-func (c *ChGProcess) beforeDeletePage(dbData []*metadbmodel.Process, msg *message.ProcessDelete) []*metadbmodel.Process {
+func (c *ChGProcess) beforeDeletePage(dbData []*metadbmodel.Process, msg *message.DeletedProcesses) []*metadbmodel.Process {
 	gids := msg.GetAddition().(*message.ProcessDeleteAddition).DeletedGIDs
 	newDatas := []*metadbmodel.Process{}
 	for _, item := range dbData {

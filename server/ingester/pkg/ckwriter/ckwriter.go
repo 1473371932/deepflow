@@ -19,8 +19,10 @@ package ckwriter
 import (
 	"context"
 	"fmt"
+	"net"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,9 +45,10 @@ import (
 var log = logging.MustGetLogger("ckwriter")
 
 const (
-	FLUSH_TIMEOUT  = 10 * time.Second
-	SQL_LOG_LENGTH = 256
-	RETRY_COUNT    = 2
+	FLUSH_TIMEOUT     = 10 * time.Second
+	SQL_LOG_LENGTH    = 256
+	SQL_RESULT_LENGTH = 1024
+	RETRY_COUNT       = 2
 )
 
 var ckwriterManager = &CKWriterManager{}
@@ -244,6 +247,37 @@ func ExecSQL(conn *ch.Client, query string) error {
 	return err
 }
 
+func QuerySingleStringColumn(conn *ch.Client, query, columnName string) (string, error) {
+	if len(query) > SQL_LOG_LENGTH {
+		log.Infof("Query SQL: %s ...", query[:SQL_LOG_LENGTH])
+	} else {
+		log.Info("Query SQL: ", query)
+	}
+
+	var columnData proto.ColStr
+	if err := conn.Do(context.Background(), ch.Query{
+		Body: query,
+		Result: proto.Results{
+			{Name: columnName, Data: &columnData},
+		},
+	}); err != nil {
+		log.Errorf("query failed: %v", err)
+	}
+
+	var result strings.Builder
+	for i := 0; i < columnData.Rows(); i++ {
+		result.WriteString(columnData.Row(i))
+		result.WriteString("\n")
+	}
+	r := result.String()
+	if len(query) > SQL_RESULT_LENGTH {
+		log.Infof("Query SQL result: %s ...", r[:SQL_RESULT_LENGTH])
+	} else {
+		log.Info("Query SQL result: ", r)
+	}
+	return r, nil
+}
+
 func initTable(conn *ch.Client, timeZone string, t *ckdb.Table, orgID uint16) error {
 	if err := ExecSQL(conn, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", t.OrgDatabase(orgID))); err != nil {
 		return err
@@ -257,6 +291,16 @@ func initTable(conn *ch.Client, timeZone string, t *ckdb.Table, orgID uint16) er
 	}
 
 	if t.Aggr1H1D {
+		aggrTableCreateSQL, err := QuerySingleStringColumn(conn, fmt.Sprintf("SHOW CREATE TABLE %s", t.AggrTable1H(orgID)), "statement")
+		if err != nil {
+			log.Warningf("query 1h agg table failed: %s", err)
+		}
+		if t.IsAggrTableWrong(aggrTableCreateSQL) {
+			if err := ExecSQL(conn, t.MakeAggrTableDropSQL1H(orgID)); err != nil {
+				log.Warningf("drop 1h agg table failed: %s", err)
+			}
+		}
+
 		if err := ExecSQL(conn, t.MakeAggrTableCreateSQL1H(orgID)); err != nil {
 			log.Warningf("create 1h agg table failed: %s", err)
 		}
@@ -270,6 +314,15 @@ func initTable(conn *ch.Client, timeZone string, t *ckdb.Table, orgID uint16) er
 			log.Warningf("create 1h global table failed: %s", err)
 		}
 
+		aggrTableCreateSQL, err = QuerySingleStringColumn(conn, fmt.Sprintf("SHOW CREATE TABLE %s", t.AggrTable1D(orgID)), "statement")
+		if err != nil {
+			log.Warningf("query 1d agg table failed: %s", err)
+		}
+		if t.IsAggrTableWrong(aggrTableCreateSQL) {
+			if err := ExecSQL(conn, t.MakeAggrTableDropSQL1D(orgID)); err != nil {
+				log.Warningf("drop 1d agg table failed: %s", err)
+			}
+		}
 		if err := ExecSQL(conn, t.MakeAggrTableCreateSQL1D(orgID)); err != nil {
 			log.Warningf("create 1d agg table failed: %s", err)
 		}
@@ -282,6 +335,22 @@ func initTable(conn *ch.Client, timeZone string, t *ckdb.Table, orgID uint16) er
 		if err := ExecSQL(conn, t.MakeAggrGlobalTableCreateSQL1D(orgID)); err != nil {
 			log.Warningf("create 1d global table failed: %s", err)
 		}
+	}
+
+	if t.Aggr1S {
+		if err := ExecSQL(conn, t.MakeAggrTableCreateSQL1S(orgID)); err != nil {
+			log.Warningf("create 1s agg table failed: %s", err)
+		}
+		if err := ExecSQL(conn, t.MakeAggrMVTableCreateSQL1S(orgID)); err != nil {
+			log.Warningf("create 1s mv table failed: %s", err)
+		}
+		if err := ExecSQL(conn, t.MakeAggrLocalTableCreateSQL1S(orgID)); err != nil {
+			log.Warningf("create 1s local table failed: %s", err)
+		}
+		if err := ExecSQL(conn, t.MakeAggrGlobalTableCreateSQL1S(orgID)); err != nil {
+			log.Warningf("create 1s global table failed: %s", err)
+		}
+
 	}
 
 	// ByConity not support modify timezone
@@ -355,7 +424,7 @@ func (w *CKWriter) InitTable(queueID int, orgID uint16) error {
 	}
 
 	for _, endpoint := range endpoints {
-		err := InitTable(fmt.Sprintf("%s:%d", endpoint.Host, endpoint.Port), w.user, w.password, w.timeZone, w.table, orgID)
+		err := InitTable(net.JoinHostPort(endpoint.Host, fmt.Sprintf("%d", endpoint.Port)), w.user, w.password, w.timeZone, w.table, orgID)
 		if err != nil {
 			log.Warningf("node %s:%d init table failed. err: %s", endpoint.Host, endpoint.Port, err)
 		} else {

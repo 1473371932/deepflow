@@ -14,30 +14,41 @@
  * limitations under the License.
  */
 
-use std::borrow::Cow;
-use std::cmp::{max, min};
-use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
-use std::{fmt, u32};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::io;
+use std::{
+    borrow::Cow,
+    cmp::{max, min},
+    collections::{BTreeSet, HashMap, HashSet},
+    fmt,
+    hash::{Hash, Hasher},
+    iter,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    path::PathBuf,
+    str,
+    sync::Arc,
+    time::Duration,
+};
 
 use arc_swap::{access::Map, ArcSwap};
 use base64::{prelude::BASE64_STANDARD, Engine};
 use bytesize::ByteSize;
+use chrono::Local;
 use flexi_logger::{
     writers::FileLogWriter, Age, Cleanup, Criterion, FileSpec, FlexiLoggerError, LogSpecification,
     LoggerHandle, Naming,
 };
 use http2::get_expected_headers;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use libc::{mlockall, MCL_CURRENT, MCL_FUTURE};
 use log::{debug, error, info, warn};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use nix::{
     sched::{sched_setaffinity, CpuSet},
     unistd::Pid,
 };
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use procfs::{process::Process, ProcError};
 use sysinfo::SystemExt;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use sysinfo::{CpuRefreshKind, RefreshKind, System};
@@ -48,32 +59,36 @@ use super::config::{Ebpf, EbpfFileIoEvent, ProcessMatcher, SymbolTable};
 use super::{
     config::{
         ApiResources, Config, DpdkSource, ExtraLogFields, ExtraLogFieldsInfo, HttpEndpoint,
-        HttpEndpointMatchRule, OracleConfig, PcapStream, PortConfig, ProcessorsFlowLogTunning,
-        RequestLogTunning, SessionTimeout, TagFilterOperator, UserConfig,
+        HttpEndpointMatchRule, Iso8583ParseConfig, NetSignParseConfig, OracleConfig, PcapStream,
+        PortConfig, ProcessorsFlowLogTunning, RequestLogTunning, SessionTimeout, TagFilterOperator,
+        Timeouts, UserConfig, WebSphereMqParseConfig, GRPC_BUFFER_SIZE_MIN,
     },
     ConfigError, KubernetesPollerType, TrafficOverflowAction,
 };
+use crate::config::InferenceWhitelist;
 use crate::flow_generator::protocol_logs::decode_new_rpc_trace_context_with_type;
 use crate::rpc::Session;
+#[cfg(all(unix, feature = "libtrace"))]
+use crate::utils::environment::{get_ctrl_ip_and_mac, is_tt_workload};
 use crate::{
     common::{
-        decapsulate::TunnelTypeBitmap, enums::CaptureNetworkType, l7_protocol_log::L7ProtocolBitmap,
+        decapsulate::TunnelTypeBitmap, enums::CaptureNetworkType,
+        l7_protocol_log::L7ProtocolBitmap, Timestamp, DEFAULT_LOG_UNCOMPRESSED_FILE_COUNT,
     },
     exception::ExceptionHandler,
     flow_generator::{protocol_logs::SOFA_NEW_RPC_TRACE_CTX_KEY, FlowTimeout, TcpTimeout},
     handler::PacketHandlerBuilder,
     metric::document::TapSide,
     trident::{AgentComponents, RunningMode},
-    utils::environment::{free_memory_check, running_in_container},
+    utils::{
+        environment::{free_memory_check, running_in_container},
+        stats,
+    },
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::{
     dispatcher::recv_engine::af_packet::OptTpacketVersion,
-    ebpf::CAP_LEN_MAX,
-    utils::environment::{
-        get_container_resource_limits, get_ctrl_ip_and_mac, is_tt_workload,
-        set_container_resource_limit,
-    },
+    utils::environment::{get_container_resource_limits, set_container_resource_limit},
 };
 #[cfg(target_os = "linux")]
 use crate::{
@@ -85,7 +100,22 @@ use crate::{trident::AgentId, utils::cgroups::is_kernel_available_for_cgroups};
 use public::bitmap::Bitmap;
 use public::l7_protocol::L7Protocol;
 use public::proto::agent::{self, AgentType, PacketCaptureType};
-use public::utils::net::MacAddr;
+use public::utils::{bitmap::parse_range_list_to_bitmap, net::MacAddr};
+
+cfg_if::cfg_if! {
+if #[cfg(feature = "enterprise")] {
+        use crate::common::{
+            flow::PacketDirection,
+            l7_protocol_log::ParseParam,
+        };
+
+        use enterprise_utils::l7::custom_policy::{
+            custom_field_policy::{CustomFieldPolicy, PolicySlice},
+            custom_protocol_policy::ExtraCustomProtocolConfig,
+        };
+        use public::l7_protocol::L7ProtocolEnum;
+    }
+}
 
 const MB: u64 = 1048576;
 
@@ -213,6 +243,10 @@ pub struct EnvironmentConfig {
     pub system_load_circuit_breaker_recover: f32,
     pub system_load_circuit_breaker_metric: agent::SystemLoadMetric,
     pub page_cache_reclaim_percentage: u8,
+    pub free_disk_circuit_breaker_percentage_threshold: u8,
+    pub free_disk_circuit_breaker_absolute_threshold: u64,
+    pub free_disk_circuit_breaker_directories: Vec<String>,
+    pub idle_memory_trimming: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -281,8 +315,6 @@ pub struct OsProcScanConfig {
     // whether to sync os socket and proc info
     // only make sense when process_info_enabled() == true
     pub os_proc_sync_enabled: bool,
-    // sync os socket and proc info only when the process has been tagged.
-    pub os_proc_sync_tagged_only: bool,
 }
 #[cfg(target_os = "windows")]
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -458,6 +490,7 @@ pub struct FlowConfig {
     pub capture_mode: PacketCaptureType,
 
     pub capacity: u32,
+    pub rrt_cache_capacity: u32,
     pub hash_slots: u32,
     pub packet_delay: Duration,
     pub flush_interval: Duration,
@@ -476,6 +509,7 @@ pub struct FlowConfig {
 
     pub l7_protocol_inference_max_fail_count: usize,
     pub l7_protocol_inference_ttl: usize,
+    pub l7_protocol_inference_whitelist: Vec<InferenceWhitelist>,
 
     // Enterprise Edition Feature: packet-sequence
     pub packet_sequence_flag: u8,
@@ -494,6 +528,9 @@ pub struct FlowConfig {
     pub batched_buffer_size_limit: usize,
 
     pub oracle_parse_conf: OracleConfig,
+    pub iso8583_parse_conf: Iso8583ParseConfig,
+    pub web_sphere_mq_parse_conf: WebSphereMqParseConfig,
+    pub net_sign_parse_conf: NetSignParseConfig,
 
     pub obfuscate_enabled_protocols: L7ProtocolBitmap,
     pub server_ports: Vec<u16>,
@@ -504,6 +541,44 @@ pub struct FlowConfig {
 
 impl From<&UserConfig> for FlowConfig {
     fn from(conf: &UserConfig) -> Self {
+        const ISO8583_FIELD_MAX_COUNT: u16 = 129;
+        let mut packet_segmentation_reassembly = HashSet::new();
+
+        for c in &conf.inputs.cbpf.preprocess.packet_segmentation_reassembly {
+            if let Ok(port) = c.parse::<u16>() {
+                packet_segmentation_reassembly.insert(port);
+            } else {
+                let Some((start, end)) = c.split_once('-') else {
+                    debug!(
+                        "invalid port or port range in packet_segmentation_reassembly: {}",
+                        c
+                    );
+                    continue;
+                };
+                let Ok(start) = start.trim().parse() else {
+                    debug!(
+                        "invalid start port in packet_segmentation_reassembly: {}",
+                        c
+                    );
+                    continue;
+                };
+                let Ok(end) = end.trim().parse() else {
+                    debug!("invalid end port in packet_segmentation_reassembly: {}", c);
+                    continue;
+                };
+                if start <= end {
+                    for port in start..=end {
+                        packet_segmentation_reassembly.insert(port);
+                    }
+                } else {
+                    debug!(
+                        "invalid port range in packet_segmentation_reassembly: {}",
+                        c
+                    );
+                }
+            }
+        }
+
         FlowConfig {
             agent_id: conf.global.common.agent_id as u16,
             agent_type: conf.global.common.agent_type,
@@ -517,6 +592,7 @@ impl From<&UserConfig> for FlowConfig {
             l7_log_tap_types: generate_tap_types_array(
                 &conf.outputs.flow_log.filters.l7_capture_network_types,
             ),
+            rrt_cache_capacity: conf.processors.flow_log.tunning.rrt_cache_capacity,
             capacity: conf.processors.flow_log.tunning.concurrent_flow_limit,
             hash_slots: conf.processors.flow_log.tunning.flow_map_hash_slots,
             packet_delay: conf
@@ -589,6 +665,12 @@ impl From<&UserConfig> for FlowConfig {
                 .application_protocol_inference
                 .inference_result_ttl
                 .as_secs() as usize,
+            l7_protocol_inference_whitelist: conf
+                .processors
+                .request_log
+                .application_protocol_inference
+                .inference_whitelist
+                .clone(),
             packet_sequence_flag: conf.processors.packet.tcp_header.header_fields_flag, // Enterprise Edition Feature: packet-sequence
             packet_sequence_block_size: conf.processors.packet.tcp_header.block_size, // Enterprise Edition Feature: packet-sequence
             l7_protocol_enabled_bitmap: L7ProtocolBitmap::from(
@@ -656,6 +738,66 @@ impl From<&UserConfig> for FlowConfig {
                 .protocol_special_config
                 .oracle
                 .clone(),
+            iso8583_parse_conf: Iso8583ParseConfig {
+                translation_enabled: conf
+                    .processors
+                    .request_log
+                    .application_protocol_inference
+                    .protocol_special_config
+                    .iso8583
+                    .translation_enabled,
+                pan_obfuscate: conf
+                    .processors
+                    .request_log
+                    .application_protocol_inference
+                    .protocol_special_config
+                    .iso8583
+                    .pan_obfuscate,
+                extract_fields: parse_range_list_to_bitmap(
+                    ISO8583_FIELD_MAX_COUNT,
+                    conf.processors
+                        .request_log
+                        .application_protocol_inference
+                        .protocol_special_config
+                        .iso8583
+                        .extract_fields
+                        .clone(),
+                    false,
+                )
+                .unwrap(),
+            },
+            web_sphere_mq_parse_conf: WebSphereMqParseConfig {
+                parse_xml_enabled: conf
+                    .processors
+                    .request_log
+                    .application_protocol_inference
+                    .protocol_special_config
+                    .web_sphere_mq
+                    .parse_xml_enabled,
+                decompress_enabled: conf
+                    .processors
+                    .request_log
+                    .application_protocol_inference
+                    .protocol_special_config
+                    .web_sphere_mq
+                    .decompress_enabled,
+                filter_attributes_enabled: conf
+                    .processors
+                    .request_log
+                    .application_protocol_inference
+                    .protocol_special_config
+                    .web_sphere_mq
+                    .filter_attributes_enabled,
+            },
+            net_sign_parse_conf: NetSignParseConfig {
+                extract_biz_data_enabled: conf
+                    .processors
+                    .request_log
+                    .application_protocol_inference
+                    .protocol_special_config
+                    .net_sign
+                    .extract_biz_data_enabled,
+            },
             obfuscate_enabled_protocols: L7ProtocolBitmap::from(
                 conf.processors
                     .request_log
@@ -675,14 +817,7 @@ impl From<&UserConfig> for FlowConfig {
                 .request_log
                 .tunning
                 .consistent_timestamp_in_l7_metrics,
-            packet_segmentation_reassembly: HashSet::from_iter(
-                conf.inputs
-                    .cbpf
-                    .preprocess
-                    .packet_segmentation_reassembly
-                    .clone()
-                    .into_iter(),
-            ),
+            packet_segmentation_reassembly,
         }
     }
 }
@@ -873,12 +1008,22 @@ impl BlacklistTrieNode {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub struct BlacklistTrie {
+    config: Vec<TagFilterOperator>,
+
     pub endpoint: BlacklistTrieNode,
     pub request_type: BlacklistTrieNode,
     pub request_domain: BlacklistTrieNode,
     pub request_resource: BlacklistTrieNode,
+}
+
+impl fmt::Debug for BlacklistTrie {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BlacklistTrie")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BlacklistTrie {
@@ -892,7 +1037,7 @@ impl BlacklistTrie {
     const EQUAL: &'static str = "equal";
     const PREFIX: &'static str = "prefix";
 
-    pub fn new(blacklists: &Vec<TagFilterOperator>) -> Option<BlacklistTrie> {
+    pub fn new(blacklists: Vec<TagFilterOperator>) -> Option<BlacklistTrie> {
         if blacklists.is_empty() {
             return None;
         }
@@ -901,6 +1046,7 @@ impl BlacklistTrie {
         for i in blacklists.iter() {
             b.insert(i);
         }
+        b.config = blacklists;
         Some(b)
     }
 
@@ -942,53 +1088,88 @@ impl BlacklistTrie {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct DnsNxdomainTrieNode {
-    children: HashMap<char, Box<DnsNxdomainTrieNode>>,
+struct DomainNameTrieNode {
+    children: HashMap<String, DomainNameTrieNode>,
     unconcerned: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DnsNxdomainTrie {
-    root: DnsNxdomainTrieNode,
+impl DomainNameTrieNode {
+    pub fn insert(&mut self, segments: &mut iter::Rev<str::Split<'_, char>>) {
+        match segments.next() {
+            None => self.unconcerned = true,
+            Some(seg) => {
+                let child = self
+                    .children
+                    .entry(seg.to_string())
+                    .or_insert_with(|| DomainNameTrieNode::default());
+                child.insert(segments);
+            }
+        }
+    }
+
+    pub fn search(&self, segments: &mut iter::Rev<str::Split<'_, char>>) -> bool {
+        if self.unconcerned {
+            return true;
+        }
+        match segments.next() {
+            None => self.unconcerned,
+            Some(seg) => self
+                .children
+                .get(seg)
+                .map(|child| child.search(segments))
+                .unwrap_or(false),
+        }
+    }
 }
 
-impl DnsNxdomainTrie {
-    pub fn insert(&mut self, rule: &String) {
-        let mut node = &mut self.root;
-        // the reversal is because what is matched is the suffix of the domain name
-        for ch in rule.chars().rev() {
-            node = node
-                .children
-                .entry(ch)
-                .or_insert_with(|| Box::new(DnsNxdomainTrieNode::default()));
+#[derive(Clone, Default)]
+pub struct DomainNameTrie {
+    entries: HashSet<String>,
+    root: DomainNameTrieNode,
+}
+
+impl fmt::Debug for DomainNameTrie {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DomainNameTrie")
+            .field("entries", &self.entries)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for DomainNameTrie {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
+}
+
+impl Eq for DomainNameTrie {}
+
+impl DomainNameTrie {
+    const SEP: char = '.';
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn insert(&mut self, rule: &str) {
+        if self.entries.contains(rule) {
+            return;
         }
-        node.unconcerned = true;
+        self.entries.insert(rule.to_string());
+        let mut segments = rule.split(Self::SEP).rev();
+        self.root.insert(&mut segments);
     }
 
     pub fn is_unconcerned(&self, input: &str) -> bool {
         if input.is_empty() {
             return false;
         }
-        let mut node = &self.root;
-        // the reversal is because what is matched is the suffix of the domain name
-        for c in input.chars().rev() {
-            match node.children.get(&c) {
-                Some(child) => {
-                    if child.unconcerned {
-                        return true;
-                    }
-                    node = child.as_ref();
-                }
-                None => {
-                    break;
-                }
-            }
-        }
-        false
+        let mut segments = input.split(Self::SEP).rev();
+        self.root.search(&mut segments)
     }
 }
 
-impl From<&Vec<String>> for DnsNxdomainTrie {
+impl From<&Vec<String>> for DomainNameTrie {
     fn from(v: &Vec<String>) -> Self {
         let mut t = Self::default();
         v.iter().for_each(|r| t.insert(r));
@@ -996,7 +1177,24 @@ impl From<&Vec<String>> for DnsNxdomainTrie {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
+pub struct CustomAppConfig {
+    pub version: u64,
+    #[cfg(feature = "enterprise")]
+    pub custom_protocol_config: Option<ExtraCustomProtocolConfig>,
+    #[cfg(feature = "enterprise")]
+    pub custom_field_policies: Option<CustomFieldPolicy>,
+}
+
+impl PartialEq for CustomAppConfig {
+    // does not include custom_protocol_config and custom_field_policies
+    // because we need None value to represent "not updated"
+    fn eq(&self, other: &Self) -> bool {
+        self.version == other.version
+    }
+}
+
+#[derive(Clone, PartialEq)]
 pub struct LogParserConfig {
     pub l7_log_collect_nps_threshold: u64,
     pub l7_log_session_aggr_max_entries: usize,
@@ -1007,11 +1205,11 @@ pub struct LogParserConfig {
     pub http_endpoint_disabled: bool,
     pub http_endpoint_trie: HttpEndpointTrie,
     pub obfuscate_enabled_protocols: L7ProtocolBitmap,
-    pub l7_log_blacklist: HashMap<String, Vec<TagFilterOperator>>,
     pub l7_log_blacklist_trie: HashMap<L7Protocol, BlacklistTrie>,
-    pub unconcerned_dns_nxdomain_response_suffixes: Vec<String>,
-    pub unconcerned_dns_nxdomain_trie: DnsNxdomainTrie,
+    pub unconcerned_dns_nxdomain_trie: DomainNameTrie,
     pub mysql_decompress_payload: bool,
+    pub mysql_endpoint_disabled: bool,
+    pub custom_app: CustomAppConfig,
 }
 
 impl Default for LogParserConfig {
@@ -1027,11 +1225,11 @@ impl Default for LogParserConfig {
             http_endpoint_disabled: false,
             http_endpoint_trie: HttpEndpointTrie::new(),
             obfuscate_enabled_protocols: L7ProtocolBitmap::default(),
-            l7_log_blacklist: HashMap::new(),
             l7_log_blacklist_trie: HashMap::new(),
-            unconcerned_dns_nxdomain_response_suffixes: vec![],
-            unconcerned_dns_nxdomain_trie: DnsNxdomainTrie::default(),
+            unconcerned_dns_nxdomain_trie: DomainNameTrie::default(),
             mysql_decompress_payload: true,
+            mysql_endpoint_disabled: true,
+            custom_app: CustomAppConfig::default(),
         }
     }
 }
@@ -1071,13 +1269,43 @@ impl fmt::Debug for LogParserConfig {
                     })
                     .collect::<Vec<_>>(),
             )
-            .field("l7_log_blacklist_trie", &self.l7_log_blacklist)
+            .field("l7_log_blacklist_trie", &self.l7_log_blacklist_trie)
             .field(
                 "unconcerned_dns_nxdomain_trie",
-                &self.unconcerned_dns_nxdomain_response_suffixes,
+                &self.unconcerned_dns_nxdomain_trie,
             )
             .field("mysql_decompress_payload", &self.mysql_decompress_payload)
+            .field("mysql_endpoint_disabled", &self.mysql_endpoint_disabled)
+            .field("custom_app", &self.custom_app)
             .finish()
+    }
+}
+
+impl LogParserConfig {
+    pub fn get_l7_timeout(&self, l7_protocol: L7Protocol) -> Timestamp {
+        match self.l7_log_session_aggr_timeout.get(&l7_protocol) {
+            Some(timeout) => *timeout,
+            None => Timeouts::l7_default_timeout(l7_protocol),
+        }
+        .into()
+    }
+
+    #[cfg(feature = "enterprise")]
+    pub fn get_custom_field_policies(
+        &self,
+        protocol: L7ProtocolEnum,
+        param: &ParseParam,
+    ) -> Option<PolicySlice<'_>> {
+        self.custom_app
+            .custom_field_policies
+            .as_ref()
+            .and_then(|cfp| {
+                let server_port = match param.direction {
+                    PacketDirection::ClientToServer => param.port_dst,
+                    PacketDirection::ServerToClient => param.port_src,
+                };
+                cfp.select(protocol, server_port)
+            })
     }
 }
 
@@ -1202,6 +1430,7 @@ pub enum TraceType {
     XTingyun(String),
     CloudWise,
     Customize(String),
+    B3,
 }
 
 // The value here must be lower case
@@ -1214,6 +1443,7 @@ const TRACE_TYPE_SW8: &str = "sw8";
 const TRACE_TYPE_TRACE_PARENT: &str = "traceparent";
 const TRACE_TYPE_X_TINGYUN: &str = "x-tingyun";
 const TRACE_TYPE_CLOUD_WISE: &str = "cloudwise";
+const TRACE_TYPE_B3: &str = "b3";
 
 const TRACE_TYPE_CLOUD_WISE_UPPER: &str = "CLOUDWISE";
 
@@ -1242,6 +1472,7 @@ impl From<&str> for TraceType {
             SOFA_NEW_RPC_TRACE_CTX_KEY => TraceType::NewRpcTraceContext,
             TRACE_TYPE_X_TINGYUN => TraceType::XTingyun(sub_tag),
             TRACE_TYPE_CLOUD_WISE => TraceType::CloudWise,
+            TRACE_TYPE_B3 => TraceType::B3,
             _ if tag.len() > 0 => TraceType::Customize(tag),
             _ => TraceType::Disabled,
         }
@@ -1264,6 +1495,7 @@ impl TraceType {
             TraceType::XTingyun(_) => context.eq_ignore_ascii_case(TRACE_TYPE_X_TINGYUN),
             TraceType::CloudWise => context.eq_ignore_ascii_case(TRACE_TYPE_CLOUD_WISE),
             TraceType::Customize(tag) => context.eq_ignore_ascii_case(&tag),
+            TraceType::B3 => context.eq_ignore_ascii_case(TRACE_TYPE_B3),
             _ => false,
         }
     }
@@ -1281,6 +1513,7 @@ impl TraceType {
             TraceType::XTingyun(_) => TRACE_TYPE_X_TINGYUN,
             TraceType::CloudWise => TRACE_TYPE_CLOUD_WISE_UPPER,
             TraceType::Customize(tag) => &tag,
+            TraceType::B3 => TRACE_TYPE_B3,
             _ => "",
         }
     }
@@ -1376,6 +1609,20 @@ impl TraceType {
         cloud_platform::cloudwise::decode_trace_id(value)
     }
 
+    // B3 Trace Format:
+    // b3: TRACEID-SPANID-1
+    // b3: 4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-1
+    fn decode_b3(value: &str, id_type: u8) -> Option<&str> {
+        let mut segs = value.split("-");
+        if id_type == Self::TRACE_ID {
+            segs.nth(0)
+        } else if id_type == Self::SPAN_ID {
+            segs.nth(1)
+        } else {
+            unreachable!()
+        }
+    }
+
     fn decode_id<'a, 'b>(&'b self, value: &'a str, id_type: u8) -> Option<Cow<'a, str>> {
         let value = value.trim();
         match self {
@@ -1394,6 +1641,7 @@ impl TraceType {
             }
             TraceType::XTingyun(sub_tag) => Self::decode_tingyun(value, sub_tag),
             TraceType::CloudWise => Self::decode_cloud_wise(value).map(|s| s.into()),
+            TraceType::B3 => Self::decode_b3(value, id_type).map(|s| s.into()),
         }
     }
 
@@ -1412,13 +1660,15 @@ impl Default for TraceType {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct L7LogDynamicConfig {
     // in lowercase
     pub proxy_client: Vec<String>,
     // in lowercase
     pub x_request_id: Vec<String>,
 
+    pub multiple_trace_id_collection: bool,
+    pub copy_apm_trace_id: bool,
     pub trace_types: Vec<TraceType>,
     pub span_types: Vec<TraceType>,
 
@@ -1426,6 +1676,19 @@ pub struct L7LogDynamicConfig {
     span_set: HashSet<String>,
     pub expected_headers_set: Arc<HashSet<Vec<u8>>>,
     pub extra_log_fields: ExtraLogFields,
+
+    pub grpc_streaming_data_enabled: bool,
+
+    pub error_request_header: usize,
+    pub error_response_header: usize,
+    pub error_request_payload: usize,
+    pub error_response_payload: usize,
+}
+
+impl Default for L7LogDynamicConfig {
+    fn default() -> Self {
+        L7LogDynamicConfigBuilder::default().into()
+    }
 }
 
 impl fmt::Debug for L7LogDynamicConfig {
@@ -1435,6 +1698,11 @@ impl fmt::Debug for L7LogDynamicConfig {
             .field("x_request_id", &self.x_request_id)
             .field("trace_types", &self.trace_types)
             .field("span_types", &self.span_types)
+            .field(
+                "multiple_trace_id_collection",
+                &self.multiple_trace_id_collection,
+            )
+            .field("copy_apm_trace_id", &self.copy_apm_trace_id)
             .field("trace_set", &self.trace_set)
             .field("span_set", &self.span_set)
             .field(
@@ -1446,6 +1714,14 @@ impl fmt::Debug for L7LogDynamicConfig {
                     .collect::<HashSet<_>>(),
             )
             .field("extra_log_fields", &self.extra_log_fields)
+            .field(
+                "grpc_streaming_data_enabled",
+                &self.grpc_streaming_data_enabled,
+            )
+            .field("error_request_header", &self.error_request_header)
+            .field("error_response_header", &self.error_response_header)
+            .field("error_request_payload", &self.error_request_payload)
+            .field("error_response_payload", &self.error_response_payload)
             .finish()
     }
 }
@@ -1454,22 +1730,124 @@ impl PartialEq for L7LogDynamicConfig {
     fn eq(&self, other: &Self) -> bool {
         self.proxy_client == other.proxy_client
             && self.x_request_id == other.x_request_id
+            && self.multiple_trace_id_collection == other.multiple_trace_id_collection
+            && self.copy_apm_trace_id == other.copy_apm_trace_id
             && self.trace_types == other.trace_types
             && self.span_types == other.span_types
             && self.extra_log_fields == other.extra_log_fields
+            && self.error_request_header == other.error_request_header
+            && self.error_response_header == other.error_response_header
+            && self.error_request_payload == other.error_request_payload
+            && self.error_response_payload == other.error_response_payload
+            && self.grpc_streaming_data_enabled == other.grpc_streaming_data_enabled
     }
 }
 
-impl Eq for L7LogDynamicConfig {}
+pub struct L7LogDynamicConfigBuilder {
+    pub proxy_client: Vec<String>,
+    pub x_request_id: Vec<String>,
+    pub multiple_trace_id_collection: bool,
+    pub copy_apm_trace_id: bool,
+    pub trace_types: Vec<TraceType>,
+    pub span_types: Vec<TraceType>,
+    pub extra_log_fields: ExtraLogFields,
+    pub grpc_streaming_data_enabled: bool,
+    #[cfg(feature = "enterprise")]
+    pub extra_headers: HashSet<String>,
+    pub error_request_header: usize,
+    pub error_request_payload: usize,
+    pub error_response_header: usize,
+    pub error_response_payload: usize,
+}
 
-impl L7LogDynamicConfig {
-    pub fn new(
-        mut proxy_client: Vec<String>,
-        mut x_request_id: Vec<String>,
-        trace_types: Vec<TraceType>,
-        span_types: Vec<TraceType>,
-        mut extra_log_fields: ExtraLogFields,
-    ) -> Self {
+impl Default for L7LogDynamicConfigBuilder {
+    fn default() -> Self {
+        (&UserConfig::default()).into()
+    }
+}
+
+impl From<&UserConfig> for L7LogDynamicConfigBuilder {
+    fn from(config: &UserConfig) -> Self {
+        let c = &config.processors.request_log;
+        Self {
+            proxy_client: c
+                .tag_extraction
+                .tracing_tag
+                .http_real_client
+                .iter()
+                .map(|s| s.to_ascii_lowercase())
+                .collect(),
+            x_request_id: c
+                .tag_extraction
+                .tracing_tag
+                .x_request_id
+                .iter()
+                .map(|s| s.to_ascii_lowercase())
+                .collect(),
+            multiple_trace_id_collection: c.tag_extraction.tracing_tag.multiple_trace_id_collection,
+            copy_apm_trace_id: c.tag_extraction.tracing_tag.copy_apm_trace_id,
+            trace_types: c
+                .tag_extraction
+                .tracing_tag
+                .apm_trace_id
+                .iter()
+                .map(|item| TraceType::from(item.as_str()))
+                .collect(),
+            span_types: c
+                .tag_extraction
+                .tracing_tag
+                .apm_span_id
+                .iter()
+                .map(|item| TraceType::from(item.as_str()))
+                .collect(),
+            extra_log_fields: ExtraLogFields {
+                http: c
+                    .tag_extraction
+                    .custom_fields
+                    .get("HTTP")
+                    .map(|c| c.iter().map(|f| ExtraLogFieldsInfo::from(f)).collect())
+                    .unwrap_or(vec![]),
+                http2: c
+                    .tag_extraction
+                    .custom_fields
+                    .get("HTTP2")
+                    .map(|c| c.iter().map(|f| ExtraLogFieldsInfo::from(f)).collect())
+                    .unwrap_or(vec![]),
+            },
+            grpc_streaming_data_enabled: c
+                .application_protocol_inference
+                .protocol_special_config
+                .grpc
+                .streaming_data_enabled,
+            #[cfg(feature = "enterprise")]
+            extra_headers: config.custom_app.extra_headers.clone(),
+            error_request_header: c.tag_extraction.raw.error_request_header,
+            error_request_payload: c.tag_extraction.raw.error_request_payload,
+            error_response_header: c.tag_extraction.raw.error_response_header,
+            error_response_payload: c.tag_extraction.raw.error_response_payload,
+        }
+    }
+}
+
+impl From<L7LogDynamicConfigBuilder> for L7LogDynamicConfig {
+    fn from(builder: L7LogDynamicConfigBuilder) -> Self {
+        let L7LogDynamicConfigBuilder {
+            mut proxy_client,
+            mut x_request_id,
+            multiple_trace_id_collection,
+            copy_apm_trace_id,
+            trace_types,
+            span_types,
+            mut extra_log_fields,
+            grpc_streaming_data_enabled,
+            #[cfg(feature = "enterprise")]
+            extra_headers,
+            error_request_header,
+            error_request_payload,
+            error_response_header,
+            error_response_payload,
+        } = builder;
+
         let mut expected_headers_set = get_expected_headers();
         let mut dup_checker = HashSet::new();
 
@@ -1512,21 +1890,40 @@ impl L7LogDynamicConfig {
         extra_log_fields.deduplicate();
 
         for f in extra_log_fields.http2.iter() {
+            dup_checker.insert(f.field_name.to_owned());
             expected_headers_set.insert(f.field_name.as_bytes().to_vec());
+        }
+
+        #[cfg(feature = "enterprise")]
+        for header in extra_headers.into_iter() {
+            if dup_checker.contains(&header) {
+                continue;
+            }
+            dup_checker.insert(header.clone());
+            expected_headers_set.insert(header.into_bytes());
         }
 
         Self {
             proxy_client,
             x_request_id,
+            multiple_trace_id_collection,
+            copy_apm_trace_id,
             trace_types,
             span_types,
             trace_set,
             span_set,
             expected_headers_set: Arc::new(expected_headers_set),
             extra_log_fields,
+            grpc_streaming_data_enabled,
+            error_request_header,
+            error_request_payload,
+            error_response_header,
+            error_response_payload,
         }
     }
+}
 
+impl L7LogDynamicConfig {
     pub fn is_trace_id(&self, context: &str) -> bool {
         self.trace_set.contains(context)
     }
@@ -1567,7 +1964,7 @@ pub struct ModuleConfig {
     pub handler: HandlerConfig,
     pub log: LogConfig,
     pub synchronizer: SynchronizerConfig,
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(unix, feature = "libtrace"))]
     pub ebpf: EbpfConfig,
     pub agent_type: AgentType,
     pub metric_server: MetricServerConfig,
@@ -1657,6 +2054,23 @@ impl TryFrom<(Config, UserConfig)> for ModuleConfig {
                     .relative_sys_load
                     .metric,
                 page_cache_reclaim_percentage: conf.global.tunning.page_cache_reclaim_percentage,
+                free_disk_circuit_breaker_percentage_threshold: conf
+                    .global
+                    .circuit_breakers
+                    .free_disk
+                    .percentage_trigger_threshold,
+                free_disk_circuit_breaker_absolute_threshold: conf
+                    .global
+                    .circuit_breakers
+                    .free_disk
+                    .absolute_trigger_threshold,
+                free_disk_circuit_breaker_directories: {
+                    let mut v = conf.global.circuit_breakers.free_disk.directories.clone();
+                    v.sort();
+                    v.dedup();
+                    v
+                },
+                idle_memory_trimming: conf.global.tunning.idle_memory_trimming,
             },
             synchronizer: SynchronizerConfig {
                 sync_interval: conf.global.communication.proactive_request_interval,
@@ -1665,7 +2079,7 @@ impl TryFrom<(Config, UserConfig)> for ModuleConfig {
                 max_escape: conf.global.communication.max_escape_duration,
             },
             stats: StatsConfig {
-                interval: Duration::from_secs(10), // TODO: make it configurable
+                interval: stats::STATS_MIN_INTERVAL, // TODO: make it configurable
                 host: conf.global.self_monitoring.hostname.clone(),
                 analyzer_ip: dest_ip.clone(),
                 analyzer_port: conf.global.communication.ingester_port,
@@ -1882,19 +2296,6 @@ impl TryFrom<(Config, UserConfig)> for ModuleConfig {
                     os_app_tag_exec_user: conf.inputs.proc.tag_extraction.exec_username.clone(),
                     os_app_tag_exec: conf.inputs.proc.tag_extraction.script_command.clone(),
                     os_proc_sync_enabled: conf.inputs.proc.enabled,
-                    os_proc_sync_tagged_only: conf
-                        .inputs
-                        .proc
-                        .process_matcher
-                        .iter()
-                        .find(|m| {
-                            m.enabled_features
-                                .iter()
-                                .find(|s| s.as_str() == "proc.gprocess_info")
-                                .is_some()
-                                && m.only_with_tag
-                        })
-                        .is_some(),
                 },
                 #[cfg(target_os = "windows")]
                 os_proc_scan_conf: OsProcScanConfig {},
@@ -1905,15 +2306,7 @@ impl TryFrom<(Config, UserConfig)> for ModuleConfig {
             flow: (&conf).into(),
             log_parser: LogParserConfig {
                 l7_log_collect_nps_threshold: conf.outputs.flow_log.throttles.l7_throttle,
-                l7_log_session_aggr_max_timeout: conf
-                    .processors
-                    .request_log
-                    .timeouts
-                    .session_aggregate
-                    .iter()
-                    .map(|app| app.timeout)
-                    .max()
-                    .unwrap_or(Duration::ZERO),
+                l7_log_session_aggr_max_timeout: conf.processors.request_log.timeouts.max(),
                 l7_log_session_aggr_timeout: conf
                     .processors
                     .request_log
@@ -1927,58 +2320,7 @@ impl TryFrom<(Config, UserConfig)> for ModuleConfig {
                     .request_log
                     .tunning
                     .session_aggregate_max_entries,
-                l7_log_dynamic: L7LogDynamicConfig::new(
-                    conf.processors
-                        .request_log
-                        .tag_extraction
-                        .tracing_tag
-                        .http_real_client
-                        .iter()
-                        .map(|x| x.to_ascii_lowercase())
-                        .collect(),
-                    conf.processors
-                        .request_log
-                        .tag_extraction
-                        .tracing_tag
-                        .x_request_id
-                        .iter()
-                        .map(|x| x.to_ascii_lowercase())
-                        .collect(),
-                    conf.processors
-                        .request_log
-                        .tag_extraction
-                        .tracing_tag
-                        .apm_trace_id
-                        .iter()
-                        .map(|item| TraceType::from(item.as_str()))
-                        .collect(),
-                    conf.processors
-                        .request_log
-                        .tag_extraction
-                        .tracing_tag
-                        .apm_span_id
-                        .iter()
-                        .map(|item| TraceType::from(item.as_str()))
-                        .collect(),
-                    ExtraLogFields {
-                        http: conf
-                            .processors
-                            .request_log
-                            .tag_extraction
-                            .custom_fields
-                            .get("HTTP")
-                            .map(|c| c.iter().map(|f| ExtraLogFieldsInfo::from(f)).collect())
-                            .unwrap_or(vec![]),
-                        http2: conf
-                            .processors
-                            .request_log
-                            .tag_extraction
-                            .custom_fields
-                            .get("HTTP2")
-                            .map(|c| c.iter().map(|f| ExtraLogFieldsInfo::from(f)).collect())
-                            .unwrap_or(vec![]),
-                    },
-                ),
+                l7_log_dynamic: L7LogDynamicConfigBuilder::from(&conf).into(),
                 l7_log_ignore_tap_sides: {
                     let mut tap_sides = [false; TapSide::MAX as usize + 1];
                     for t in conf
@@ -2009,7 +2351,6 @@ impl TryFrom<(Config, UserConfig)> for ModuleConfig {
                         .obfuscate_protocols
                         .as_slice(),
                 ),
-                l7_log_blacklist: conf.processors.request_log.filters.tag_filters.clone(),
                 l7_log_blacklist_trie: {
                     let mut blacklist_trie = HashMap::new();
                     for (k, v) in conf.processors.request_log.filters.tag_filters.iter() {
@@ -2018,17 +2359,13 @@ impl TryFrom<(Config, UserConfig)> for ModuleConfig {
                             warn!("Unsupported l7_protocol: {:?}", k);
                             continue;
                         }
-                        BlacklistTrie::new(v).map(|x| blacklist_trie.insert(l7_protocol, x));
+                        if let Some(t) = BlacklistTrie::new(v.clone()) {
+                            blacklist_trie.insert(l7_protocol, t);
+                        }
                     }
                     blacklist_trie
                 },
-                unconcerned_dns_nxdomain_response_suffixes: conf
-                    .processors
-                    .request_log
-                    .filters
-                    .unconcerned_dns_nxdomain_response_suffixes
-                    .clone(),
-                unconcerned_dns_nxdomain_trie: DnsNxdomainTrie::from(
+                unconcerned_dns_nxdomain_trie: DomainNameTrie::from(
                     &conf
                         .processors
                         .request_log
@@ -2042,6 +2379,31 @@ impl TryFrom<(Config, UserConfig)> for ModuleConfig {
                     .protocol_special_config
                     .mysql
                     .decompress_payload,
+                mysql_endpoint_disabled: conf
+                    .processors
+                    .request_log
+                    .application_protocol_inference
+                    .protocol_special_config
+                    .mysql
+                    .endpoint_disabled,
+                #[cfg(not(feature = "enterprise"))]
+                custom_app: CustomAppConfig::default(),
+                #[cfg(feature = "enterprise")]
+                custom_app: CustomAppConfig {
+                    version: conf.custom_app.version,
+                    custom_protocol_config: if let Some(config) = conf.custom_app.config.as_ref() {
+                        Some(ExtraCustomProtocolConfig::new(
+                            config.biz_protocol_policies.as_slice(),
+                        ))
+                    } else {
+                        None
+                    },
+                    custom_field_policies: if let Some(config) = conf.custom_app.config.as_ref() {
+                        Some(CustomFieldPolicy::new(config))
+                    } else {
+                        None
+                    },
+                },
             },
             debug: DebugConfig {
                 agent_id: conf.global.common.agent_id as u16,
@@ -2071,13 +2433,13 @@ impl TryFrom<(Config, UserConfig)> for ModuleConfig {
                 },
                 host: conf.global.self_monitoring.hostname.clone(),
             },
-            #[cfg(any(target_os = "linux", target_os = "android"))]
+            #[cfg(all(unix, feature = "libtrace"))]
             ebpf: EbpfConfig {
                 collector_enabled: conf.outputs.flow_metrics.enabled,
                 l7_metrics_enabled: conf.outputs.flow_metrics.filters.apm_metrics,
                 agent_id: conf.global.common.agent_id as u16,
                 epc_id: conf.global.common.vpc_id,
-                l7_log_packet_size: CAP_LEN_MAX
+                l7_log_packet_size: crate::ebpf::CAP_LEN_MAX
                     .min(conf.processors.request_log.tunning.payload_truncation as usize),
                 l7_log_tap_types: generate_tap_types_array(
                     &conf.outputs.flow_log.filters.l7_capture_network_types,
@@ -2289,7 +2651,7 @@ impl ConfigHandler {
         )
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(unix, feature = "libtrace"))]
     pub fn ebpf(&self) -> EbpfAccess {
         Map::new(self.current_config.clone(), |config| -> &EbpfConfig {
             &config.ebpf
@@ -2310,7 +2672,7 @@ impl ConfigHandler {
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn set_process_scheduling_priority(process_scheduling_priority: usize) {
+    fn set_process_scheduling_priority(process_scheduling_priority: isize) {
         let pid = std::process::id();
         unsafe {
             if libc::setpriority(
@@ -2323,6 +2685,102 @@ impl ConfigHandler {
                     "Process scheduling priority set {} to pid {} error.",
                     process_scheduling_priority, pid
                 );
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn procfs_error_to_io(error: ProcError) -> io::Error {
+        let kind = match &error {
+            ProcError::PermissionDenied(_) => io::ErrorKind::PermissionDenied,
+            ProcError::NotFound(_) => io::ErrorKind::NotFound,
+            ProcError::Incomplete(_) => io::ErrorKind::UnexpectedEof,
+            ProcError::Io(inner, _) => inner.kind(),
+            ProcError::Other(_) | ProcError::InternalError(_) => io::ErrorKind::Other,
+        };
+        io::Error::new(kind, error)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn should_skip_cpu_affinity(thread_name: &str) -> bool {
+        // `kick-kern.*` threads are self-managed eBPF per-CPU kickers.
+        thread_name.starts_with("kick-kern.")
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn set_cpu_affinity_for_all_threads(cpu_set: &CpuSet) -> io::Result<()> {
+        const MAX_AFFINITY_SYNC_PASSES: usize = 3;
+
+        let mut processed_thread_ids = HashSet::new();
+        let mut first_error: Option<io::Error> = None;
+
+        for _ in 0..MAX_AFFINITY_SYNC_PASSES {
+            let mut saw_new_thread = false;
+            let process = Process::myself().map_err(Self::procfs_error_to_io)?;
+            let tasks = process.tasks().map_err(Self::procfs_error_to_io)?;
+
+            for task in tasks {
+                let task = match task {
+                    Ok(task) => task,
+                    Err(ProcError::NotFound(_)) => continue,
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error = Some(Self::procfs_error_to_io(e));
+                        }
+                        continue;
+                    }
+                };
+                let thread_id = task.tid;
+                saw_new_thread |= processed_thread_ids.insert(thread_id);
+
+                let thread_name = match task.status() {
+                    Ok(status) => status.name,
+                    Err(ProcError::NotFound(_)) => continue,
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error = Some(Self::procfs_error_to_io(e));
+                        }
+                        continue;
+                    }
+                };
+
+                if Self::should_skip_cpu_affinity(&thread_name) {
+                    continue;
+                }
+
+                if let Err(e) = sched_setaffinity(Pid::from_raw(thread_id), cpu_set) {
+                    if e == nix::errno::Errno::ESRCH {
+                        continue;
+                    }
+                    if first_error.is_none() {
+                        first_error = Some(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!(
+                                "CPU Affinity({:?}) bind error for thread {} ({}): {:?}",
+                                cpu_set, thread_id, thread_name, e
+                            ),
+                        ));
+                    }
+                }
+            }
+
+            if !saw_new_thread {
+                break;
+            }
+        }
+
+        first_error.map_or(Ok(()), Err)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn set_swap_disabled() {
+        unsafe {
+            if mlockall(MCL_CURRENT | MCL_FUTURE) != 0 {
+                warn!(
+                    "Failed to lock memory pages. Need CAP_IPC_LOCK capability or root privileges."
+                );
+            } else {
+                info!("All memory pages are now locked and won't be swapped out.");
             }
         }
     }
@@ -2357,8 +2815,7 @@ impl ConfigHandler {
         if invalid_config {
             warn!("Invalid CPU Affinity config {:?}.", cpu_affinity);
         } else {
-            let pid = std::process::id() as i32;
-            if let Err(e) = sched_setaffinity(Pid::from_raw(pid), &cpu_set) {
+            if let Err(e) = Self::set_cpu_affinity_for_all_threads(cpu_set) {
                 warn!("CPU Affinity({:?}) bind error: {:?}.", &cpu_set, e);
             }
         }
@@ -2397,8 +2854,8 @@ impl ConfigHandler {
             .as_ref()
             .map(|re| public::netns::find_ns_files_by_regex(&re));
         if old_netns != new_netns {
-            info!(
-                "query net namespaces changed from {:?} to {:?}, restart agent to create dispatcher for extra namespaces, deepflow-agent restart...",
+            warn!(
+                "inputs.cbpf.af_packet.extra_netns_regex namespace set changed ({:?} -> {:?}), deepflow-agent restart...",
                 old_netns, new_netns
             );
             crate::utils::clean_and_exit(public::consts::NORMAL_EXIT_WITH_RESTART);
@@ -2492,12 +2949,12 @@ impl ConfigHandler {
         }
     }
 
-    fn set_log_retention(
+    fn set_log_retention_and_path(
         logger_handle: &mut Option<LoggerHandle>,
         log_retention: &Duration,
         log_file: &String,
     ) -> bool {
-        let log_retention = (log_retention.as_secs() / 3600 / 24).min(1);
+        let log_retention = (log_retention.as_secs() / 3600 / 24).max(1);
         match logger_handle.as_mut() {
             Some(h) => match h.flw_config() {
                 Err(FlexiLoggerError::NoFileLogger) => {
@@ -2509,7 +2966,10 @@ impl ConfigHandler {
                         .rotate(
                             Criterion::Age(Age::Day),
                             Naming::Timestamps,
-                            Cleanup::KeepLogFiles(log_retention as usize),
+                            Cleanup::KeepLogAndCompressedFiles(
+                                DEFAULT_LOG_UNCOMPRESSED_FILE_COUNT,
+                                log_retention as usize,
+                            ),
                         )
                         .create_symlink(log_file)
                         .append(),
@@ -2557,7 +3017,7 @@ impl ConfigHandler {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "libtrace"))]
     fn set_ebpf(handler: &ConfigHandler, components: &mut AgentComponents) {
         if let Some(d) = components.ebpf_dispatcher_component.as_mut() {
             d.ebpf_collector
@@ -2602,6 +3062,7 @@ impl ConfigHandler {
         );
     }
 
+    #[cfg(feature = "enterprise-integration")]
     fn set_vector(handler: &ConfigHandler, components: &mut AgentComponents) {
         components.vector_component.on_config_change(
             handler.candidate_config.user_config.inputs.vector.enabled,
@@ -2649,6 +3110,7 @@ impl ConfigHandler {
         &mut self,
         user_config: UserConfig,
         exception_handler: &ExceptionHandler,
+        #[allow(unused)] stats_collector: &stats::Collector, // used for custom_field_policies
         mut components: Option<&mut AgentComponents>,
         #[cfg(target_os = "linux")] api_watcher: &Arc<ApiWatcher>,
         runtime: &Runtime,
@@ -2661,17 +3123,51 @@ impl ConfigHandler {
         let config = &mut candidate_config.user_config;
         let mut new_config: ModuleConfig = (static_config.clone(), user_config).try_into().unwrap();
         let mut callbacks: Vec<fn(&ConfigHandler, &mut AgentComponents)> = vec![];
+        let config_update_started_at = Local::now();
         let mut restart_dispatcher = false;
+        let mut dispatcher_restart_reasons = BTreeSet::<Cow<'static, str>>::new();
         let mut restart_agent = false;
+        let mut agent_restart_reasons = BTreeSet::<Cow<'static, str>>::new();
+        let changed_reason =
+            |key: &'static str, old: &dyn fmt::Debug, new: &dyn fmt::Debug| -> Cow<'static, str> {
+                Cow::Owned(format!("{key}: {old:?} -> {new:?}"))
+            };
+
+        // Batch-update config fields with consistent logging and optional restart-reason capture.
+        //
+        // For each tuple `(old_field, new_field, key)`:
+        // - compare and log when changed,
+        // - optionally append a restart reason when `$restart` is true,
+        // - write `new_field` back to `old_field`,
+        // - OR the computed restart flag into `$restart_flag`.
+        //
+        // Note: this macro is intended for direct field updates only. Keep entries with
+        // side effects/callbacks/non-trivial branching outside this macro to avoid changing behavior.
+        macro_rules! update_fields_with_restart_reason {
+            ($restart_flag:ident, $restart:expr, $reasons:expr, [$(($old:expr, $new:expr, $key:expr)),+ $(,)?]) => {{
+                $(
+                    let old_ref = &mut $old;
+                    let new_ref = &$new;
+                    if *old_ref != *new_ref {
+                        info!("Update {} from {:?} to {:?}.", $key, old_ref, new_ref);
+                        let restart_value = $restart;
+                        let reason = if restart_value {
+                            Some(changed_reason($key, old_ref, new_ref))
+                        } else {
+                            None
+                        };
+                        *old_ref = (*new_ref).clone();
+                        $restart_flag |= restart_value;
+                        if let Some(reason) = reason {
+                            $reasons.insert(reason);
+                        }
+                    }
+                )+
+            }};
+        }
+
         #[cfg(target_os = "windows")]
         let capture_mode = new_config.user_config.inputs.cbpf.common.capture_mode;
-        let log_file = new_config
-            .user_config
-            .global
-            .self_monitoring
-            .log
-            .log_file
-            .clone();
         let logger_handle = &mut self.logger_handle;
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let mut cpu_set = CpuSet::new();
@@ -2683,7 +3179,7 @@ impl ConfigHandler {
         let mut dispatcher_need_reload_config = candidate_config.flow != new_config.flow;
         dispatcher_need_reload_config |= candidate_config.log_parser != new_config.log_parser;
         dispatcher_need_reload_config |= candidate_config.collector != new_config.collector;
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(all(unix, feature = "libtrace"))]
         {
             dispatcher_need_reload_config |= candidate_config.ebpf != new_config.ebpf;
         }
@@ -2693,7 +3189,7 @@ impl ConfigHandler {
                 for dispatcher in c.dispatcher_components.iter() {
                     dispatcher.dispatcher_listener.notify_reload_config();
                 }
-                #[cfg(any(target_os = "linux", target_os = "android"))]
+                #[cfg(all(unix, feature = "libtrace"))]
                 if let Some(d) = c.ebpf_dispatcher_component.as_ref() {
                     d.ebpf_collector.notify_reload_config();
                 }
@@ -2703,38 +3199,33 @@ impl ConfigHandler {
         // inputs
         let af_packet = &mut config.inputs.cbpf.af_packet;
         let new_af_packet = &mut new_config.user_config.inputs.cbpf.af_packet;
-        if af_packet.bpf_filter_disabled != new_af_packet.bpf_filter_disabled {
-            info!(
-                "Update inputs.cbpf.af_packet.bpf_filter_disabled from {:?} to {:?}.",
-                af_packet.bpf_filter_disabled, new_af_packet.bpf_filter_disabled
-            );
-            af_packet.bpf_filter_disabled = new_af_packet.bpf_filter_disabled;
-            restart_agent = !first_run;
-        }
-        if af_packet.skip_npb_bpf != new_af_packet.skip_npb_bpf {
-            info!(
-                "Update inputs.cbpf.af_packet.skip_npb_bpf from {:?} to {:?}.",
-                af_packet.skip_npb_bpf, new_af_packet.skip_npb_bpf
-            );
-            af_packet.skip_npb_bpf = new_af_packet.skip_npb_bpf;
-            restart_agent = !first_run;
-        }
-        if af_packet.bond_interfaces != new_af_packet.bond_interfaces {
-            info!(
-                "Update inputs.cbpf.af_packet.bond_interfaces from {:?} to {:?}.",
-                af_packet.bond_interfaces, new_af_packet.bond_interfaces
-            );
-            af_packet.bond_interfaces = new_af_packet.bond_interfaces.clone();
-            restart_agent = !first_run;
-        }
-        if af_packet.extra_bpf_filter != new_af_packet.extra_bpf_filter {
-            info!(
-                "Update inputs.cbpf.af_packet.extra_bpf_filter from {:?} to {:?}.",
-                af_packet.extra_bpf_filter, new_af_packet.extra_bpf_filter
-            );
-            af_packet.extra_bpf_filter = new_af_packet.extra_bpf_filter.clone();
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    af_packet.bpf_filter_disabled,
+                    new_af_packet.bpf_filter_disabled,
+                    "inputs.cbpf.af_packet.bpf_filter_disabled"
+                ),
+                (
+                    af_packet.skip_npb_bpf,
+                    new_af_packet.skip_npb_bpf,
+                    "inputs.cbpf.af_packet.skip_npb_bpf"
+                ),
+                (
+                    af_packet.bond_interfaces,
+                    new_af_packet.bond_interfaces,
+                    "inputs.cbpf.af_packet.bond_interfaces"
+                ),
+                (
+                    af_packet.extra_bpf_filter,
+                    new_af_packet.extra_bpf_filter,
+                    "inputs.cbpf.af_packet.extra_bpf_filter"
+                )
+            ]
+        );
         if af_packet.extra_netns_regex != new_af_packet.extra_netns_regex {
             info!(
                 "Update inputs.cbpf.af_packet.extra_netns_regex from {:?} to {:?}.",
@@ -2761,18 +3252,16 @@ impl ConfigHandler {
                 callbacks.push(Self::switch_recv_engine);
             }
         }
-        if af_packet.inner_interface_capture_enabled
-            != new_af_packet.inner_interface_capture_enabled
-        {
-            info!(
-                "Update inputs.cbpf.af_packet.inner_interface_capture_enabled from {:?} to {:?}.",
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [(
                 af_packet.inner_interface_capture_enabled,
-                new_af_packet.inner_interface_capture_enabled
-            );
-            af_packet.inner_interface_capture_enabled =
-                new_af_packet.inner_interface_capture_enabled;
-            restart_agent = !first_run;
-        }
+                new_af_packet.inner_interface_capture_enabled,
+                "inputs.cbpf.af_packet.inner_interface_capture_enabled"
+            )]
+        );
         if af_packet.inner_interface_regex != new_af_packet.inner_interface_regex {
             info!(
                 "Update inputs.cbpf.af_packet.inner_interface_regex from {:?} to {:?}.",
@@ -2780,76 +3269,67 @@ impl ConfigHandler {
             );
             af_packet.inner_interface_regex = new_af_packet.inner_interface_regex.clone();
         }
-        if af_packet.src_interfaces != new_af_packet.src_interfaces {
-            info!(
-                "Update inputs.cbpf.af_packet.src_interfaces from {:?} to {:?}.",
-                af_packet.src_interfaces, new_af_packet.src_interfaces
-            );
-            af_packet.src_interfaces = new_af_packet.src_interfaces.clone();
-            restart_agent = !first_run;
-        }
-        if af_packet.vlan_pcp_in_physical_mirror_traffic
-            != new_af_packet.vlan_pcp_in_physical_mirror_traffic
-        {
-            info!(
-                "Update inputs.cbpf.af_packet.vlan_pcp_in_physical_mirror_traffic from {:?} to {:?}.",
-                af_packet.vlan_pcp_in_physical_mirror_traffic,
-                new_af_packet.vlan_pcp_in_physical_mirror_traffic
-            );
-            af_packet.vlan_pcp_in_physical_mirror_traffic =
-                new_af_packet.vlan_pcp_in_physical_mirror_traffic;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    af_packet.src_interfaces,
+                    new_af_packet.src_interfaces,
+                    "inputs.cbpf.af_packet.src_interfaces"
+                ),
+                (
+                    af_packet.vlan_pcp_in_physical_mirror_traffic,
+                    new_af_packet.vlan_pcp_in_physical_mirror_traffic,
+                    "inputs.cbpf.af_packet.vlan_pcp_in_physical_mirror_traffic"
+                )
+            ]
+        );
         let tunning = &mut af_packet.tunning;
         let new_tunning = &mut new_af_packet.tunning;
-        if tunning.ring_blocks_enabled != new_tunning.ring_blocks_enabled {
-            info!(
-                "Update inputs.cbpf.af_packet.tunning.ring_blocks_enabled from {:?} to {:?}.",
-                tunning.ring_blocks_enabled, new_tunning.ring_blocks_enabled
-            );
-            tunning.ring_blocks_enabled = new_tunning.ring_blocks_enabled;
-            restart_agent = !first_run;
-        }
-        if tunning.packet_fanout_count != new_tunning.packet_fanout_count {
-            info!(
-                "Update inputs.cbpf.af_packet.tunning.packet_fanout_count from {:?} to {:?}.",
-                tunning.packet_fanout_count, new_tunning.packet_fanout_count
-            );
-            tunning.packet_fanout_count = new_tunning.packet_fanout_count;
-            restart_agent = !first_run;
-        }
-        if tunning.packet_fanout_mode != new_tunning.packet_fanout_mode {
-            info!(
-                "Update inputs.cbpf.af_packet.tunning.packet_fanout_mode from {:?} to {:?}.",
-                tunning.packet_fanout_mode, new_tunning.packet_fanout_mode
-            );
-            tunning.packet_fanout_mode = new_tunning.packet_fanout_mode;
-            restart_agent = !first_run;
-        }
-        if tunning.promisc != new_tunning.promisc {
-            info!(
-                "Update inputs.cbpf.af_packet.tunning.interface_promisc_enabled from {:?} to {:?}.",
-                tunning.promisc, new_tunning.promisc
-            );
-            tunning.promisc = new_tunning.promisc;
-            restart_agent = !first_run;
-        }
-        if tunning.ring_blocks != new_tunning.ring_blocks {
-            info!(
-                "Update inputs.cbpf.af_packet.tunning.ring_blocks from {:?} to {:?}.",
-                tunning.ring_blocks, new_tunning.ring_blocks
-            );
-            tunning.ring_blocks = new_tunning.ring_blocks;
-            restart_agent = !first_run;
-        }
-        if tunning.socket_version != new_tunning.socket_version {
-            info!(
-                "Update inputs.cbpf.af_packet.tunning.socket_version from {:?} to {:?}.",
-                tunning.socket_version, new_tunning.socket_version
-            );
-            tunning.socket_version = new_tunning.socket_version;
-            restart_dispatcher = !cfg!(target_os = "windows");
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    tunning.ring_blocks_enabled,
+                    new_tunning.ring_blocks_enabled,
+                    "inputs.cbpf.af_packet.tunning.ring_blocks_enabled"
+                ),
+                (
+                    tunning.packet_fanout_count,
+                    new_tunning.packet_fanout_count,
+                    "inputs.cbpf.af_packet.tunning.packet_fanout_count"
+                ),
+                (
+                    tunning.packet_fanout_mode,
+                    new_tunning.packet_fanout_mode,
+                    "inputs.cbpf.af_packet.tunning.packet_fanout_mode"
+                ),
+                (
+                    tunning.promisc,
+                    new_tunning.promisc,
+                    "inputs.cbpf.af_packet.tunning.interface_promisc_enabled"
+                ),
+                (
+                    tunning.ring_blocks,
+                    new_tunning.ring_blocks,
+                    "inputs.cbpf.af_packet.tunning.ring_blocks"
+                )
+            ]
+        );
+        update_fields_with_restart_reason!(
+            restart_dispatcher,
+            !cfg!(target_os = "windows"),
+            dispatcher_restart_reasons,
+            [(
+                tunning.socket_version,
+                new_tunning.socket_version,
+                "inputs.cbpf.af_packet.tunning.socket_version"
+            )]
+        );
 
         let packet_fanout_count = config.inputs.cbpf.af_packet.tunning.packet_fanout_count;
         let common = &mut config.inputs.cbpf.common;
@@ -2859,11 +3339,17 @@ impl ConfigHandler {
                 "Update inputs.cbpf.common.capture_mode from {:?} to {:?}.",
                 common.capture_mode, new_common.capture_mode
             );
+            let old_capture_mode = common.capture_mode;
             common.capture_mode = new_common.capture_mode;
             candidate_config.capture_mode = new_common.capture_mode;
             if let Some(c) = components.as_mut() {
                 if packet_fanout_count > 1 {
-                    info!("capture_mode changes and fanout is enabled, deepflow-agent restart...");
+                    warn!(
+                        "inputs.cbpf.common.capture_mode changed ({:?} -> {:?}) with inputs.cbpf.af_packet.tunning.packet_fanout_count={} (>1), deepflow-agent restart...",
+                        old_capture_mode,
+                        new_common.capture_mode,
+                        packet_fanout_count
+                    );
                     crate::utils::clean_and_exit(public::consts::NORMAL_EXIT_WITH_RESTART);
                     return vec![];
                 } else {
@@ -2871,7 +3357,15 @@ impl ConfigHandler {
                     c.clear_dispatcher_components();
                 }
             }
-            restart_agent = !first_run;
+            let restart_value = !first_run;
+            restart_agent |= restart_value;
+            if restart_value {
+                agent_restart_reasons.insert(changed_reason(
+                    "inputs.cbpf.common.capture_mode",
+                    &old_capture_mode,
+                    &new_common.capture_mode,
+                ));
+            }
         }
         if candidate_config.capture_mode != PacketCaptureType::Analyzer
             && !running_in_container()
@@ -2887,53 +3381,41 @@ impl ConfigHandler {
 
         let physical_mirror = &mut config.inputs.cbpf.physical_mirror;
         let new_physical_mirror = &mut new_config.user_config.inputs.cbpf.physical_mirror;
-        if physical_mirror.packet_dedup_disabled != new_physical_mirror.packet_dedup_disabled {
-            info!(
-                "Update inputs.cbpf.physical_mirror.packet_dedup_disabled from {:?} to {:?}.",
-                physical_mirror.packet_dedup_disabled, new_physical_mirror.packet_dedup_disabled
-            );
-            physical_mirror.packet_dedup_disabled = new_physical_mirror.packet_dedup_disabled;
-            restart_agent = !first_run;
-        }
-        if physical_mirror.private_cloud_gateway_traffic
-            != new_physical_mirror.private_cloud_gateway_traffic
-        {
-            info!(
-                "Update inputs.cbpf.physical_mirror.private_cloud_gateway_traffic from {:?} to {:?}.",
-                physical_mirror.private_cloud_gateway_traffic,
-                new_physical_mirror.private_cloud_gateway_traffic
-            );
-            physical_mirror.private_cloud_gateway_traffic =
-                new_physical_mirror.private_cloud_gateway_traffic;
-            restart_agent = !first_run;
-        }
-        if physical_mirror.default_capture_network_type
-            != new_physical_mirror.default_capture_network_type
-        {
-            info!(
-                "Update inputs.cbpf.physical_mirror.default_capture_network_type from {:?} to {:?}.",
-                physical_mirror.default_capture_network_type,
-                new_physical_mirror.default_capture_network_type
-            );
-            physical_mirror.default_capture_network_type =
-                new_physical_mirror.default_capture_network_type;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    physical_mirror.packet_dedup_disabled,
+                    new_physical_mirror.packet_dedup_disabled,
+                    "inputs.cbpf.physical_mirror.packet_dedup_disabled"
+                ),
+                (
+                    physical_mirror.private_cloud_gateway_traffic,
+                    new_physical_mirror.private_cloud_gateway_traffic,
+                    "inputs.cbpf.physical_mirror.private_cloud_gateway_traffic"
+                ),
+                (
+                    physical_mirror.default_capture_network_type,
+                    new_physical_mirror.default_capture_network_type,
+                    "inputs.cbpf.physical_mirror.default_capture_network_type"
+                )
+            ]
+        );
 
         let preprocess = &mut config.inputs.cbpf.preprocess;
         let new_preprocess = &mut new_config.user_config.inputs.cbpf.preprocess;
-        if preprocess.packet_segmentation_reassembly
-            != new_preprocess.packet_segmentation_reassembly
-        {
-            info!(
-                "Update inputs.cbpf.preprocess.packet_segmentation_reassembly from {:?} to {:?}.",
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [(
                 preprocess.packet_segmentation_reassembly,
-                new_preprocess.packet_segmentation_reassembly
-            );
-            preprocess.packet_segmentation_reassembly =
-                new_preprocess.packet_segmentation_reassembly.clone();
-            restart_agent = !first_run;
-        }
+                new_preprocess.packet_segmentation_reassembly,
+                "inputs.cbpf.preprocess.packet_segmentation_reassembly"
+            )]
+        );
         if preprocess.tunnel_decap_protocols != new_preprocess.tunnel_decap_protocols {
             info!(
                 "Update inputs.cbpf.preprocess.tunnel_decap_protocols from {:?} to {:?}.",
@@ -2941,87 +3423,78 @@ impl ConfigHandler {
             );
             preprocess.tunnel_decap_protocols = new_preprocess.tunnel_decap_protocols.clone();
         }
-        if preprocess.tunnel_trim_protocols != new_preprocess.tunnel_trim_protocols {
-            info!(
-                "Update inputs.cbpf.preprocess.tunnel_trim_protocols from {:?} to {:?}.",
-                preprocess.tunnel_trim_protocols, new_preprocess.tunnel_trim_protocols
-            );
-            preprocess.tunnel_trim_protocols = new_preprocess.tunnel_trim_protocols.clone();
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [(
+                preprocess.tunnel_trim_protocols,
+                new_preprocess.tunnel_trim_protocols,
+                "inputs.cbpf.preprocess.tunnel_trim_protocols"
+            )]
+        );
 
         let special_network = &mut config.inputs.cbpf.special_network;
         let new_special_network = &mut new_config.user_config.inputs.cbpf.special_network;
-        if special_network.dpdk.source != new_special_network.dpdk.source {
-            info!(
-                "Update inputs.cbpf.special_network.dpdk.source from {:?} to {:?}.",
-                special_network.dpdk.source, new_special_network.dpdk.source
-            );
-            special_network.dpdk.source = new_special_network.dpdk.source;
-            restart_agent = !first_run;
-        }
-        if special_network.dpdk.reorder_cache_window_size
-            != new_special_network.dpdk.reorder_cache_window_size
-        {
-            info!(
-                "Update inputs.cbpf.special_network.dpdk.reorder_cache_window_size from {:?} to {:?}.",
-                special_network.dpdk.reorder_cache_window_size,
-                new_special_network.dpdk.reorder_cache_window_size
-            );
-            special_network.dpdk.reorder_cache_window_size =
-                new_special_network.dpdk.reorder_cache_window_size;
-            restart_agent = !first_run;
-        }
-        if special_network.libpcap.enabled != new_special_network.libpcap.enabled {
-            info!(
-                "Update inputs.cbpf.special_network.libpcap.enabled from {:?} to {:?}.",
-                special_network.libpcap.enabled, new_special_network.libpcap.enabled
-            );
-            special_network.libpcap.enabled = new_special_network.libpcap.enabled;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    special_network.dpdk.source,
+                    new_special_network.dpdk.source,
+                    "inputs.cbpf.special_network.dpdk.source"
+                ),
+                (
+                    special_network.dpdk.reorder_cache_window_size,
+                    new_special_network.dpdk.reorder_cache_window_size,
+                    "inputs.cbpf.special_network.dpdk.reorder_cache_window_size"
+                ),
+                (
+                    special_network.libpcap.enabled,
+                    new_special_network.libpcap.enabled,
+                    "inputs.cbpf.special_network.libpcap.enabled"
+                ),
+                (
+                    special_network.vhost_user.vhost_socket_path,
+                    new_special_network.vhost_user.vhost_socket_path,
+                    "inputs.cbpf.special_network.vhost_user.vhost_socket_path"
+                )
+            ]
+        );
 
         let physical_switch = &mut special_network.physical_switch;
         let new_physical_switch = &mut new_special_network.physical_switch;
-        if physical_switch.netflow_ports != new_physical_switch.netflow_ports {
-            info!(
-                "Update inputs.cbpf.special_network.physical_switch.netflow_ports  from {:?} to {:?}.",
-                physical_switch.netflow_ports, new_physical_switch.netflow_ports
-            );
-            physical_switch.netflow_ports = new_physical_switch.netflow_ports.clone();
-            restart_agent = !first_run;
-        }
-        if physical_switch.sflow_ports != new_physical_switch.sflow_ports {
-            info!(
-                "Update inputs.cbpf.special_network.physical_switch.sflow_ports  from {:?} to {:?}.",
-                physical_switch.sflow_ports, new_physical_switch.sflow_ports
-            );
-            physical_switch.sflow_ports = new_physical_switch.sflow_ports.clone();
-            restart_agent = !first_run;
-        }
-        if special_network.vhost_user.vhost_socket_path
-            != new_special_network.vhost_user.vhost_socket_path
-        {
-            info!(
-                "Update inputs.cbpf.special_network.vhost_user.vhost_socket_path from {:?} to {:?}.",
-                special_network.vhost_user.vhost_socket_path,
-                new_special_network.vhost_user.vhost_socket_path
-            );
-            special_network.vhost_user.vhost_socket_path =
-                new_special_network.vhost_user.vhost_socket_path.clone();
-            restart_agent = !first_run;
-        }
-
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    physical_switch.netflow_ports,
+                    new_physical_switch.netflow_ports,
+                    "inputs.cbpf.special_network.physical_switch.netflow_ports"
+                ),
+                (
+                    physical_switch.sflow_ports,
+                    new_physical_switch.sflow_ports,
+                    "inputs.cbpf.special_network.physical_switch.sflow_ports"
+                )
+            ]
+        );
         let tunning = &mut config.inputs.cbpf.tunning;
         let new_tunning = &mut new_config.user_config.inputs.cbpf.tunning;
-        if tunning.dispatcher_queue_enabled != new_tunning.dispatcher_queue_enabled {
-            info!(
-                "Update inputs.cbpf.tunning.dispatcher_queue_enabled from {:?} to {:?}.",
-                tunning.dispatcher_queue_enabled, new_tunning.dispatcher_queue_enabled
-            );
-            tunning.dispatcher_queue_enabled = new_tunning.dispatcher_queue_enabled;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [(
+                tunning.dispatcher_queue_enabled,
+                new_tunning.dispatcher_queue_enabled,
+                "inputs.cbpf.tunning.dispatcher_queue_enabled"
+            )]
+        );
         if tunning.max_capture_packet_size != new_tunning.max_capture_packet_size {
             info!(
                 "Update inputs.cbpf.tunning.max_capture_packet_size from {:?} to {:?}.",
@@ -3037,444 +3510,452 @@ impl ConfigHandler {
             tunning.max_capture_pps = new_tunning.max_capture_pps;
             callbacks.push(Self::leaky_bucket_callback);
         }
-        if tunning.raw_packet_buffer_block_size != new_tunning.raw_packet_buffer_block_size {
-            info!(
-                "Update inputs.cbpf.tunning.raw_packet_buffer_block_size from {:?} to {:?}.",
-                tunning.raw_packet_buffer_block_size, new_tunning.raw_packet_buffer_block_size
-            );
-            tunning.raw_packet_buffer_block_size = new_tunning.raw_packet_buffer_block_size;
-            restart_agent = !first_run;
-        }
-        if tunning.raw_packet_queue_size != new_tunning.raw_packet_queue_size {
-            info!(
-                "Update inputs.cbpf.tunning.raw_packet_queue_size from {:?} to {:?}.",
-                tunning.raw_packet_queue_size, new_tunning.raw_packet_queue_size
-            );
-            tunning.raw_packet_queue_size = new_tunning.raw_packet_queue_size;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    tunning.raw_packet_buffer_block_size,
+                    new_tunning.raw_packet_buffer_block_size,
+                    "inputs.cbpf.tunning.raw_packet_buffer_block_size"
+                ),
+                (
+                    tunning.raw_packet_queue_size,
+                    new_tunning.raw_packet_queue_size,
+                    "inputs.cbpf.tunning.raw_packet_queue_size"
+                )
+            ]
+        );
 
         let ebpf = &mut config.inputs.ebpf;
         let new_ebpf = &mut new_config.user_config.inputs.ebpf;
-        if ebpf.disabled != new_ebpf.disabled {
-            info!(
-                "Update inputs.ebpf.disabled from {:?} to {:?}.",
-                ebpf.disabled, new_ebpf.disabled
-            );
-            ebpf.disabled = new_ebpf.disabled;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [(ebpf.disabled, new_ebpf.disabled, "inputs.ebpf.disabled")]
+        );
 
         let io_event = &mut ebpf.file.io_event;
         let new_io_event = &mut new_ebpf.file.io_event;
-        if io_event.collect_mode != new_io_event.collect_mode {
-            info!(
-                "Update inputs.ebpf.file.io_event.collect_mode from {:?} to {:?}.",
-                io_event.collect_mode, new_io_event.collect_mode
-            );
-            io_event.collect_mode = new_io_event.collect_mode;
-            restart_agent = !first_run;
-        }
-        if io_event.minimal_duration != new_io_event.minimal_duration {
-            info!(
-                "Update inputs.ebpf.file.io_event.minimal_duration from {:?} to {:?}.",
-                io_event.minimal_duration, new_io_event.minimal_duration
-            );
-            io_event.minimal_duration = new_io_event.minimal_duration;
-            restart_agent = !first_run;
-        }
-        if ebpf.java_symbol_file_refresh_defer_interval
-            != new_ebpf.java_symbol_file_refresh_defer_interval
-        {
-            info!(
-                "Update inputs.ebpf.java_symbol_file_refresh_defer_interval from {:?} to {:?}.",
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    io_event.collect_mode,
+                    new_io_event.collect_mode,
+                    "inputs.ebpf.file.io_event.collect_mode"
+                ),
+                (
+                    io_event.minimal_duration,
+                    new_io_event.minimal_duration,
+                    "inputs.ebpf.file.io_event.minimal_duration"
+                ),
+                (
+                    io_event.enable_virtual_file_collect,
+                    new_io_event.enable_virtual_file_collect,
+                    "inputs.ebpf.file.io_event.enable_virtual_file_collect"
+                )
+            ]
+        );
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [(
                 ebpf.java_symbol_file_refresh_defer_interval,
-                new_ebpf.java_symbol_file_refresh_defer_interval
-            );
-            ebpf.java_symbol_file_refresh_defer_interval =
-                new_ebpf.java_symbol_file_refresh_defer_interval;
-            restart_agent = !first_run;
-        }
+                new_ebpf.java_symbol_file_refresh_defer_interval,
+                "inputs.ebpf.java_symbol_file_refresh_defer_interval"
+            )]
+        );
 
         let on_cpu = &mut ebpf.profile.on_cpu;
         let new_on_cpu = &mut new_ebpf.profile.on_cpu;
-        if on_cpu.aggregate_by_cpu != new_on_cpu.aggregate_by_cpu {
-            info!(
-                "Update inputs.ebpf.profile.on_cpu.aggregate_by_cpu from {:?} to {:?}.",
-                on_cpu.aggregate_by_cpu, new_on_cpu.aggregate_by_cpu
-            );
-            on_cpu.aggregate_by_cpu = new_on_cpu.aggregate_by_cpu;
-            restart_agent = !first_run;
-        }
-        if on_cpu.disabled != new_on_cpu.disabled {
-            info!(
-                "Update inputs.ebpf.profile.on_cpu.disabled from {:?} to {:?}.",
-                on_cpu.disabled, new_on_cpu.disabled
-            );
-            on_cpu.disabled = new_on_cpu.disabled;
-            restart_agent = !first_run;
-        }
-        if on_cpu.sampling_frequency != new_on_cpu.sampling_frequency {
-            info!(
-                "Update inputs.ebpf.profile.on_cpu.sampling_frequency from {:?} to {:?}.",
-                on_cpu.sampling_frequency, new_on_cpu.sampling_frequency
-            );
-            on_cpu.sampling_frequency = new_on_cpu.sampling_frequency;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    on_cpu.aggregate_by_cpu,
+                    new_on_cpu.aggregate_by_cpu,
+                    "inputs.ebpf.profile.on_cpu.aggregate_by_cpu"
+                ),
+                (
+                    on_cpu.disabled,
+                    new_on_cpu.disabled,
+                    "inputs.ebpf.profile.on_cpu.disabled"
+                ),
+                (
+                    on_cpu.sampling_frequency,
+                    new_on_cpu.sampling_frequency,
+                    "inputs.ebpf.profile.on_cpu.sampling_frequency"
+                )
+            ]
+        );
 
         let memory = &mut ebpf.profile.memory;
         let new_memory = &mut new_ebpf.profile.memory;
-        if memory.disabled != new_memory.disabled {
-            info!(
-                "Update inputs.ebpf.profile.memory.disabled from {:?} to {:?}.",
-                memory.disabled, new_memory.disabled
-            );
-            memory.disabled = new_memory.disabled;
-            restart_agent = !first_run;
-        }
-        if memory.report_interval != new_memory.report_interval {
-            info!(
-                "Update inputs.ebpf.profile.memory.report_interval from {:?} to {:?}.",
-                memory.report_interval, new_memory.report_interval
-            );
-            memory.report_interval = new_memory.report_interval;
-            restart_agent = !first_run;
-        }
-        if memory.allocated_addresses_lru_len != new_memory.allocated_addresses_lru_len {
-            info!(
-                "Update inputs.ebpf.profile.memory.allocated_addresses_lru_len from {:?} to {:?}.",
-                memory.allocated_addresses_lru_len, new_memory.allocated_addresses_lru_len
-            );
-            memory.allocated_addresses_lru_len = new_memory.allocated_addresses_lru_len;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    memory.disabled,
+                    new_memory.disabled,
+                    "inputs.ebpf.profile.memory.disabled"
+                ),
+                (
+                    memory.queue_size,
+                    new_memory.queue_size,
+                    "inputs.ebpf.profile.memory.queue_size"
+                )
+            ]
+        );
+        *memory = *new_memory;
 
         let off_cpu = &mut ebpf.profile.off_cpu;
         let new_off_cpu = &mut new_ebpf.profile.off_cpu;
-        if off_cpu.aggregate_by_cpu != new_off_cpu.aggregate_by_cpu {
-            info!(
-                "Update inputs.ebpf.profile.off_cpu.aggregate_by_cpu from {:?} to {:?}.",
-                off_cpu.aggregate_by_cpu, new_off_cpu.aggregate_by_cpu
-            );
-            off_cpu.aggregate_by_cpu = new_off_cpu.aggregate_by_cpu;
-            restart_agent = !first_run;
-        }
-        if off_cpu.disabled != new_off_cpu.disabled {
-            info!(
-                "Update inputs.ebpf.profile.off_cpu.disabled from {:?} to {:?}.",
-                off_cpu.disabled, new_off_cpu.disabled
-            );
-            off_cpu.disabled = new_off_cpu.disabled;
-            restart_agent = !first_run;
-        }
-        if off_cpu.min_blocking_time != new_off_cpu.min_blocking_time {
-            info!(
-                "Update inputs.ebpf.profile.off_cpu.min_blocking_time from {:?} to {:?}.",
-                off_cpu.min_blocking_time, new_off_cpu.min_blocking_time
-            );
-            off_cpu.min_blocking_time = new_off_cpu.min_blocking_time;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    off_cpu.aggregate_by_cpu,
+                    new_off_cpu.aggregate_by_cpu,
+                    "inputs.ebpf.profile.off_cpu.aggregate_by_cpu"
+                ),
+                (
+                    off_cpu.disabled,
+                    new_off_cpu.disabled,
+                    "inputs.ebpf.profile.off_cpu.disabled"
+                ),
+                (
+                    off_cpu.min_blocking_time,
+                    new_off_cpu.min_blocking_time,
+                    "inputs.ebpf.profile.off_cpu.min_blocking_time"
+                )
+            ]
+        );
 
-        if ebpf.profile.preprocess.stack_compression
-            != new_ebpf.profile.preprocess.stack_compression
-        {
-            info!(
-                "Update inputs.ebpf.profile.preprocess.stack_compression from {:?} to {:?}.",
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [(
                 ebpf.profile.preprocess.stack_compression,
-                new_ebpf.profile.preprocess.stack_compression
-            );
-            ebpf.profile.preprocess.stack_compression =
-                new_ebpf.profile.preprocess.stack_compression;
-            restart_agent = !first_run;
-        }
+                new_ebpf.profile.preprocess.stack_compression,
+                "inputs.ebpf.profile.preprocess.stack_compression"
+            )]
+        );
 
         let unwinding = &mut ebpf.profile.unwinding;
         let new_unwinding = &mut new_ebpf.profile.unwinding;
-        if unwinding.dwarf_disabled != new_unwinding.dwarf_disabled {
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    unwinding.dwarf_disabled,
+                    new_unwinding.dwarf_disabled,
+                    "inputs.ebpf.profile.unwinding.dwarf_disabled"
+                ),
+                (
+                    unwinding.dwarf_process_map_size,
+                    new_unwinding.dwarf_process_map_size,
+                    "inputs.ebpf.profile.unwinding.dwarf_process_map_size"
+                ),
+                (
+                    unwinding.dwarf_regex,
+                    new_unwinding.dwarf_regex,
+                    "inputs.ebpf.profile.unwinding.dwarf_regex"
+                ),
+                (
+                    unwinding.dwarf_shard_map_size,
+                    new_unwinding.dwarf_shard_map_size,
+                    "inputs.ebpf.profile.unwinding.dwarf_shard_map_size"
+                )
+            ]
+        );
+
+        // The hot-update configuration items in ebpf.network are handled within the set_ebpf() callback.
+        let network = &mut ebpf.network;
+        let new_network = &mut new_ebpf.network;
+
+        if network.nic_opt_enabled != new_network.nic_opt_enabled {
             info!(
-                "Update inputs.ebpf.profile.unwinding.dwarf_disabled from {:?} to {:?}.",
-                unwinding.dwarf_disabled, new_unwinding.dwarf_disabled
+                "Update inputs.ebpf.network.nic_opt_enabled from {:?} to {:?}.",
+                network.nic_opt_enabled, new_network.nic_opt_enabled
             );
-            unwinding.dwarf_disabled = new_unwinding.dwarf_disabled;
-            restart_agent = !first_run;
+            network.nic_opt_enabled = new_network.nic_opt_enabled;
         }
-        if unwinding.dwarf_process_map_size != new_unwinding.dwarf_process_map_size {
+
+        if network.nic_optimize != new_network.nic_optimize {
             info!(
-                "Update inputs.ebpf.profile.unwinding.dwarf_process_map_size from {:?} to {:?}.",
-                unwinding.dwarf_process_map_size, new_unwinding.dwarf_process_map_size
+                "Update inputs.ebpf.network.nic_optimize from {:?} to {:?}.",
+                network.nic_optimize, new_network.nic_optimize
             );
-            unwinding.dwarf_process_map_size = new_unwinding.dwarf_process_map_size;
-            restart_agent = !first_run;
-        }
-        if unwinding.dwarf_regex != new_unwinding.dwarf_regex {
-            info!(
-                "Update inputs.ebpf.profile.unwinding.dwarf_regex from {:?} to {:?}.",
-                unwinding.dwarf_regex, new_unwinding.dwarf_regex
-            );
-            unwinding.dwarf_regex = new_unwinding.dwarf_regex.clone();
-            restart_agent = !first_run;
-        }
-        if unwinding.dwarf_shard_map_size != new_unwinding.dwarf_shard_map_size {
-            info!(
-                "Update inputs.ebpf.profile.unwinding.dwarf_shard_map_size from {:?} to {:?}.",
-                unwinding.dwarf_shard_map_size, new_unwinding.dwarf_shard_map_size
-            );
-            unwinding.dwarf_shard_map_size = new_unwinding.dwarf_shard_map_size;
-            restart_agent = !first_run;
+            network.nic_optimize = new_network.nic_optimize.clone();
         }
 
         let kprobe = &mut ebpf.socket.kprobe;
         let new_kprobe = &mut new_ebpf.socket.kprobe;
-        if kprobe.disabled != new_kprobe.disabled {
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    kprobe.disabled,
+                    new_kprobe.disabled,
+                    "inputs.ebpf.socket.kprobe.disabled"
+                ),
+                (
+                    kprobe.enable_unix_socket,
+                    new_kprobe.enable_unix_socket,
+                    "inputs.ebpf.socket.kprobe.enable_unix_socket"
+                ),
+                (
+                    kprobe.blacklist.ports,
+                    new_kprobe.blacklist.ports,
+                    "inputs.ebpf.socket.kprobe.blacklist.ports"
+                ),
+                (
+                    kprobe.whitelist.ports,
+                    new_kprobe.whitelist.ports,
+                    "inputs.ebpf.socket.kprobe.whitelist.ports"
+                )
+            ]
+        );
+
+        let sock_ops = &mut ebpf.socket.sock_ops;
+        let new_sock_ops = &mut new_ebpf.socket.sock_ops;
+        if sock_ops.tcp_option_trace.enabled != new_sock_ops.tcp_option_trace.enabled {
             info!(
-                "Update inputs.ebpf.socket.kprobe.disabled from {:?} to {:?}.",
-                kprobe.disabled, new_kprobe.disabled
+                "Update inputs.ebpf.socket.sock_ops.tcp_option_trace.enabled from {:?} to {:?}.",
+                sock_ops.tcp_option_trace.enabled, new_sock_ops.tcp_option_trace.enabled
             );
-            kprobe.disabled = new_kprobe.disabled;
-            restart_agent = !first_run;
+            sock_ops.tcp_option_trace.enabled = new_sock_ops.tcp_option_trace.enabled;
         }
-        if kprobe.blacklist.ports != new_kprobe.blacklist.ports {
+        if sock_ops.tcp_option_trace.sampling_window_bytes
+            != new_sock_ops.tcp_option_trace.sampling_window_bytes
+        {
             info!(
-                "Update inputs.ebpf.socket.kprobe.blacklist.ports from {:?} to {:?}.",
-                kprobe.blacklist.ports, new_kprobe.blacklist.ports
+                "Update inputs.ebpf.socket.sock_ops.tcp_option_trace.sampling_window_bytes from {:?} to {:?}.",
+                sock_ops.tcp_option_trace.sampling_window_bytes,
+                new_sock_ops.tcp_option_trace.sampling_window_bytes
             );
-            kprobe.blacklist.ports = new_kprobe.blacklist.ports.clone();
-            restart_agent = !first_run;
-        }
-        if kprobe.whitelist.ports != new_kprobe.whitelist.ports {
-            info!(
-                "Update inputs.ebpf.socket.kprobe.whitelist.ports from {:?} to {:?}.",
-                kprobe.whitelist.ports, new_kprobe.whitelist.ports
-            );
-            kprobe.whitelist.ports = new_kprobe.whitelist.ports.clone();
-            restart_agent = !first_run;
+            sock_ops.tcp_option_trace.sampling_window_bytes =
+                new_sock_ops.tcp_option_trace.sampling_window_bytes;
         }
 
         let uprobe = &mut ebpf.socket.uprobe;
         let new_uprobe = &mut new_ebpf.socket.uprobe;
-        if uprobe.tls.enabled != new_uprobe.tls.enabled {
-            info!(
-                "Update inputs.ebpf.socket.uprobe.tls.enabled from {:?} to {:?}.",
-                uprobe.tls.enabled, new_uprobe.tls.enabled
-            );
-            uprobe.tls.enabled = new_uprobe.tls.enabled;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [(
+                uprobe.tls.enabled,
+                new_uprobe.tls.enabled,
+                "inputs.ebpf.socket.uprobe.tls.enabled"
+            )]
+        );
         let golang_uprobe = &mut uprobe.golang;
         let new_golang_uprobe = &mut new_uprobe.golang;
-        if golang_uprobe.enabled != new_golang_uprobe.enabled {
-            info!(
-                "Update inputs.ebpf.socket.uprobe.golang.enabled from {:?} to {:?}.",
-                golang_uprobe.enabled, new_golang_uprobe.enabled
-            );
-            golang_uprobe.enabled = new_golang_uprobe.enabled;
-            restart_agent = !first_run;
-        }
-        if golang_uprobe.tracing_timeout != new_golang_uprobe.tracing_timeout {
-            info!(
-                "Update inputs.ebpf.socket.uprobe.golang.tracing_timeout from {:?} to {:?}.",
-                golang_uprobe.tracing_timeout, new_golang_uprobe.tracing_timeout
-            );
-            golang_uprobe.tracing_timeout = new_golang_uprobe.tracing_timeout;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    golang_uprobe.enabled,
+                    new_golang_uprobe.enabled,
+                    "inputs.ebpf.socket.uprobe.golang.enabled"
+                ),
+                (
+                    golang_uprobe.tracing_timeout,
+                    new_golang_uprobe.tracing_timeout,
+                    "inputs.ebpf.socket.uprobe.golang.tracing_timeout"
+                )
+            ]
+        );
 
         let dpdk_uprobe = &mut uprobe.dpdk;
         let new_dpdk_uprobe = &mut new_uprobe.dpdk;
-        if dpdk_uprobe.command != new_dpdk_uprobe.command {
-            info!(
-                "Update inputs.ebpf.socket.uprobe.dpdk.command from {:?} to {:?}.",
-                dpdk_uprobe.command, new_dpdk_uprobe.command
-            );
-            dpdk_uprobe.command = new_dpdk_uprobe.command.clone();
-            restart_agent = !first_run;
-        }
-        if dpdk_uprobe.rx_hooks != new_dpdk_uprobe.rx_hooks {
-            info!(
-                "Update inputs.ebpf.socket.uprobe.dpdk.rx_hooks from {:?} to {:?}.",
-                dpdk_uprobe.rx_hooks, new_dpdk_uprobe.rx_hooks
-            );
-            dpdk_uprobe.rx_hooks = new_dpdk_uprobe.rx_hooks.clone();
-            restart_agent = !first_run;
-        }
-        if dpdk_uprobe.tx_hooks != new_dpdk_uprobe.tx_hooks {
-            info!(
-                "Update inputs.ebpf.socket.uprobe.dpdk.tx_hooks from {:?} to {:?}.",
-                dpdk_uprobe.tx_hooks, new_dpdk_uprobe.tx_hooks
-            );
-            dpdk_uprobe.tx_hooks = new_dpdk_uprobe.tx_hooks.clone();
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    dpdk_uprobe.command,
+                    new_dpdk_uprobe.command,
+                    "inputs.ebpf.socket.uprobe.dpdk.command"
+                ),
+                (
+                    dpdk_uprobe.rx_hooks,
+                    new_dpdk_uprobe.rx_hooks,
+                    "inputs.ebpf.socket.uprobe.dpdk.rx_hooks"
+                ),
+                (
+                    dpdk_uprobe.tx_hooks,
+                    new_dpdk_uprobe.tx_hooks,
+                    "inputs.ebpf.socket.uprobe.dpdk.tx_hooks"
+                )
+            ]
+        );
 
         let preprocess = &mut ebpf.socket.preprocess;
         let new_preprocess = &mut new_ebpf.socket.preprocess;
-        if preprocess.out_of_order_reassembly_cache_size
-            != new_preprocess.out_of_order_reassembly_cache_size
-        {
-            info!(
-                "Update inputs.ebpf.socket.preprocess.out_of_order_reassembly_cache_size from {:?} to {:?}.",
-                preprocess.out_of_order_reassembly_cache_size,
-                new_preprocess.out_of_order_reassembly_cache_size
-            );
-            preprocess.out_of_order_reassembly_cache_size =
-                new_preprocess.out_of_order_reassembly_cache_size;
-            restart_agent = !first_run;
-        }
-        if preprocess.out_of_order_reassembly_protocols
-            != new_preprocess.out_of_order_reassembly_protocols
-        {
-            info!(
-                "Update inputs.ebpf.socket.preprocess.out_of_order_reassembly_protocols from {:?} to {:?}.",
-                preprocess.out_of_order_reassembly_protocols,
-                new_preprocess.out_of_order_reassembly_protocols
-            );
-            preprocess.out_of_order_reassembly_protocols =
-                new_preprocess.out_of_order_reassembly_protocols.clone();
-            restart_agent = !first_run;
-        }
-        if preprocess.segmentation_reassembly_protocols
-            != new_preprocess.segmentation_reassembly_protocols
-        {
-            info!(
-                "Update inputs.ebpf.socket.preprocess.segmentation_reassembly_protocols from {:?} to {:?}.",
-                preprocess.segmentation_reassembly_protocols,
-                new_preprocess.segmentation_reassembly_protocols
-            );
-            preprocess.segmentation_reassembly_protocols =
-                new_preprocess.segmentation_reassembly_protocols.clone();
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    preprocess.out_of_order_reassembly_cache_size,
+                    new_preprocess.out_of_order_reassembly_cache_size,
+                    "inputs.ebpf.socket.preprocess.out_of_order_reassembly_cache_size"
+                ),
+                (
+                    preprocess.out_of_order_reassembly_protocols,
+                    new_preprocess.out_of_order_reassembly_protocols,
+                    "inputs.ebpf.socket.preprocess.out_of_order_reassembly_protocols"
+                ),
+                (
+                    preprocess.out_of_order_reassembly_timeout,
+                    new_preprocess.out_of_order_reassembly_timeout,
+                    "inputs.ebpf.socket.preprocess.out_of_order_reassembly_timeout"
+                ),
+                (
+                    preprocess.segmentation_reassembly_protocols,
+                    new_preprocess.segmentation_reassembly_protocols,
+                    "inputs.ebpf.socket.preprocess.segmentation_reassembly_protocols"
+                )
+            ]
+        );
 
         let tunning = &mut ebpf.socket.tunning;
         let new_tunning = &mut new_ebpf.socket.tunning;
-        if tunning.map_prealloc_disabled != new_tunning.map_prealloc_disabled {
-            info!(
-                "Update inputs.ebpf.socket.tunning.map_prealloc_disabled from {:?} to {:?}.",
-                tunning.map_prealloc_disabled, new_tunning.map_prealloc_disabled
-            );
-            tunning.map_prealloc_disabled = new_tunning.map_prealloc_disabled;
-            restart_agent = !first_run;
-        }
-        if tunning.syscall_trace_id_disabled != new_tunning.syscall_trace_id_disabled {
-            info!(
-                "Update inputs.ebpf.socket.tunning.syscall_trace_id_disabled from {:?} to {:?}.",
-                tunning.syscall_trace_id_disabled, new_tunning.syscall_trace_id_disabled
-            );
-            tunning.syscall_trace_id_disabled = new_tunning.syscall_trace_id_disabled;
-            restart_agent = !first_run;
-        }
-        if tunning.max_capture_rate != new_tunning.max_capture_rate {
-            info!(
-                "Update inputs.ebpf.socket.tunning.max_capture_rate from {:?} to {:?}.",
-                tunning.max_capture_rate, new_tunning.max_capture_rate
-            );
-            tunning.max_capture_rate = new_tunning.max_capture_rate;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    tunning.fentry_enabled,
+                    new_tunning.fentry_enabled,
+                    "inputs.ebpf.socket.tunning.fentry_enabled"
+                ),
+                (
+                    tunning.map_prealloc_disabled,
+                    new_tunning.map_prealloc_disabled,
+                    "inputs.ebpf.socket.tunning.map_prealloc_disabled"
+                ),
+                (
+                    tunning.syscall_trace_id_disabled,
+                    new_tunning.syscall_trace_id_disabled,
+                    "inputs.ebpf.socket.tunning.syscall_trace_id_disabled"
+                ),
+                (
+                    tunning.max_capture_rate,
+                    new_tunning.max_capture_rate,
+                    "inputs.ebpf.socket.tunning.max_capture_rate"
+                )
+            ]
+        );
 
         let tunning = &mut ebpf.tunning;
         let new_tunning = &mut new_ebpf.tunning;
-        if tunning.collector_queue_size != new_tunning.collector_queue_size {
-            info!(
-                "Update inputs.ebpf.tunning.collector_queue_size from {:?} to {:?}.",
-                tunning.collector_queue_size, new_tunning.collector_queue_size
-            );
-            tunning.collector_queue_size = new_tunning.collector_queue_size;
-            restart_agent = !first_run;
-        }
-        if tunning.kernel_ring_size != new_tunning.kernel_ring_size {
-            info!(
-                "Update inputs.ebpf.tunning.kernel_ring_size from {:?} to {:?}.",
-                tunning.kernel_ring_size, new_tunning.kernel_ring_size
-            );
-            tunning.kernel_ring_size = new_tunning.kernel_ring_size;
-            restart_agent = !first_run;
-        }
-        if tunning.max_socket_entries != new_tunning.max_socket_entries {
-            info!(
-                "Update inputs.ebpf.tunning.max_socket_entries from {:?} to {:?}.",
-                tunning.max_socket_entries, new_tunning.max_socket_entries
-            );
-            tunning.max_socket_entries = new_tunning.max_socket_entries;
-            restart_agent = !first_run;
-        }
-        if tunning.max_trace_entries != new_tunning.max_trace_entries {
-            info!(
-                "Update inputs.ebpf.tunning.max_trace_entries from {:?} to {:?}.",
-                tunning.max_trace_entries, new_tunning.max_trace_entries
-            );
-            tunning.max_trace_entries = new_tunning.max_trace_entries;
-            restart_agent = !first_run;
-        }
-        if tunning.perf_pages_count != new_tunning.perf_pages_count {
-            info!(
-                "Update inputs.ebpf.tunning.perf_pages_count from {:?} to {:?}.",
-                tunning.perf_pages_count, new_tunning.perf_pages_count
-            );
-            tunning.perf_pages_count = new_tunning.perf_pages_count;
-            restart_agent = !first_run;
-        }
-        if tunning.socket_map_reclaim_threshold != new_tunning.socket_map_reclaim_threshold {
-            info!(
-                "Update inputs.ebpf.tunning.socket_map_reclaim_threshold from {:?} to {:?}.",
-                tunning.socket_map_reclaim_threshold, new_tunning.socket_map_reclaim_threshold
-            );
-            tunning.socket_map_reclaim_threshold = new_tunning.socket_map_reclaim_threshold;
-            restart_agent = !first_run;
-        }
-        if tunning.userspace_worker_threads != new_tunning.userspace_worker_threads {
-            info!(
-                "Update inputs.ebpf.tunning.userspace_worker_threads from {:?} to {:?}.",
-                tunning.userspace_worker_threads, new_tunning.userspace_worker_threads
-            );
-            tunning.userspace_worker_threads = new_tunning.userspace_worker_threads;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    tunning.collector_queue_size,
+                    new_tunning.collector_queue_size,
+                    "inputs.ebpf.tunning.collector_queue_size"
+                ),
+                (
+                    tunning.kernel_ring_size,
+                    new_tunning.kernel_ring_size,
+                    "inputs.ebpf.tunning.kernel_ring_size"
+                ),
+                (
+                    tunning.kick_kern_nice,
+                    new_tunning.kick_kern_nice,
+                    "inputs.ebpf.tunning.kick_kern_nice"
+                ),
+                (
+                    tunning.max_socket_entries,
+                    new_tunning.max_socket_entries,
+                    "inputs.ebpf.tunning.max_socket_entries"
+                ),
+                (
+                    tunning.max_trace_entries,
+                    new_tunning.max_trace_entries,
+                    "inputs.ebpf.tunning.max_trace_entries"
+                ),
+                (
+                    tunning.perf_pages_count,
+                    new_tunning.perf_pages_count,
+                    "inputs.ebpf.tunning.perf_pages_count"
+                ),
+                (
+                    tunning.socket_map_reclaim_threshold,
+                    new_tunning.socket_map_reclaim_threshold,
+                    "inputs.ebpf.tunning.socket_map_reclaim_threshold"
+                ),
+                (
+                    tunning.userspace_worker_threads,
+                    new_tunning.userspace_worker_threads,
+                    "inputs.ebpf.tunning.userspace_worker_threads"
+                )
+            ]
+        );
 
         let integration = &mut config.inputs.integration;
         let new_integration = &mut new_config.user_config.inputs.integration;
-        if integration.enabled != new_integration.enabled {
-            info!(
-                "Update inputs.integration.enabled from {:?} to {:?}.",
-                integration.enabled, new_integration.enabled
-            );
-            integration.enabled = new_integration.enabled;
-            restart_agent = !first_run;
-        }
-        if integration.compression != new_integration.compression {
-            info!(
-                "Update inputs.integration.compression from {:?} to {:?}.",
-                integration.compression, new_integration.compression
-            );
-            integration.compression = new_integration.compression.clone();
-            restart_agent = !first_run;
-        }
-        if integration.feature_control != new_integration.feature_control {
-            info!(
-                "Update inputs.integration.feature_control from {:?} to {:?}.",
-                integration.feature_control, new_integration.feature_control
-            );
-            integration.feature_control = new_integration.feature_control;
-            restart_agent = !first_run;
-        }
-        if integration.listen_port != new_integration.listen_port {
-            info!(
-                "Update inputs.integration.listen_port from {:?} to {:?}.",
-                integration.listen_port, new_integration.listen_port
-            );
-            integration.listen_port = new_integration.listen_port;
-            restart_agent = !first_run;
-        }
-        if integration.prometheus_extra_labels != new_integration.prometheus_extra_labels {
-            info!(
-                "Update inputs.integration.prometheus_extra_labels from {:?} to {:?}.",
-                integration.prometheus_extra_labels, new_integration.prometheus_extra_labels
-            );
-            integration.prometheus_extra_labels = new_integration.prometheus_extra_labels.clone();
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    integration.enabled,
+                    new_integration.enabled,
+                    "inputs.integration.enabled"
+                ),
+                (
+                    integration.compression,
+                    new_integration.compression,
+                    "inputs.integration.compression"
+                ),
+                (
+                    integration.feature_control,
+                    new_integration.feature_control,
+                    "inputs.integration.feature_control"
+                ),
+                (
+                    integration.listen_port,
+                    new_integration.listen_port,
+                    "inputs.integration.listen_port"
+                ),
+                (
+                    integration.prometheus_extra_labels,
+                    new_integration.prometheus_extra_labels,
+                    "inputs.integration.prometheus_extra_labels"
+                )
+            ]
+        );
 
         let resources = &mut config.inputs.resources;
         let new_resources = &mut new_config.user_config.inputs.resources;
@@ -3488,77 +3969,63 @@ impl ConfigHandler {
 
         let kubernetes = &mut resources.kubernetes;
         let new_kubernetes = &mut new_resources.kubernetes;
-        if kubernetes.api_list_max_interval != new_kubernetes.api_list_max_interval {
-            info!(
-                "Update inputs.resources.kubernetes.api_list_max_interval from {:?} to {:?}.",
-                kubernetes.api_list_max_interval, new_kubernetes.api_list_max_interval
-            );
-            kubernetes.api_list_max_interval = new_kubernetes.api_list_max_interval;
-            restart_agent = !first_run;
-        }
-        if kubernetes.api_list_page_size != new_kubernetes.api_list_page_size {
-            info!(
-                "Update inputs.resources.kubernetes.api_list_page_size from {:?} to {:?}.",
-                kubernetes.api_list_page_size, new_kubernetes.api_list_page_size
-            );
-            kubernetes.api_list_page_size = new_kubernetes.api_list_page_size;
-            restart_agent = !first_run;
-        }
-        if kubernetes.api_resources != new_kubernetes.api_resources {
-            info!(
-                "Update inputs.resources.kubernetes.api_resources from {:?} to {:?}.",
-                kubernetes.api_resources, new_kubernetes.api_resources
-            );
-            kubernetes.api_resources = new_kubernetes.api_resources.clone();
-            restart_agent = !first_run;
-        }
-        if kubernetes.ingress_flavour != new_kubernetes.ingress_flavour {
-            info!(
-                "Update inputs.resources.kubernetes.ingress_flavour from {:?} to {:?}.",
-                kubernetes.ingress_flavour, new_kubernetes.ingress_flavour
-            );
-            kubernetes.ingress_flavour = new_kubernetes.ingress_flavour.clone();
-            restart_agent = !first_run;
-        }
-        if kubernetes.kubernetes_namespace != new_kubernetes.kubernetes_namespace {
-            info!(
-                "Update inputs.resources.kubernetes.kubernetes_namespace from {:?} to {:?}.",
-                kubernetes.kubernetes_namespace, new_kubernetes.kubernetes_namespace
-            );
-            kubernetes.kubernetes_namespace = new_kubernetes.kubernetes_namespace.clone();
-            restart_agent = !first_run;
-        }
-        if kubernetes.pod_mac_collection_method != new_kubernetes.pod_mac_collection_method {
-            info!(
-                "Update inputs.resources.kubernetes.pod_mac_collection_method from {:?} to {:?}.",
-                kubernetes.pod_mac_collection_method, new_kubernetes.pod_mac_collection_method
-            );
-            kubernetes.pod_mac_collection_method = new_kubernetes.pod_mac_collection_method;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    kubernetes.api_list_max_interval,
+                    new_kubernetes.api_list_max_interval,
+                    "inputs.resources.kubernetes.api_list_max_interval"
+                ),
+                (
+                    kubernetes.api_list_page_size,
+                    new_kubernetes.api_list_page_size,
+                    "inputs.resources.kubernetes.api_list_page_size"
+                ),
+                (
+                    kubernetes.api_resources,
+                    new_kubernetes.api_resources,
+                    "inputs.resources.kubernetes.api_resources"
+                ),
+                (
+                    kubernetes.ingress_flavour,
+                    new_kubernetes.ingress_flavour,
+                    "inputs.resources.kubernetes.ingress_flavour"
+                ),
+                (
+                    kubernetes.kubernetes_namespace,
+                    new_kubernetes.kubernetes_namespace,
+                    "inputs.resources.kubernetes.kubernetes_namespace"
+                ),
+                (
+                    kubernetes.pod_mac_collection_method,
+                    new_kubernetes.pod_mac_collection_method,
+                    "inputs.resources.kubernetes.pod_mac_collection_method"
+                )
+            ]
+        );
 
         let private_cloud = &mut resources.private_cloud;
         let new_private_cloud = &mut new_resources.private_cloud;
-        if private_cloud.hypervisor_resource_enabled
-            != new_private_cloud.hypervisor_resource_enabled
-        {
-            info!(
-                "Update inputs.resources.private_cloud.hypervisor_resource_enabled from {:?} to {:?}.",
-                private_cloud.hypervisor_resource_enabled,
-                new_private_cloud.hypervisor_resource_enabled
-            );
-            private_cloud.hypervisor_resource_enabled =
-                new_private_cloud.hypervisor_resource_enabled;
-            restart_agent = !first_run;
-        }
-        if private_cloud.vm_mac_mapping_script != new_private_cloud.vm_mac_mapping_script {
-            info!(
-                "Update inputs.resources.private_cloud.vm_mac_mapping_script from {:?} to {:?}.",
-                private_cloud.vm_mac_mapping_script, new_private_cloud.vm_mac_mapping_script
-            );
-            private_cloud.vm_mac_mapping_script = new_private_cloud.vm_mac_mapping_script.clone();
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    private_cloud.hypervisor_resource_enabled,
+                    new_private_cloud.hypervisor_resource_enabled,
+                    "inputs.resources.private_cloud.hypervisor_resource_enabled"
+                ),
+                (
+                    private_cloud.vm_mac_mapping_script,
+                    new_private_cloud.vm_mac_mapping_script,
+                    "inputs.resources.private_cloud.vm_mac_mapping_script"
+                )
+            ]
+        );
         if private_cloud.vm_mac_source != new_private_cloud.vm_mac_source {
             info!(
                 "Update inputs.resources.private_cloud.vm_mac_source from {:?} to {:?}.",
@@ -3576,20 +4043,18 @@ impl ConfigHandler {
 
         let proc = &mut config.inputs.proc;
         let new_proc = &mut new_config.user_config.inputs.proc;
-        if proc.enabled != new_proc.enabled {
-            info!(
-                "Update inputs.proc.enabled from {:?} to {:?}.",
-                proc.enabled, new_proc.enabled
-            );
-            proc.enabled = new_proc.enabled;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [(proc.enabled, new_proc.enabled, "inputs.proc.enabled")]
+        );
         if proc.min_lifetime != new_proc.min_lifetime {
             info!(
                 "Update inputs.proc.min_lifetime from {:?} to {:?}.",
                 proc.min_lifetime, new_proc.min_lifetime
             );
             proc.min_lifetime = new_proc.min_lifetime;
-            restart_agent = !first_run;
         }
         let mut process_matcher_update = false;
         if proc.proc_dir_path != new_proc.proc_dir_path {
@@ -3599,7 +4064,14 @@ impl ConfigHandler {
             );
             proc.proc_dir_path = new_proc.proc_dir_path.clone();
             process_matcher_update = true;
-            restart_agent = !first_run;
+        }
+        if proc.process_blacklist != new_proc.process_blacklist {
+            info!(
+                "Update inputs.proc.process_blacklist from {:?} to {:?}.",
+                proc.process_blacklist, new_proc.process_blacklist
+            );
+            proc.process_blacklist = new_proc.process_blacklist.clone();
+            process_matcher_update = true;
         }
         if proc.process_matcher != new_proc.process_matcher {
             info!(
@@ -3608,23 +4080,23 @@ impl ConfigHandler {
             );
             proc.process_matcher = new_proc.process_matcher.clone();
             process_matcher_update = true;
-            restart_agent = !first_run;
         }
-        if proc.symbol_table != new_proc.symbol_table {
-            info!(
-                "Update inputs.proc.symbol_table from {:?} to {:?}.",
-                proc.symbol_table, new_proc.symbol_table
-            );
-            proc.symbol_table = new_proc.symbol_table;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [(
+                proc.symbol_table,
+                new_proc.symbol_table,
+                "inputs.proc.symbol_table"
+            )]
+        );
         if proc.socket_info_sync_interval != new_proc.socket_info_sync_interval {
             info!(
                 "Update inputs.proc.socket_info_sync_interval from {:?} to {:?}.",
                 proc.socket_info_sync_interval, new_proc.socket_info_sync_interval
             );
             proc.socket_info_sync_interval = new_proc.socket_info_sync_interval;
-            restart_agent = !first_run;
         }
 
         let tag = &mut proc.tag_extraction;
@@ -3636,7 +4108,6 @@ impl ConfigHandler {
             );
             tag.exec_username = new_tag.exec_username.clone();
             process_matcher_update = true;
-            restart_agent = !first_run;
         }
         if tag.script_command != new_tag.script_command {
             info!(
@@ -3645,13 +4116,13 @@ impl ConfigHandler {
             );
             tag.script_command = new_tag.script_command.clone();
             process_matcher_update = true;
-            restart_agent = !first_run;
         }
 
         if process_matcher_update {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             if let Some(c) = components.as_ref() {
                 c.process_listener.on_config_change(
+                    &new_config.user_config.inputs.proc.process_blacklist,
                     &new_config.user_config.inputs.proc.process_matcher,
                     new_config.user_config.inputs.proc.proc_dir_path.clone(),
                     new_config
@@ -3675,14 +4146,16 @@ impl ConfigHandler {
         // global
         let alerts = &mut config.global.alerts;
         let new_alerts = &mut new_config.user_config.global.alerts;
-        if alerts.check_core_file_disabled != new_alerts.check_core_file_disabled {
-            info!(
-                "Update global.alerts.check_core_file_disabled from {:?} to {:?}.",
-                alerts.check_core_file_disabled, new_alerts.check_core_file_disabled
-            );
-            alerts.check_core_file_disabled = new_alerts.check_core_file_disabled;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [(
+                alerts.check_core_file_disabled,
+                new_alerts.check_core_file_disabled,
+                "global.alerts.check_core_file_disabled"
+            )]
+        );
         if alerts.process_threshold != new_alerts.process_threshold {
             info!(
                 "Update global.alerts.process_threshold from {:?} to {:?}.",
@@ -3797,26 +4270,32 @@ impl ConfigHandler {
             });
             common.enabled = new_common.enabled;
         }
-        if common.region_id != new_common.region_id {
+        if common.region_id != new_common.region_id && new_common.region_id > 0 {
             info!(
                 "Update global.common.region_id from {:?} to {:?}.",
                 common.region_id, new_common.region_id
             );
             common.region_id = new_common.region_id;
+        } else {
+            // The old and new configurations are consistent to avoid restarts
+            new_common.region_id = common.region_id;
         }
         if common.pod_cluster_id != new_common.pod_cluster_id {
             info!(
-                "Update global.common.region_id from {:?} to {:?}.",
+                "Update global.common.pod_cluster_id from {:?} to {:?}.",
                 common.pod_cluster_id, new_common.pod_cluster_id
             );
             common.pod_cluster_id = new_common.pod_cluster_id;
         }
-        if common.vpc_id != new_common.vpc_id {
+        if common.vpc_id != new_common.vpc_id && new_common.vpc_id > 0 {
             info!(
                 "Update global.common.vpc_id from {:?} to {:?}.",
                 common.vpc_id, new_common.vpc_id
             );
             common.vpc_id = new_common.vpc_id;
+        } else {
+            // The old and new configurations are consistent to avoid restarts
+            new_common.vpc_id = common.vpc_id;
         }
         if common.agent_id != new_common.agent_id {
             info!(
@@ -3825,19 +4304,25 @@ impl ConfigHandler {
             );
             common.agent_id = new_common.agent_id;
         }
-        if common.team_id != new_common.team_id {
+        if common.team_id != new_common.team_id && new_common.team_id > 0 {
             info!(
                 "Update global.common.team_id from {:?} to {:?}.",
                 common.team_id, new_common.team_id
             );
+            // The old and new configurations are consistent to avoid restarts
             common.team_id = new_common.team_id;
+        } else {
+            new_common.team_id = common.team_id;
         }
-        if common.organize_id != new_common.organize_id {
+        if common.organize_id != new_common.organize_id && new_common.organize_id > 0 {
             info!(
                 "Update global.common.organize_id from {:?} to {:?}.",
                 common.organize_id, new_common.organize_id
             );
             common.organize_id = new_common.organize_id;
+        } else {
+            // The old and new configurations are consistent to avoid restarts
+            new_common.organize_id = common.organize_id;
         }
         if common.agent_type != new_common.agent_type {
             info!(
@@ -3864,12 +4349,15 @@ impl ConfigHandler {
             communication.request_via_nat_ip = new_communication.request_via_nat_ip;
         }
         if communication.grpc_buffer_size != new_communication.grpc_buffer_size {
-            info!(
-                "Update global.communication.grpc_buffer_size from {:?} to {:?}.",
-                communication.grpc_buffer_size, new_communication.grpc_buffer_size
-            );
+            if new_communication.grpc_buffer_size > 0 {
+                info!(
+                    "Update global.communication.grpc_buffer_size from {:?} to {:?}, and it is actually used {:?}.",
+                    communication.grpc_buffer_size, new_communication.grpc_buffer_size, new_communication.grpc_buffer_size.max(GRPC_BUFFER_SIZE_MIN)
+                );
+
+                session.set_rx_size(new_communication.grpc_buffer_size.max(GRPC_BUFFER_SIZE_MIN));
+            }
             communication.grpc_buffer_size = new_communication.grpc_buffer_size;
-            session.set_rx_size(new_communication.grpc_buffer_size);
         }
         if communication.max_throughput_to_ingester != new_communication.max_throughput_to_ingester
         {
@@ -3938,16 +4426,13 @@ impl ConfigHandler {
 
         let limits = &mut config.global.limits;
         let new_limits = &mut new_config.user_config.global.limits;
+        let mut update_log_retention_and_path = false;
         if limits.local_log_retention != new_limits.local_log_retention {
             info!(
                 "Update global.limits.local_log_retention from {:?} to {:?}.",
                 limits.local_log_retention, new_limits.local_log_retention
             );
-            if Self::set_log_retention(logger_handle, &new_limits.local_log_retention, &log_file) {
-                limits.local_log_retention = new_limits.local_log_retention;
-            } else {
-                new_limits.local_log_retention = limits.local_log_retention;
-            }
+            update_log_retention_and_path = true;
         }
         if limits.max_local_log_file_size != new_limits.max_local_log_file_size {
             info!(
@@ -3992,6 +4477,34 @@ impl ConfigHandler {
             limits.max_sockets_tolerate_interval = new_limits.max_sockets_tolerate_interval;
         }
 
+        let free_disk = &mut config.global.circuit_breakers.free_disk;
+        let new_free_disk = &mut new_config.user_config.global.circuit_breakers.free_disk;
+        if free_disk.percentage_trigger_threshold != new_free_disk.percentage_trigger_threshold {
+            info!(
+                "Update global.circuit_breakers.free_disk.percentage_trigger_threshold from {:?} to {:?}.",
+                free_disk.percentage_trigger_threshold, new_free_disk.percentage_trigger_threshold
+            );
+            free_disk.percentage_trigger_threshold = new_free_disk.percentage_trigger_threshold;
+        }
+
+        if free_disk.absolute_trigger_threshold != new_free_disk.absolute_trigger_threshold {
+            info!(
+                "Update global.circuit_breakers.free_disk.absolute_trigger_threshold from {:?} to {:?}.",
+                free_disk.absolute_trigger_threshold, new_free_disk.absolute_trigger_threshold
+            );
+            free_disk.absolute_trigger_threshold = new_free_disk.absolute_trigger_threshold;
+        }
+
+        new_free_disk.directories.sort();
+        new_free_disk.directories.dedup();
+        if free_disk.directories != new_free_disk.directories {
+            info!(
+                "Update global.circuit_breakers.free_disk.directories from {:?} to {:?}.",
+                free_disk.directories, new_free_disk.directories
+            );
+            free_disk.directories = new_free_disk.directories.clone();
+        }
+
         let ntp = &mut config.global.ntp;
         let new_ntp = &mut new_config.user_config.global.ntp;
         if ntp.enabled != new_ntp.enabled {
@@ -4001,22 +4514,15 @@ impl ConfigHandler {
             );
             ntp.enabled = new_ntp.enabled;
         }
-        if ntp.max_drift != new_ntp.max_drift {
-            info!(
-                "Update global.ntp.max_drift from {:?} to {:?}.",
-                ntp.max_drift, new_ntp.max_drift
-            );
-            ntp.max_drift = new_ntp.max_drift;
-            restart_agent = !first_run;
-        }
-        if ntp.min_drift != new_ntp.min_drift {
-            info!(
-                "Update global.ntp.min_drift from {:?} to {:?}.",
-                ntp.min_drift, new_ntp.min_drift
-            );
-            ntp.min_drift = new_ntp.min_drift;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (ntp.max_drift, new_ntp.max_drift, "global.ntp.max_drift"),
+                (ntp.min_drift, new_ntp.min_drift, "global.ntp.min_drift")
+            ]
+        );
 
         let self_monitoring = &mut config.global.self_monitoring;
         let new_self_monitoring = &mut new_config.user_config.global.self_monitoring;
@@ -4029,22 +4535,16 @@ impl ConfigHandler {
             );
             debug.enabled = debug.enabled;
         }
-        if debug.debug_metrics_enabled != new_debug.debug_metrics_enabled {
-            info!(
-                "Update global.self_monitoring.debug.debug_metrics_enabled from {:?} to {:?}.",
-                debug.debug_metrics_enabled, new_debug.debug_metrics_enabled
-            );
-            debug.debug_metrics_enabled = debug.debug_metrics_enabled;
-            restart_agent = !first_run;
-        }
-        if debug.local_udp_port != new_debug.local_udp_port {
-            info!(
-                "Update global.self_monitoring.debug.local_udp_port from {:?} to {:?}.",
-                debug.local_udp_port, new_debug.local_udp_port
-            );
-            debug.local_udp_port = debug.local_udp_port;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [(
+                debug.local_udp_port,
+                new_debug.local_udp_port,
+                "global.self_monitoring.debug.local_udp_port"
+            )]
+        );
 
         if self_monitoring.hostname != new_self_monitoring.hostname {
             info!(
@@ -4083,8 +4583,7 @@ impl ConfigHandler {
                 "Update global.self_monitoring.log.log_file from {:?} to {:?}.",
                 log.log_file, new_log.log_file
             );
-            log.log_file = new_log.log_file.clone();
-            restart_agent = !first_run;
+            update_log_retention_and_path = true;
         }
         if log.log_level != new_log.log_level {
             info!(
@@ -4097,33 +4596,36 @@ impl ConfigHandler {
                 new_log.log_level = log.log_level.clone();
             }
         }
-        if self_monitoring.profile.enabled != new_self_monitoring.profile.enabled {
-            info!(
-                "Update global.self_monitoring.profile.enabled from {:?} to {:?}.",
-                self_monitoring.profile.enabled, new_self_monitoring.profile.enabled
-            );
-            self_monitoring.profile.enabled = new_self_monitoring.profile.enabled;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [(
+                self_monitoring.profile.enabled,
+                new_self_monitoring.profile.enabled,
+                "global.self_monitoring.profile.enabled"
+            )]
+        );
 
         let standalone_mode = &mut config.global.standalone_mode;
         let new_standalone_mode = &mut new_config.user_config.global.standalone_mode;
-        if standalone_mode.data_file_dir != new_standalone_mode.data_file_dir {
-            info!(
-                "Update global.standalone_mode.data_file_dir from {:?} to {:?}.",
-                standalone_mode.data_file_dir, new_standalone_mode.data_file_dir
-            );
-            standalone_mode.data_file_dir = new_standalone_mode.data_file_dir.clone();
-            restart_agent = !first_run;
-        }
-        if standalone_mode.max_data_file_size != new_standalone_mode.max_data_file_size {
-            info!(
-                "Update global.standalone_mode.max_data_file_size from {:?} to {:?}.",
-                standalone_mode.max_data_file_size, new_standalone_mode.max_data_file_size
-            );
-            standalone_mode.max_data_file_size = new_standalone_mode.max_data_file_size;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    standalone_mode.data_file_dir,
+                    new_standalone_mode.data_file_dir,
+                    "global.standalone_mode.data_file_dir"
+                ),
+                (
+                    standalone_mode.max_data_file_size,
+                    new_standalone_mode.max_data_file_size,
+                    "global.standalone_mode.max_data_file_size"
+                )
+            ]
+        );
 
         let tunning = &mut config.global.tunning;
         let new_tunning = &mut new_config.user_config.global.tunning;
@@ -4133,12 +4635,38 @@ impl ConfigHandler {
                 tunning.idle_memory_trimming, new_tunning.idle_memory_trimming
             );
             tunning.idle_memory_trimming = new_tunning.idle_memory_trimming;
-            restart_agent = !first_run;
+        }
+        if tunning.swap_disabled != new_tunning.swap_disabled {
+            info!(
+                "Update global.tunning.swap_disabled from {:?} to {:?}.",
+                tunning.swap_disabled, new_tunning.swap_disabled
+            );
+            let reason = changed_reason(
+                "global.tunning.swap_disabled",
+                &tunning.swap_disabled,
+                &new_tunning.swap_disabled,
+            );
+            tunning.swap_disabled = new_tunning.swap_disabled;
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            if tunning.swap_disabled {
+                Self::set_swap_disabled();
+            } else {
+                let restart_value = !first_run;
+                restart_agent |= restart_value;
+                if restart_value {
+                    agent_restart_reasons.insert(reason);
+                }
+            }
         }
         if tunning.cpu_affinity != new_tunning.cpu_affinity {
             info!(
                 "Update global.tunning.cpu_affinity from {:?} to {:?}.",
                 tunning.cpu_affinity, new_tunning.cpu_affinity
+            );
+            let reason = changed_reason(
+                "global.tunning.cpu_affinity",
+                &tunning.cpu_affinity,
+                &new_tunning.cpu_affinity,
             );
             tunning.cpu_affinity = new_tunning.cpu_affinity.clone();
             #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -4146,7 +4674,11 @@ impl ConfigHandler {
                 Self::set_cpu_affinity(&tunning.cpu_affinity, &mut cpu_set);
                 new_config.dispatcher.cpu_set = cpu_set;
             }
-            restart_agent = !first_run;
+            let restart_value = !first_run;
+            restart_agent |= restart_value;
+            if restart_value {
+                agent_restart_reasons.insert(reason);
+            }
         }
         if tunning.process_scheduling_priority != new_tunning.process_scheduling_priority {
             info!(
@@ -4156,7 +4688,6 @@ impl ConfigHandler {
             tunning.process_scheduling_priority = new_tunning.process_scheduling_priority;
             #[cfg(any(target_os = "linux", target_os = "android"))]
             Self::set_process_scheduling_priority(tunning.process_scheduling_priority);
-            restart_agent = !first_run;
         }
         if tunning.resource_monitoring_interval != new_tunning.resource_monitoring_interval {
             info!(
@@ -4164,7 +4695,6 @@ impl ConfigHandler {
                 tunning.resource_monitoring_interval, new_tunning.resource_monitoring_interval
             );
             tunning.resource_monitoring_interval = new_tunning.resource_monitoring_interval;
-            restart_agent = !first_run;
         }
         if tunning.page_cache_reclaim_percentage != new_tunning.page_cache_reclaim_percentage {
             info!(
@@ -4174,17 +4704,32 @@ impl ConfigHandler {
             tunning.page_cache_reclaim_percentage = new_tunning.page_cache_reclaim_percentage;
         }
 
+        if update_log_retention_and_path {
+            let new_retention = &new_config.user_config.global.limits.local_log_retention;
+            let new_log_file = &new_config.user_config.global.self_monitoring.log.log_file;
+            if Self::set_log_retention_and_path(logger_handle, new_retention, new_log_file) {
+                config.global.limits.local_log_retention = *new_retention;
+                config.global.self_monitoring.log.log_file = new_log_file.clone();
+            } else {
+                new_config.user_config.global.limits.local_log_retention =
+                    config.global.limits.local_log_retention;
+                new_config.user_config.global.self_monitoring.log.log_file =
+                    config.global.self_monitoring.log.log_file.clone();
+            }
+        }
         // dev
         let dev = &mut config.dev;
         let new_dev = &mut new_config.user_config.dev;
-        if dev.feature_flags != new_dev.feature_flags {
-            info!(
-                "Update dev.feature_flags from {:?} to {:?}.",
-                dev.feature_flags, new_dev.feature_flags
-            );
-            dev.feature_flags = new_dev.feature_flags.clone();
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [(
+                dev.feature_flags,
+                new_dev.feature_flags,
+                "dev.feature_flags"
+            )]
+        );
 
         // output
         let outputs = &mut config.outputs;
@@ -4198,14 +4743,16 @@ impl ConfigHandler {
             );
             socket.multiple_sockets_to_ingester = new_socket.multiple_sockets_to_ingester;
         }
-        if socket.raw_udp_qos_bypass != new_socket.raw_udp_qos_bypass {
-            info!(
-                "Update outputs.socket.raw_udp_qos_bypass from {:?} to {:?}.",
-                socket.raw_udp_qos_bypass, new_socket.raw_udp_qos_bypass
-            );
-            socket.raw_udp_qos_bypass = new_socket.raw_udp_qos_bypass;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [(
+                socket.raw_udp_qos_bypass,
+                new_socket.raw_udp_qos_bypass,
+                "outputs.socket.raw_udp_qos_bypass"
+            )]
+        );
         if socket.data_socket_type != new_socket.data_socket_type {
             info!(
                 "Update outputs.socket.data_socket_type from {:?} to {:?}.",
@@ -4288,14 +4835,16 @@ impl ConfigHandler {
 
         let tunning = &mut flow_log.tunning;
         let new_tunning = &mut new_flow_log.tunning;
-        if tunning.collector_queue_size != new_tunning.collector_queue_size {
-            info!(
-                "Update outputs.flow_log.tunning.collector_queue_size from {:?} to {:?}.",
-                tunning.collector_queue_size, new_tunning.collector_queue_size
-            );
-            tunning.collector_queue_size = new_tunning.collector_queue_size;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [(
+                tunning.collector_queue_size,
+                new_tunning.collector_queue_size,
+                "outputs.flow_log.tunning.collector_queue_size"
+            )]
+        );
 
         let flow_metrics = &mut outputs.flow_metrics;
         let new_flow_metrics = &mut new_outputs.flow_metrics;
@@ -4315,14 +4864,30 @@ impl ConfigHandler {
             );
             filters.apm_metrics = new_filters.apm_metrics;
         }
-        if filters.inactive_ip_aggregation != new_filters.inactive_ip_aggregation {
+        if filters.npm_metrics != new_filters.npm_metrics {
             info!(
-                "Update outputs.flow_metrics.filters.inactive_ip_aggregation from {:?} to {:?}.",
-                filters.inactive_ip_aggregation, new_filters.inactive_ip_aggregation
+                "Update outputs.flow_metrics.filters.npm_metrics from {:?} to {:?}.",
+                filters.npm_metrics, new_filters.npm_metrics
             );
-            filters.inactive_ip_aggregation = new_filters.inactive_ip_aggregation;
-            restart_dispatcher = true;
+            filters.npm_metrics = new_filters.npm_metrics;
         }
+        update_fields_with_restart_reason!(
+            restart_dispatcher,
+            true,
+            dispatcher_restart_reasons,
+            [
+                (
+                    filters.inactive_ip_aggregation,
+                    new_filters.inactive_ip_aggregation,
+                    "outputs.flow_metrics.filters.inactive_ip_aggregation"
+                ),
+                (
+                    filters.npm_metrics_concurrent,
+                    new_filters.npm_metrics_concurrent,
+                    "outputs.flow_metrics.filters.npm_metrics_concurrent"
+                )
+            ]
+        );
         if filters.inactive_server_port_aggregation != new_filters.inactive_server_port_aggregation
         {
             info!(
@@ -4331,21 +4896,6 @@ impl ConfigHandler {
                 new_filters.inactive_server_port_aggregation
             );
             filters.inactive_server_port_aggregation = new_filters.inactive_server_port_aggregation;
-        }
-        if filters.npm_metrics != new_filters.npm_metrics {
-            info!(
-                "Update outputs.flow_metrics.filters.npm_metrics from {:?} to {:?}.",
-                filters.npm_metrics, new_filters.npm_metrics
-            );
-            filters.npm_metrics = new_filters.npm_metrics;
-        }
-        if filters.npm_metrics_concurrent != new_filters.npm_metrics_concurrent {
-            info!(
-                "Update outputs.flow_metrics.filters.npm_metrics_concurrent from {:?} to {:?}.",
-                filters.npm_metrics_concurrent, new_filters.npm_metrics_concurrent
-            );
-            filters.npm_metrics_concurrent = new_filters.npm_metrics_concurrent;
-            restart_dispatcher = true;
         }
         if filters.second_metrics != new_filters.second_metrics {
             info!(
@@ -4356,25 +4906,19 @@ impl ConfigHandler {
         }
         let tunning = &mut outputs.flow_metrics.tunning;
         let new_tunning = &mut new_outputs.flow_metrics.tunning;
-        if tunning.sender_queue_size != new_tunning.sender_queue_size {
-            info!(
-                "Update outputs.flow_metrics.tunning.sender_queue_size from {:?} to {:?}.",
-                tunning.sender_queue_size, new_tunning.sender_queue_size
-            );
-            tunning.sender_queue_size = new_tunning.sender_queue_size;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [(
+                tunning.sender_queue_size,
+                new_tunning.sender_queue_size,
+                "outputs.flow_metrics.tunning.sender_queue_size"
+            )]
+        );
 
         let npb = &mut outputs.npb;
         let new_npb = &mut new_outputs.npb;
-        if npb.overlay_vlan_header_trimming != new_npb.overlay_vlan_header_trimming {
-            info!(
-                "Update outputs.npb.overlay_vlan_header_trimming from {:?} to {:?}.",
-                npb.overlay_vlan_header_trimming, new_npb.overlay_vlan_header_trimming
-            );
-            npb.overlay_vlan_header_trimming = new_npb.overlay_vlan_header_trimming;
-            restart_agent = !first_run;
-        }
         if npb.traffic_global_dedup != new_npb.traffic_global_dedup {
             info!(
                 "Update outputs.npb.traffic_global_dedup from {:?} to {:?}.",
@@ -4382,14 +4926,23 @@ impl ConfigHandler {
             );
             npb.traffic_global_dedup = new_npb.traffic_global_dedup;
         }
-        if npb.custom_vxlan_flags != new_npb.custom_vxlan_flags {
-            info!(
-                "Update outputs.npb.custom_vxlan_flags from {:?} to {:?}.",
-                npb.custom_vxlan_flags, new_npb.custom_vxlan_flags
-            );
-            npb.custom_vxlan_flags = new_npb.custom_vxlan_flags;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    npb.overlay_vlan_header_trimming,
+                    new_npb.overlay_vlan_header_trimming,
+                    "outputs.npb.overlay_vlan_header_trimming"
+                ),
+                (
+                    npb.custom_vxlan_flags,
+                    new_npb.custom_vxlan_flags,
+                    "outputs.npb.custom_vxlan_flags"
+                )
+            ]
+        );
         if npb.extra_vlan_header != new_npb.extra_vlan_header {
             info!(
                 "Update outputs.npb.extra_vlan_header from {:?} to {:?}.",
@@ -4423,22 +4976,26 @@ impl ConfigHandler {
             );
             npb.raw_udp_vlan_tag = new_npb.raw_udp_vlan_tag;
         }
-        if npb.target_port != new_npb.target_port {
-            info!(
-                "Update outputs.npb.target_port from {:?} to {:?}.",
-                npb.target_port, new_npb.target_port
-            );
-            npb.target_port = new_npb.target_port;
-            restart_agent = !first_run;
-        }
-        if outputs.compression != new_outputs.compression {
-            info!(
-                "Update outputs.compression from {:?} to {:?}.",
-                outputs.compression, new_outputs.compression
-            );
-            outputs.compression = new_outputs.compression.clone();
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [(
+                npb.target_port,
+                new_npb.target_port,
+                "outputs.npb.target_port"
+            )]
+        );
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [(
+                outputs.compression,
+                new_outputs.compression,
+                "outputs.compression"
+            )]
+        );
 
         // plugins
         let plugins = &mut config.plugins;
@@ -4472,169 +5029,152 @@ impl ConfigHandler {
         let new_packet = &mut new_processors.packet;
         let pcap = &mut packet.pcap_stream;
         let new_pcap = &mut new_packet.pcap_stream;
-        if pcap.buffer_size_per_flow != new_pcap.buffer_size_per_flow {
-            info!(
-                "Update processors.packet.pcap_stream.buffer_size_per_flow from {:?} to {:?}.",
-                pcap.buffer_size_per_flow, new_pcap.buffer_size_per_flow
-            );
-            pcap.buffer_size_per_flow = new_pcap.buffer_size_per_flow;
-            restart_agent = !first_run;
-        }
-        if pcap.flush_interval != new_pcap.flush_interval {
-            info!(
-                "Update processors.packet.pcap_stream.flush_interval from {:?} to {:?}.",
-                pcap.flush_interval, new_pcap.flush_interval
-            );
-            pcap.flush_interval = new_pcap.flush_interval;
-            restart_agent = !first_run;
-        }
-        if pcap.receiver_queue_size != new_pcap.receiver_queue_size {
-            info!(
-                "Update processors.packet.pcap_stream.receiver_queue_size from {:?} to {:?}.",
-                pcap.receiver_queue_size, new_pcap.receiver_queue_size
-            );
-            pcap.receiver_queue_size = new_pcap.receiver_queue_size;
-            restart_agent = !first_run;
-        }
-        if pcap.total_buffer_size != new_pcap.total_buffer_size {
-            info!(
-                "Update processors.packet.pcap_stream.total_buffer_size from {:?} to {:?}.",
-                pcap.total_buffer_size, new_pcap.total_buffer_size
-            );
-            pcap.total_buffer_size = new_pcap.total_buffer_size;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    pcap.buffer_size_per_flow,
+                    new_pcap.buffer_size_per_flow,
+                    "processors.packet.pcap_stream.buffer_size_per_flow"
+                ),
+                (
+                    pcap.flush_interval,
+                    new_pcap.flush_interval,
+                    "processors.packet.pcap_stream.flush_interval"
+                ),
+                (
+                    pcap.receiver_queue_size,
+                    new_pcap.receiver_queue_size,
+                    "processors.packet.pcap_stream.receiver_queue_size"
+                ),
+                (
+                    pcap.total_buffer_size,
+                    new_pcap.total_buffer_size,
+                    "processors.packet.pcap_stream.total_buffer_size"
+                )
+            ]
+        );
 
         let policy = &mut packet.policy;
         let new_policy = &mut new_packet.policy;
-        if policy.fast_path_disabled != new_policy.fast_path_disabled {
-            info!(
-                "Update processors.packet.policy.fast_path_disabled from {:?} to {:?}.",
-                policy.fast_path_disabled, new_policy.fast_path_disabled
-            );
-            policy.fast_path_disabled = new_policy.fast_path_disabled;
-            restart_agent = !first_run;
-        }
-        if policy.fast_path_map_size != new_policy.fast_path_map_size {
-            info!(
-                "Update processors.packet.policy.fast_path_map_size from {:?} to {:?}.",
-                policy.fast_path_map_size, new_policy.fast_path_map_size
-            );
-            policy.fast_path_map_size = new_policy.fast_path_map_size;
-            restart_agent = !first_run;
-        }
-        if policy.forward_table_capacity != new_policy.forward_table_capacity {
-            info!(
-                "Update processors.packet.policy.forward_table_capacity from {:?} to {:?}.",
-                policy.forward_table_capacity, new_policy.forward_table_capacity
-            );
-            policy.forward_table_capacity = new_policy.forward_table_capacity;
-            restart_agent = !first_run;
-        }
-        if policy.max_first_path_level != new_policy.max_first_path_level {
-            info!(
-                "Update processors.packet.policy.max_first_path_level from {:?} to {:?}.",
-                policy.max_first_path_level, new_policy.max_first_path_level
-            );
-            policy.max_first_path_level = new_policy.max_first_path_level;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    policy.fast_path_disabled,
+                    new_policy.fast_path_disabled,
+                    "processors.packet.policy.fast_path_disabled"
+                ),
+                (
+                    policy.fast_path_map_size,
+                    new_policy.fast_path_map_size,
+                    "processors.packet.policy.fast_path_map_size"
+                ),
+                (
+                    policy.forward_table_capacity,
+                    new_policy.forward_table_capacity,
+                    "processors.packet.policy.forward_table_capacity"
+                ),
+                (
+                    policy.max_first_path_level,
+                    new_policy.max_first_path_level,
+                    "processors.packet.policy.max_first_path_level"
+                )
+            ]
+        );
 
         let tcp_header = &mut packet.tcp_header;
         let new_tcp_header = &mut new_packet.tcp_header;
-        if tcp_header.block_size != new_tcp_header.block_size {
-            info!(
-                "Update processors.packet.tcp_header.block_size from {:?} to {:?}.",
-                tcp_header.block_size, new_tcp_header.block_size
-            );
-            tcp_header.block_size = new_tcp_header.block_size;
-            restart_agent = !first_run;
-        }
-        if tcp_header.header_fields_flag != new_tcp_header.header_fields_flag {
-            info!(
-                "Update processors.packet.tcp_header.header_fields_flag from {:?} to {:?}.",
-                tcp_header.header_fields_flag, new_tcp_header.header_fields_flag
-            );
-            tcp_header.header_fields_flag = new_tcp_header.header_fields_flag;
-            restart_agent = !first_run;
-        }
-        if tcp_header.sender_queue_size != new_tcp_header.sender_queue_size {
-            info!(
-                "Update processors.packet.tcp_header.sender_queue_size from {:?} to {:?}.",
-                tcp_header.sender_queue_size, new_tcp_header.sender_queue_size
-            );
-            tcp_header.sender_queue_size = new_tcp_header.sender_queue_size;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    tcp_header.block_size,
+                    new_tcp_header.block_size,
+                    "processors.packet.tcp_header.block_size"
+                ),
+                (
+                    tcp_header.header_fields_flag,
+                    new_tcp_header.header_fields_flag,
+                    "processors.packet.tcp_header.header_fields_flag"
+                ),
+                (
+                    tcp_header.sender_queue_size,
+                    new_tcp_header.sender_queue_size,
+                    "processors.packet.tcp_header.sender_queue_size"
+                )
+            ]
+        );
 
         let toa = &mut packet.toa;
         let new_toa = &mut new_packet.toa;
-        if toa.cache_size != new_toa.cache_size {
-            info!(
-                "Update processors.packet.toa.cache_size from {:?} to {:?}.",
-                toa.cache_size, new_toa.cache_size
-            );
-            toa.cache_size = new_toa.cache_size;
-            restart_agent = !first_run;
-        }
-        if toa.sender_queue_size != new_toa.sender_queue_size {
-            info!(
-                "Update processors.packet.toa.sender_queue_size from {:?} to {:?}.",
-                toa.sender_queue_size, new_toa.sender_queue_size
-            );
-            toa.sender_queue_size = new_toa.sender_queue_size;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    toa.cache_size,
+                    new_toa.cache_size,
+                    "processors.packet.toa.cache_size"
+                ),
+                (
+                    toa.sender_queue_size,
+                    new_toa.sender_queue_size,
+                    "processors.packet.toa.sender_queue_size"
+                )
+            ]
+        );
 
         let flow_log = &mut processors.flow_log;
         let new_flow_log = &mut new_processors.flow_log;
         let conntrack = &mut flow_log.conntrack;
         let new_conntrack = &mut new_flow_log.conntrack;
-        if conntrack.flow_flush_interval != new_conntrack.flow_flush_interval {
-            info!(
-                "Update processors.flow_log.conntrack.flow_flush_interval from {:?} to {:?}.",
-                conntrack.flow_flush_interval, new_conntrack.flow_flush_interval
-            );
-            conntrack.flow_flush_interval = new_conntrack.flow_flush_interval;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [(
+                conntrack.flow_flush_interval,
+                new_conntrack.flow_flush_interval,
+                "processors.flow_log.conntrack.flow_flush_interval"
+            )]
+        );
         let flow_generation = &mut conntrack.flow_generation;
         let new_flow_generation = &mut new_conntrack.flow_generation;
-        if flow_generation.cloud_traffic_ignore_mac != new_flow_generation.cloud_traffic_ignore_mac
-        {
-            info!(
-                "Update processors.flow_log.conntrack.flow_generation.cloud_traffic_ignore_mac from {:?} to {:?}.",
-                flow_generation.cloud_traffic_ignore_mac,
-                new_flow_generation.cloud_traffic_ignore_mac
-            );
-            flow_generation.cloud_traffic_ignore_mac = new_flow_generation.cloud_traffic_ignore_mac;
-            restart_agent = !first_run;
-        }
-        if flow_generation.idc_traffic_ignore_vlan != new_flow_generation.idc_traffic_ignore_vlan {
-            info!(
-                "Update processors.flow_log.conntrack.flow_generation.idc_traffic_ignore_vlan from {:?} to {:?}.",
-                flow_generation.idc_traffic_ignore_vlan,
-                new_flow_generation.idc_traffic_ignore_vlan
-            );
-            flow_generation.idc_traffic_ignore_vlan = new_flow_generation.idc_traffic_ignore_vlan;
-            restart_agent = !first_run;
-        }
-        if flow_generation.ignore_l2_end != new_flow_generation.ignore_l2_end {
-            info!(
-                "Update processors.flow_log.conntrack.flow_generation.ignore_l2_end from {:?} to {:?}.",
-                flow_generation.ignore_l2_end, new_flow_generation.ignore_l2_end
-            );
-            flow_generation.ignore_l2_end = new_flow_generation.ignore_l2_end;
-            restart_agent = !first_run;
-        }
-        if flow_generation.server_ports != new_flow_generation.server_ports {
-            info!(
-                "Update processors.flow_log.conntrack.flow_generation.server_ports from {:?} to {:?}.",
-                flow_generation.server_ports, new_flow_generation.server_ports
-            );
-            flow_generation.server_ports = new_flow_generation.server_ports.clone();
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    flow_generation.cloud_traffic_ignore_mac,
+                    new_flow_generation.cloud_traffic_ignore_mac,
+                    "processors.flow_log.conntrack.flow_generation.cloud_traffic_ignore_mac"
+                ),
+                (
+                    flow_generation.idc_traffic_ignore_vlan,
+                    new_flow_generation.idc_traffic_ignore_vlan,
+                    "processors.flow_log.conntrack.flow_generation.idc_traffic_ignore_vlan"
+                ),
+                (
+                    flow_generation.ignore_l2_end,
+                    new_flow_generation.ignore_l2_end,
+                    "processors.flow_log.conntrack.flow_generation.ignore_l2_end"
+                ),
+                (
+                    flow_generation.server_ports,
+                    new_flow_generation.server_ports,
+                    "processors.flow_log.conntrack.flow_generation.server_ports"
+                )
+            ]
+        );
 
         let timeouts = &mut conntrack.timeouts;
         let new_timeouts = &mut new_conntrack.timeouts;
@@ -4644,7 +5184,6 @@ impl ConfigHandler {
                 timeouts.closing_rst, new_timeouts.closing_rst
             );
             timeouts.closing_rst = new_timeouts.closing_rst;
-            restart_agent = !first_run;
         }
         if timeouts.established != new_timeouts.established {
             info!(
@@ -4652,7 +5191,6 @@ impl ConfigHandler {
                 timeouts.established, new_timeouts.established
             );
             timeouts.established = new_timeouts.established;
-            restart_agent = !first_run;
         }
         if timeouts.opening_rst != new_timeouts.opening_rst {
             info!(
@@ -4660,7 +5198,6 @@ impl ConfigHandler {
                 timeouts.opening_rst, new_timeouts.opening_rst
             );
             timeouts.opening_rst = new_timeouts.opening_rst;
-            restart_agent = !first_run;
         }
         if timeouts.others != new_timeouts.others {
             info!(
@@ -4668,141 +5205,133 @@ impl ConfigHandler {
                 timeouts.others, new_timeouts.others
             );
             timeouts.others = new_timeouts.others;
-            restart_agent = !first_run;
         }
 
         let time_window = &mut flow_log.time_window;
         let new_time_window = &mut new_flow_log.time_window;
-        if time_window.extra_tolerable_flow_delay != new_time_window.extra_tolerable_flow_delay {
-            info!(
-                "Update processors.flow_log.time_window.extra_tolerable_flow_delay from {:?} to {:?}.",
-                time_window.extra_tolerable_flow_delay, new_time_window.extra_tolerable_flow_delay
-            );
-            time_window.extra_tolerable_flow_delay = new_time_window.extra_tolerable_flow_delay;
-            restart_agent = !first_run;
-        }
-        if time_window.max_tolerable_packet_delay != new_time_window.max_tolerable_packet_delay {
-            info!(
-                "Update processors.flow_log.time_window.max_tolerable_packet_delay from {:?} to {:?}.",
-                time_window.max_tolerable_packet_delay, new_time_window.max_tolerable_packet_delay
-            );
-            time_window.max_tolerable_packet_delay = new_time_window.max_tolerable_packet_delay;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    time_window.extra_tolerable_flow_delay,
+                    new_time_window.extra_tolerable_flow_delay,
+                    "processors.flow_log.time_window.extra_tolerable_flow_delay"
+                ),
+                (
+                    time_window.max_tolerable_packet_delay,
+                    new_time_window.max_tolerable_packet_delay,
+                    "processors.flow_log.time_window.max_tolerable_packet_delay"
+                )
+            ]
+        );
 
         let tunning = &mut flow_log.tunning;
         let new_tunning = &mut new_flow_log.tunning;
-        if tunning.concurrent_flow_limit != new_tunning.concurrent_flow_limit {
-            info!(
-                "Update processors.flow_log.tunning.concurrent_flow_limit from {:?} to {:?}.",
-                tunning.concurrent_flow_limit, new_tunning.concurrent_flow_limit
-            );
-            tunning.concurrent_flow_limit = new_tunning.concurrent_flow_limit;
-            restart_agent = !first_run;
-        }
-        if tunning.flow_aggregator_queue_size != new_tunning.flow_aggregator_queue_size {
-            info!(
-                "Update processors.flow_log.tunning.flow_aggregator_queue_size from {:?} to {:?}.",
-                tunning.flow_aggregator_queue_size, new_tunning.flow_aggregator_queue_size
-            );
-            tunning.flow_aggregator_queue_size = new_tunning.flow_aggregator_queue_size;
-            restart_agent = !first_run;
-        }
-        if tunning.flow_generator_queue_size != new_tunning.flow_generator_queue_size {
-            info!(
-                "Update processors.flow_log.tunning.flow_generator_queue_size from {:?} to {:?}.",
-                tunning.flow_generator_queue_size, new_tunning.flow_generator_queue_size
-            );
-            tunning.flow_generator_queue_size = new_tunning.flow_generator_queue_size;
-            restart_agent = !first_run;
-        }
-        if tunning.flow_map_hash_slots != new_tunning.flow_map_hash_slots {
-            info!(
-                "Update processors.flow_log.tunning.flow_map_hash_slots from {:?} to {:?}.",
-                tunning.flow_map_hash_slots, new_tunning.flow_map_hash_slots
-            );
-            tunning.flow_map_hash_slots = new_tunning.flow_map_hash_slots;
-            restart_agent = !first_run;
-        }
-        if tunning.max_batched_buffer_size != new_tunning.max_batched_buffer_size {
-            info!(
-                "Update processors.flow_log.tunning.max_batched_buffer_size from {:?} to {:?}.",
-                tunning.max_batched_buffer_size, new_tunning.max_batched_buffer_size
-            );
-            tunning.max_batched_buffer_size = new_tunning.max_batched_buffer_size;
-            restart_agent = !first_run;
-        }
-        if tunning.memory_pool_size != new_tunning.memory_pool_size {
-            info!(
-                "Update processors.flow_log.tunning.memory_pool_size from {:?} to {:?}.",
-                tunning.memory_pool_size, new_tunning.memory_pool_size
-            );
-            tunning.memory_pool_size = new_tunning.memory_pool_size;
-            restart_agent = !first_run;
-        }
-        if tunning.quadruple_generator_queue_size != new_tunning.quadruple_generator_queue_size {
-            info!(
-                "Update processors.flow_log.tunning.quadruple_generator_queue_size from {:?} to {:?}.",
-                tunning.quadruple_generator_queue_size, new_tunning.quadruple_generator_queue_size
-            );
-            tunning.quadruple_generator_queue_size = new_tunning.quadruple_generator_queue_size;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    tunning.rrt_cache_capacity,
+                    new_tunning.rrt_cache_capacity,
+                    "processors.flow_log.tunning.rrt_cache_capacity"
+                ),
+                (
+                    tunning.concurrent_flow_limit,
+                    new_tunning.concurrent_flow_limit,
+                    "processors.flow_log.tunning.concurrent_flow_limit"
+                ),
+                (
+                    tunning.flow_aggregator_queue_size,
+                    new_tunning.flow_aggregator_queue_size,
+                    "processors.flow_log.tunning.flow_aggregator_queue_size"
+                ),
+                (
+                    tunning.flow_generator_queue_size,
+                    new_tunning.flow_generator_queue_size,
+                    "processors.flow_log.tunning.flow_generator_queue_size"
+                ),
+                (
+                    tunning.flow_map_hash_slots,
+                    new_tunning.flow_map_hash_slots,
+                    "processors.flow_log.tunning.flow_map_hash_slots"
+                ),
+                (
+                    tunning.max_batched_buffer_size,
+                    new_tunning.max_batched_buffer_size,
+                    "processors.flow_log.tunning.max_batched_buffer_size"
+                ),
+                (
+                    tunning.memory_pool_size,
+                    new_tunning.memory_pool_size,
+                    "processors.flow_log.tunning.memory_pool_size"
+                ),
+                (
+                    tunning.quadruple_generator_queue_size,
+                    new_tunning.quadruple_generator_queue_size,
+                    "processors.flow_log.tunning.quadruple_generator_queue_size"
+                )
+            ]
+        );
 
         let request_log = &mut processors.request_log;
         let new_request_log = &mut new_processors.request_log;
         let app = &mut request_log.application_protocol_inference;
         let new_app = &mut new_request_log.application_protocol_inference;
-        if app.enabled_protocols != new_app.enabled_protocols {
-            info!(
-                "Update processors.request_log.application_protocol_inference.enabled_protocols from {:?} to {:?}.",
-                app.enabled_protocols, new_app.enabled_protocols
-            );
-            app.enabled_protocols = new_app.enabled_protocols.clone();
-            restart_agent = !first_run;
-        }
-        if app.inference_max_retries != new_app.inference_max_retries {
-            info!(
-                "Update processors.request_log.application_protocol_inference.inference_max_retries from {:?} to {:?}.",
-                app.inference_max_retries, new_app.inference_max_retries
-            );
-            app.inference_max_retries = new_app.inference_max_retries;
-            restart_agent = !first_run;
-        }
-        if app.inference_result_ttl != new_app.inference_result_ttl {
-            info!(
-                "Update processors.request_log.application_protocol_inference.inference_result_ttl from {:?} to {:?}.",
-                app.inference_result_ttl, new_app.inference_result_ttl
-            );
-            app.inference_result_ttl = new_app.inference_result_ttl;
-            restart_agent = !first_run;
-        }
-        if app.protocol_special_config != new_app.protocol_special_config {
-            info!(
-                "Update processors.request_log.application_protocol_inference.protocol_special_config from {:?} to {:?}.",
-                app.protocol_special_config, new_app.protocol_special_config
-            );
-            app.protocol_special_config = new_app.protocol_special_config;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    app.enabled_protocols,
+                    new_app.enabled_protocols,
+                    "processors.request_log.application_protocol_inference.enabled_protocols"
+                ),
+                (
+                    app.inference_max_retries,
+                    new_app.inference_max_retries,
+                    "processors.request_log.application_protocol_inference.inference_max_retries"
+                ),
+                (
+                    app.inference_result_ttl,
+                    new_app.inference_result_ttl,
+                    "processors.request_log.application_protocol_inference.inference_result_ttl"
+                ),
+                (
+                    app.inference_whitelist,
+                    new_app.inference_whitelist,
+                    "processors.request_log.application_protocol_inference.inference_whitelist"
+                ),
+                (
+                    app.protocol_special_config,
+                    new_app.protocol_special_config,
+                    "processors.request_log.application_protocol_inference.protocol_special_config"
+                )
+            ]
+        );
         let filters = &mut request_log.filters;
         let new_filters = &mut new_request_log.filters;
-        if filters.port_number_prefilters != new_filters.port_number_prefilters {
-            info!(
-                "Update processors.request_log.filters.port_number_prefilters from {:?} to {:?}.",
-                filters.port_number_prefilters, new_filters.port_number_prefilters
-            );
-            filters.port_number_prefilters = new_filters.port_number_prefilters.clone();
-            restart_agent = !first_run;
-        }
-        if filters.tag_filters != new_filters.tag_filters {
-            info!(
-                "Update processors.request_log.filters.tag_filters from {:?} to {:?}.",
-                filters.tag_filters, new_filters.tag_filters
-            );
-            filters.tag_filters = new_filters.tag_filters.clone();
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    filters.port_number_prefilters,
+                    new_filters.port_number_prefilters,
+                    "processors.request_log.filters.port_number_prefilters"
+                ),
+                (
+                    filters.tag_filters,
+                    new_filters.tag_filters,
+                    "processors.request_log.filters.tag_filters"
+                )
+            ]
+        );
         if filters.unconcerned_dns_nxdomain_response_suffixes
             != new_filters.unconcerned_dns_nxdomain_response_suffixes
         {
@@ -4814,7 +5343,6 @@ impl ConfigHandler {
             filters.unconcerned_dns_nxdomain_response_suffixes = new_filters
                 .unconcerned_dns_nxdomain_response_suffixes
                 .clone();
-            restart_agent = !first_run;
         }
         if filters.cbpf_disabled != new_filters.cbpf_disabled {
             info!(
@@ -4825,22 +5353,23 @@ impl ConfigHandler {
         }
         let timeouts = &mut request_log.timeouts;
         let new_timeouts = &mut new_request_log.timeouts;
-        if timeouts.tcp_request_timeout != new_timeouts.tcp_request_timeout {
-            info!(
-                "Update processors.request_log.timeouts.tcp_request_timeout from {:?} to {:?}.",
-                timeouts.tcp_request_timeout, new_timeouts.tcp_request_timeout
-            );
-            timeouts.tcp_request_timeout = new_timeouts.tcp_request_timeout;
-            restart_agent = !first_run;
-        }
-        if timeouts.udp_request_timeout != new_timeouts.udp_request_timeout {
-            info!(
-                "Update processors.request_log.timeouts.udp_request_timeout from {:?} to {:?}.",
-                timeouts.udp_request_timeout, new_timeouts.udp_request_timeout
-            );
-            timeouts.udp_request_timeout = new_timeouts.udp_request_timeout;
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    timeouts.tcp_request_timeout,
+                    new_timeouts.tcp_request_timeout,
+                    "processors.request_log.timeouts.tcp_request_timeout"
+                ),
+                (
+                    timeouts.udp_request_timeout,
+                    new_timeouts.udp_request_timeout,
+                    "processors.request_log.timeouts.udp_request_timeout"
+                )
+            ]
+        );
         if timeouts.session_aggregate != new_timeouts.session_aggregate {
             info!(
                 "Update processors.request_log.timeouts.session_aggregate from {:?} to {:?}.",
@@ -4851,30 +5380,28 @@ impl ConfigHandler {
 
         let tag_extraction = &mut request_log.tag_extraction;
         let new_tag_extraction = &mut new_request_log.tag_extraction;
-        if tag_extraction.custom_fields != new_tag_extraction.custom_fields {
-            info!(
-                "Update processors.request_log.tag_extraction.custom_fields from {:?} to {:?}.",
-                tag_extraction.custom_fields, new_tag_extraction.custom_fields
-            );
-            tag_extraction.custom_fields = new_tag_extraction.custom_fields.clone();
-            restart_agent = !first_run;
-        }
-        if tag_extraction.http_endpoint != new_tag_extraction.http_endpoint {
-            info!(
-                "Update processors.request_log.tag_extraction.http_endpoint from {:?} to {:?}.",
-                tag_extraction.http_endpoint, new_tag_extraction.http_endpoint
-            );
-            tag_extraction.http_endpoint = new_tag_extraction.http_endpoint.clone();
-            restart_agent = !first_run;
-        }
-        if tag_extraction.obfuscate_protocols != new_tag_extraction.obfuscate_protocols {
-            info!(
-                "Update processors.request_log.tag_extraction.obfuscate_protocols from {:?} to {:?}.",
-                tag_extraction.obfuscate_protocols, new_tag_extraction.obfuscate_protocols
-            );
-            tag_extraction.obfuscate_protocols = new_tag_extraction.obfuscate_protocols.clone();
-            restart_agent = !first_run;
-        }
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [
+                (
+                    tag_extraction.custom_fields,
+                    new_tag_extraction.custom_fields,
+                    "processors.request_log.tag_extraction.custom_fields"
+                ),
+                (
+                    tag_extraction.http_endpoint,
+                    new_tag_extraction.http_endpoint,
+                    "processors.request_log.tag_extraction.http_endpoint"
+                ),
+                (
+                    tag_extraction.obfuscate_protocols,
+                    new_tag_extraction.obfuscate_protocols,
+                    "processors.request_log.tag_extraction.obfuscate_protocols"
+                )
+            ]
+        );
         if tag_extraction.tracing_tag != new_tag_extraction.tracing_tag {
             info!(
                 "Update processors.request_log.tag_extraction.tracing_tag from {:?} to {:?}.",
@@ -4882,21 +5409,45 @@ impl ConfigHandler {
             );
             tag_extraction.tracing_tag = new_tag_extraction.tracing_tag.clone();
         }
+        let raw = &mut tag_extraction.raw;
+        let new_raw = &mut new_tag_extraction.raw;
+        if raw.error_request_header != new_raw.error_request_header {
+            info!("Update processors.request_log.tag_extraction.raw.error_request_header from {:?} to {:?}.",
+                raw.error_request_header, new_raw.error_request_header
+            );
+            raw.error_request_header = new_raw.error_request_header;
+        }
+        if raw.error_response_header != new_raw.error_response_header {
+            info!("Update processors.request_log.tag_extraction.raw.error_response_header from {:?} to {:?}.",
+                raw.error_response_header, new_raw.error_response_header
+            );
+            raw.error_response_header = new_raw.error_response_header;
+        }
+        if raw.error_request_payload != new_raw.error_request_payload {
+            info!("Update processors.request_log.tag_extraction.raw.error_request_payload from {:?} to {:?}.",
+                raw.error_request_payload, new_raw.error_request_payload
+            );
+            raw.error_request_payload = new_raw.error_request_payload;
+        }
+        if raw.error_response_payload != new_raw.error_response_payload {
+            info!("Update processors.request_log.tag_extraction.raw.error_response_payload from {:?} to {:?}.",
+                raw.error_response_payload, new_raw.error_response_payload
+            );
+            raw.error_response_payload = new_raw.error_response_payload;
+        }
 
         let tunning = &mut request_log.tunning;
         let new_tunning = &mut new_request_log.tunning;
-        if tunning.consistent_timestamp_in_l7_metrics
-            != new_tunning.consistent_timestamp_in_l7_metrics
-        {
-            info!(
-                "Update processors.request_log.tunning.consistent_timestamp_in_l7_metrics from {:?} to {:?}.",
+        update_fields_with_restart_reason!(
+            restart_agent,
+            !first_run,
+            agent_restart_reasons,
+            [(
                 tunning.consistent_timestamp_in_l7_metrics,
-                new_tunning.consistent_timestamp_in_l7_metrics
-            );
-            tunning.consistent_timestamp_in_l7_metrics =
-                new_tunning.consistent_timestamp_in_l7_metrics;
-            restart_agent = !first_run;
-        }
+                new_tunning.consistent_timestamp_in_l7_metrics,
+                "processors.request_log.tunning.consistent_timestamp_in_l7_metrics"
+            )]
+        );
         if tunning.payload_truncation != new_tunning.payload_truncation {
             info!(
                 "Update processors.request_log.tunning.payload_truncation from {:?} to {:?}.",
@@ -4912,21 +5463,25 @@ impl ConfigHandler {
             tunning.session_aggregate_max_entries = new_tunning.session_aggregate_max_entries;
         }
 
-        let vector = &mut config.inputs.vector;
-        let new_vector = &mut new_config.user_config.inputs.vector;
-        if vector.enabled != new_vector.enabled || vector.config != new_vector.config {
-            info!(
-                "vector inputs.vector from {:#?} to {:#?}",
-                vector, new_vector
-            );
-            if components.is_some() {
-                callbacks.push(Self::set_vector);
+        #[cfg(feature = "enterprise-integration")]
+        {
+            let vector = &mut config.inputs.vector;
+            let new_vector = &mut new_config.user_config.inputs.vector;
+            if vector.enabled != new_vector.enabled || vector.config != new_vector.config {
+                info!(
+                    "vector inputs.vector from {:#?} to {:#?}",
+                    vector, new_vector
+                );
+                if components.is_some() {
+                    callbacks.push(Self::set_vector);
+                }
+                vector.enabled = new_vector.enabled;
+                vector.config = new_vector.config.clone();
             }
-            vector.enabled = new_vector.enabled;
-            vector.config = new_vector.config.clone();
         }
 
         candidate_config.enabled = new_config.enabled;
+        let old_capture_mode = candidate_config.capture_mode;
         candidate_config.capture_mode = new_config.capture_mode;
         if candidate_config.dispatcher != new_config.dispatcher {
             #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -4954,6 +5509,12 @@ impl ConfigHandler {
                     != candidate_config.get_flow_capacity(candidate_config.dispatcher.max_memory)
             {
                 restart_dispatcher = true;
+                dispatcher_restart_reasons.insert(Cow::Owned(format!(
+                    "capture_mode: {old_capture_mode:?} -> {:?}; dispatcher.max_memory: {:?} -> {:?}",
+                    new_config.capture_mode,
+                    candidate_config.dispatcher.max_memory,
+                    new_config.dispatcher.max_memory,
+                )));
             }
 
             debug!(
@@ -5031,6 +5592,14 @@ impl ConfigHandler {
                         candidate_config.environment.max_memory,
                     )) {
                         warn!("set container resources limit failed: {:?}", e);
+                    } else {
+                        warn!(
+                            "container resource limit updated: cpu {}c -> {}c, memory {}B -> {}B, the agent will restart",
+                            self.container_cpu_limit as f64 / 1000.0,
+                            candidate_config.environment.max_millicpus as f64 / 1000.0,
+                            self.container_mem_limit,
+                            candidate_config.environment.max_memory
+                        );
                     };
                 }
             }
@@ -5057,6 +5626,11 @@ impl ConfigHandler {
         if candidate_config.flow != new_config.flow {
             if candidate_config.flow.collector_enabled != new_config.flow.collector_enabled {
                 restart_dispatcher = true;
+                dispatcher_restart_reasons.insert(changed_reason(
+                    "flow.collector_enabled",
+                    &candidate_config.flow.collector_enabled,
+                    &new_config.flow.collector_enabled,
+                ));
             }
             debug!(
                 "flow_generator config change from {:#?} to {:#?}",
@@ -5080,9 +5654,17 @@ impl ConfigHandler {
                 "collector config change from {:#?} to {:#?}",
                 candidate_config.collector, new_config.collector
             );
-            restart_dispatcher = candidate_config.collector.agent_id
+            let restart_value = candidate_config.collector.agent_id
                 != new_config.collector.agent_id
                 && new_config.collector.enabled;
+            restart_dispatcher |= restart_value;
+            if restart_value {
+                dispatcher_restart_reasons.insert(changed_reason(
+                    "collector.agent_id",
+                    &candidate_config.collector.agent_id,
+                    &new_config.collector.agent_id,
+                ));
+            }
             candidate_config.collector = new_config.collector.clone();
         }
 
@@ -5124,18 +5706,33 @@ impl ConfigHandler {
             {
                 if candidate_config.sender.enabled != new_config.sender.enabled {
                     restart_dispatcher = true;
+                    dispatcher_restart_reasons.insert(changed_reason(
+                        "sender.enabled",
+                        &candidate_config.sender.enabled,
+                        &new_config.sender.enabled,
+                    ));
                 }
             }
 
             if candidate_config.sender.npb_socket_type != new_config.sender.npb_socket_type {
                 if candidate_config.capture_mode != PacketCaptureType::Analyzer {
                     restart_dispatcher = true;
+                    dispatcher_restart_reasons.insert(changed_reason(
+                        "sender.npb_socket_type",
+                        &candidate_config.sender.npb_socket_type,
+                        &new_config.sender.npb_socket_type,
+                    ));
                 }
             }
 
             if candidate_config.sender.npb_dedup_enabled != new_config.sender.npb_dedup_enabled {
                 if candidate_config.capture_mode != PacketCaptureType::Analyzer {
                     restart_dispatcher = true;
+                    dispatcher_restart_reasons.insert(changed_reason(
+                        "sender.npb_dedup_enabled",
+                        &candidate_config.sender.npb_dedup_enabled,
+                        &new_config.sender.npb_dedup_enabled,
+                    ));
                 }
             }
 
@@ -5150,6 +5747,11 @@ impl ConfigHandler {
             if candidate_config.handler.npb_dedup_enabled != new_config.handler.npb_dedup_enabled {
                 if candidate_config.capture_mode != PacketCaptureType::Analyzer {
                     restart_dispatcher = true;
+                    dispatcher_restart_reasons.insert(changed_reason(
+                        "handler.npb_dedup_enabled",
+                        &candidate_config.handler.npb_dedup_enabled,
+                        &new_config.handler.npb_dedup_enabled,
+                    ));
                 }
             }
             debug!(
@@ -5159,12 +5761,50 @@ impl ConfigHandler {
             candidate_config.handler = new_config.handler.clone();
         }
 
+        // this comparison does not include custom_protocol_config and custom_field_policies
+        // do not copy these two fields when log parser config changed
         if candidate_config.log_parser != new_config.log_parser {
             debug!(
                 "log_parser config change from {:#?} to {:#?}",
                 candidate_config.log_parser, new_config.log_parser
             );
-            candidate_config.log_parser = new_config.log_parser.clone();
+            let old_app = &mut candidate_config.log_parser.custom_app;
+            #[cfg(feature = "enterprise")]
+            {
+                let new_app = &mut new_config.log_parser.custom_app;
+                if old_app.version != new_app.version {
+                    let old = old_app.custom_protocol_config.take();
+                    if let Some(config) = new_app.custom_protocol_config.take() {
+                        debug!("custom_protocol_config change from {old:#?} to {config:#?}");
+                        old_app.custom_protocol_config.replace(config);
+                    } else if old.is_some() {
+                        debug!("custom_protocol_config removed");
+                    }
+
+                    if let Some(old) = old_app.custom_field_policies.take() {
+                        stats_collector.deregister_countables(old.counters().map(|(m, _)| m));
+                    }
+                    if let Some(cfp) = new_app.custom_field_policies.take() {
+                        debug!("custom_field_policies change from {old:#?} to {cfp:#?}");
+                        stats_collector.register_countables(cfp.counters());
+                        old_app.custom_field_policies.replace(cfp);
+                    } else if old.is_some() {
+                        debug!("custom_field_policies removed");
+                    }
+                    old_app.version = new_app.version;
+                }
+            }
+            candidate_config.log_parser = LogParserConfig {
+                // custom_app is updated in the above code into old_app
+                custom_app: CustomAppConfig {
+                    version: old_app.version,
+                    #[cfg(feature = "enterprise")]
+                    custom_protocol_config: old_app.custom_protocol_config.take(),
+                    #[cfg(feature = "enterprise")]
+                    custom_field_policies: old_app.custom_field_policies.take(),
+                },
+                ..new_config.log_parser.clone()
+            };
         }
 
         if candidate_config.synchronizer != new_config.synchronizer {
@@ -5175,9 +5815,21 @@ impl ConfigHandler {
             candidate_config.synchronizer = new_config.synchronizer.clone();
         }
 
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(all(unix, feature = "libtrace"))]
         if candidate_config.ebpf != new_config.ebpf {
             if candidate_config.capture_mode != PacketCaptureType::Analyzer {
+                // Check if language-specific profiling configuration changed (only on dynamic config update, not on first start)
+                if components.is_some()
+                    && candidate_config.ebpf.ebpf.profile.languages
+                        != new_config.ebpf.ebpf.profile.languages
+                {
+                    error!(
+                        "inputs.ebpf.profile.languages changed ({:#?} -> {:#?}), deepflow-agent restart (eBPF maps cannot be dynamically created/destroyed)",
+                        candidate_config.ebpf.ebpf.profile.languages,
+                        new_config.ebpf.ebpf.profile.languages
+                    );
+                    crate::utils::clean_and_exit(public::consts::NORMAL_EXIT_WITH_RESTART);
+                }
                 debug!(
                     "ebpf config change from {:#?} to {:#?}",
                     candidate_config.ebpf, new_config.ebpf
@@ -5219,8 +5871,13 @@ impl ConfigHandler {
                 "npb config change from {:#?} to {:#?}",
                 candidate_config.npb, new_config.npb
             );
-            candidate_config.npb = new_config.npb.clone();
             restart_dispatcher = true;
+            dispatcher_restart_reasons.insert(changed_reason(
+                "npb",
+                &candidate_config.npb,
+                &new_config.npb,
+            ));
+            candidate_config.npb = new_config.npb.clone();
             if components.is_some() {
                 callbacks.push(Self::set_npb);
             }
@@ -5230,10 +5887,11 @@ impl ConfigHandler {
         candidate_config.log = new_config.log.clone();
         candidate_config.port_config = new_config.port_config.clone();
         candidate_config.pcap = new_config.pcap.clone();
+        candidate_config.user_config = new_config.user_config.clone();
 
         if new_config != *candidate_config {
             error!(
-                "Some configurations have not been, updated deepflow-agent restart... please check the code."
+                "on_config safety fallback found unapplied config diff, deepflow-agent restart..."
             );
             error!(
                 "Configurations from {:#?} to {:#?}",
@@ -5256,17 +5914,53 @@ impl ConfigHandler {
                 .source
                 == DpdkSource::Ebpf
         {
-            restart_agent = !first_run;
+            let restart_value = !first_run;
+            restart_agent |= restart_value;
+            if restart_value {
+                agent_restart_reasons.extend(dispatcher_restart_reasons.iter().cloned());
+                agent_restart_reasons.insert(Cow::Owned(format!(
+                    "dispatcher restart escalated to agent restart because inputs.cbpf.special_network.dpdk.source={:?}",
+                    new_config
+                        .user_config
+                        .inputs
+                        .cbpf
+                        .special_network
+                        .dpdk
+                        .source
+                )));
+            }
         }
 
         if restart_agent {
-            warn!("Change configuration and restart agent...");
+            let reasons = agent_restart_reasons
+                .iter()
+                .enumerate()
+                .map(|(i, reason)| format!("\n  {}. {}", i + 1, reason))
+                .collect::<Vec<_>>()
+                .join("");
+            warn!(
+                "restart agent due to {} reason(s) at {}:{}\ndeepflow-agent restart...",
+                agent_restart_reasons.len(),
+                config_update_started_at.to_rfc3339(),
+                reasons
+            );
             crate::utils::clean_and_exit(public::consts::NORMAL_EXIT_WITH_RESTART);
             return vec![];
         }
 
         if restart_dispatcher {
-            warn!("Change configuration and restart dispatcher...");
+            let reasons = dispatcher_restart_reasons
+                .iter()
+                .enumerate()
+                .map(|(i, reason)| format!("\n  {}. {}", i + 1, reason))
+                .collect::<Vec<_>>()
+                .join("");
+            warn!(
+                "restart dispatcher due to {} reason(s) at {}:{}\nrestarting dispatcher threads...",
+                dispatcher_restart_reasons.len(),
+                config_update_started_at.to_rfc3339(),
+                reasons
+            );
             callbacks.push(Self::set_restart_dispatcher);
         }
 
@@ -5305,6 +5999,16 @@ impl ModuleConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use nix::{
+        sched::{sched_getaffinity, sched_setaffinity},
+        unistd::Pid,
+    };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use std::{
+        sync::{mpsc, Arc, Barrier},
+        thread,
+    };
 
     #[test]
     fn test_new_trie() {
@@ -5405,5 +6109,92 @@ mod tests {
             assert_eq!(tt.decode_trace_id(value).as_ref().map(|s| s.as_ref()), tid);
             assert_eq!(tt.decode_span_id(value).as_ref().map(|s| s.as_ref()), sid);
         }
+    }
+
+    #[test]
+    fn test_domain_name_trie() {
+        let mut trie = DomainNameTrie::default();
+        trie.insert("www.xxx.yyy.zzz");
+        trie.insert("xxx.yyy.zzz");
+
+        assert!(trie.is_unconcerned("vv.www.xxx.yyy.zzz"));
+        assert!(trie.is_unconcerned("www.xxx.yyy.zzz"));
+        assert!(trie.is_unconcerned("xxx.yyy.zzz"));
+        assert!(trie.is_unconcerned("uuu.xxx.yyy.zzz"));
+
+        assert!(!trie.is_unconcerned("xx.yyy.zzz"));
+        assert!(!trie.is_unconcerned("xxx.yyy.zzz.aaa"));
+        assert!(!trie.is_unconcerned("yyy.zzz"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn available_cpu_ids(cpu_set: &CpuSet) -> Vec<usize> {
+        (0..libc::CPU_SETSIZE as usize)
+            .filter(|id| cpu_set.is_set(*id).unwrap_or(false))
+            .collect()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn single_cpu_set(cpu_id: usize) -> CpuSet {
+        let mut cpu_set = CpuSet::new();
+        cpu_set.set(cpu_id).unwrap();
+        cpu_set
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    struct AffinityRestore(CpuSet);
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    impl Drop for AffinityRestore {
+        fn drop(&mut self) {
+            let _ = sched_setaffinity(Pid::from_raw(0), &self.0);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn test_set_cpu_affinity_updates_existing_worker_threads() {
+        let original_cpu_set = sched_getaffinity(Pid::from_raw(0)).unwrap();
+        let _restore = AffinityRestore(original_cpu_set);
+        let available_cpu_ids = available_cpu_ids(&_restore.0);
+        if available_cpu_ids.len() < 2 {
+            return;
+        }
+
+        let target_cpu_id = available_cpu_ids[0];
+        let worker_initial_cpu_id = available_cpu_ids[1];
+        let worker_initial_cpu_set = single_cpu_set(worker_initial_cpu_id);
+        let worker_ready = Arc::new(Barrier::new(2));
+        let worker_check = Arc::new(Barrier::new(2));
+        let (sender, receiver) = mpsc::channel();
+
+        let worker = {
+            let worker_ready = worker_ready.clone();
+            let worker_check = worker_check.clone();
+            thread::spawn(move || {
+                sched_setaffinity(Pid::from_raw(0), &worker_initial_cpu_set).unwrap();
+                worker_ready.wait();
+                worker_check.wait();
+                sender
+                    .send(sched_getaffinity(Pid::from_raw(0)).unwrap())
+                    .unwrap();
+            })
+        };
+
+        worker_ready.wait();
+
+        let mut cpu_set = CpuSet::new();
+        ConfigHandler::set_cpu_affinity(&vec![target_cpu_id], &mut cpu_set);
+
+        worker_check.wait();
+
+        let worker_cpu_set = receiver.recv().unwrap();
+        let main_thread_cpu_set = sched_getaffinity(Pid::from_raw(0)).unwrap();
+        worker.join().unwrap();
+
+        assert!(main_thread_cpu_set.is_set(target_cpu_id).unwrap());
+        assert!(!main_thread_cpu_set.is_set(worker_initial_cpu_id).unwrap());
+        assert!(worker_cpu_set.is_set(target_cpu_id).unwrap());
+        assert!(!worker_cpu_set.is_set(worker_initial_cpu_id).unwrap());
     }
 }

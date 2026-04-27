@@ -23,8 +23,15 @@ use std::net::{IpAddr, ToSocketAddrs};
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(feature = "extended_observability")]
+use std::ffi::CString;
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use envmnt::{ExpandOptions, ExpansionType};
+#[cfg(feature = "extended_observability")]
+use libc::c_int;
+#[cfg(feature = "extended_observability")]
+use log::warn;
 use log::{debug, error, info};
 use md5::{Digest, Md5};
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -37,8 +44,11 @@ use serde::{
 use thiserror::Error;
 use tokio::runtime::Runtime;
 
-use crate::common::l7_protocol_log::L7ProtocolParser;
+use crate::common::l7_protocol_log::{L7ProtocolBitmap, L7ProtocolParser};
 use crate::dispatcher::recv_engine::DEFAULT_BLOCK_SIZE;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(feature = "extended_observability")]
+use crate::ebpf;
 use crate::flow_generator::{DnsLog, MemcachedLog};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::platform::{OsAppTag, ProcessData};
@@ -47,9 +57,14 @@ use crate::{
 };
 
 use public::{
-    bitmap::Bitmap, l7_protocol::L7Protocol, proto::agent,
+    bitmap::Bitmap,
+    l7_protocol::{L7Protocol, L7ProtocolChecker},
+    proto::agent,
     utils::bitmap::parse_u16_range_list_to_bitmap,
 };
+
+#[cfg(feature = "enterprise")]
+use enterprise_utils::l7::custom_policy::config::CustomProtocolConfig;
 
 pub const K8S_CA_CRT_PATH: &str = "/run/secrets/kubernetes.io/serviceaccount/ca.crt";
 const MINUTE: Duration = Duration::from_secs(60);
@@ -120,6 +135,8 @@ pub struct Config {
     pub pid_file: String,
     pub team_id: String,
     pub cgroups_disabled: bool,
+    pub liveness_probe_enabled: bool,
+    pub liveness_probe_port: u16,
 }
 
 impl Config {
@@ -204,6 +221,8 @@ impl Config {
         };
 
         loop {
+            session.update_current_server().await;
+
             match session
                 .grpc_get_kubernetes_cluster_id_with_statsd(request.clone())
                 .await
@@ -215,6 +234,7 @@ impl Config {
                             "get_kubernetes_cluster_id grpc call from server error: {}",
                             cluster_id_response.error_msg()
                         );
+                        session.set_request_failed(true);
                         tokio::time::sleep(MINUTE).await;
                         continue;
                     }
@@ -224,6 +244,7 @@ impl Config {
                                 error!(
                                     "call get_kubernetes_cluster_id return cluster_id is empty string"
                                 );
+                                session.set_request_failed(true);
                                 tokio::time::sleep(MINUTE).await;
                                 continue;
                             }
@@ -235,11 +256,15 @@ impl Config {
                             return Some(id);
                         }
                         None => {
-                            error!("call get_kubernetes_cluster_id return response is none")
+                            error!("call get_kubernetes_cluster_id return response is none");
+                            session.set_request_failed(true);
                         }
                     }
                 }
-                Err(e) => error!("get_kubernetes_cluster_id grpc call error: {}", e),
+                Err(e) => {
+                    error!("get_kubernetes_cluster_id grpc call error: {}", e);
+                    session.set_request_failed(true);
+                }
             }
             tokio::time::sleep(MINUTE).await;
         }
@@ -274,6 +299,8 @@ impl Default for Config {
             pid_file: Default::default(),
             team_id: "".into(),
             cgroups_disabled: false,
+            liveness_probe_enabled: true,
+            liveness_probe_port: 39090,
         }
     }
 }
@@ -294,9 +321,10 @@ impl Default for TagExtraction {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub enum ProcessMatchType {
     Cmd,
+    #[default]
     ProcessName,
     ParentProcessName,
     Tag,
@@ -374,7 +402,7 @@ impl Default for ProcessMatcher {
     fn default() -> Self {
         Self {
             match_regex: Regex::new("").unwrap(),
-            match_type: "".into(),
+            match_type: ProcessMatchType::ProcessName,
             match_languages: vec![],
             match_usernames: vec![],
             only_in_container: true,
@@ -554,26 +582,32 @@ pub struct Proc {
     #[serde(with = "humantime_serde")]
     pub min_lifetime: Duration,
     pub tag_extraction: TagExtraction,
+    #[serde(deserialize_with = "deser_to_sorted_strings")]
+    pub process_blacklist: Vec<String>,
     pub process_matcher: Vec<ProcessMatcher>,
     pub symbol_table: SymbolTable,
 }
 
 impl Default for Proc {
     fn default() -> Self {
-        Self {
+        let mut p = Self {
             enabled: true,
             proc_dir_path: "/proc".to_string(),
             socket_info_sync_interval: Duration::from_secs(0),
             min_lifetime: Duration::from_secs(3),
             tag_extraction: TagExtraction::default(),
+            process_blacklist: vec![
+                "sleep".to_owned(),
+                "sh".to_owned(),
+                "bash".to_owned(),
+                "pause".to_owned(),
+                "runc".to_owned(),
+                "grep".to_owned(),
+                "awk".to_owned(),
+                "sed".to_owned(),
+                "curl".to_owned(),
+            ],
             process_matcher: vec![
-                ProcessMatcher {
-                    match_regex: Regex::new(r"^(sleep|sh|bash|pause|runc)$").unwrap(),
-                    only_in_container: false,
-                    ignore: true,
-                    enabled_features: vec!["proc.gprocess_info".to_string()],
-                    ..Default::default()
-                },
                 ProcessMatcher {
                     match_regex: Regex::new(r"\bjava( +\S+)* +-jar +(\S*/)*([^ /]+\.jar)").unwrap(),
                     only_in_container: false,
@@ -586,7 +620,47 @@ impl Default for Proc {
                     ..Default::default()
                 },
                 ProcessMatcher {
+                    match_regex: Regex::new(
+                        r"\bjava( +\S+)* +-(?:cp|classpath) +\S+ +(?P<CLASS_NAME>[$_A-Za-z][$_0-9A-Za-z]*(?:\.[$_A-Za-z][$_0-9A-Za-z]*)*)",
+                    )
+                    .unwrap(),
+                    only_in_container: false,
+                    match_type: ProcessMatchType::CmdWithArgs,
+                    rewrite_name: "${CLASS_NAME}".to_string(),
+                    enabled_features: vec![
+                        "ebpf.profile.on_cpu".to_string(),
+                        "proc.gprocess_info".to_string(),
+                    ],
+                    ..Default::default()
+                },
+                ProcessMatcher {
                     match_regex: Regex::new(r"\bpython(\S)*( +-\S+)* +(\S*/)*([^ /]+)").unwrap(),
+                    only_in_container: false,
+                    match_type: ProcessMatchType::CmdWithArgs,
+                    rewrite_name: "$4".to_string(),
+                    enabled_features: vec![
+                        "ebpf.profile.on_cpu".to_string(),
+                        "proc.gprocess_info".to_string(),
+                    ],
+                    ..Default::default()
+                },
+                ProcessMatcher {
+                    match_regex: Regex::new(
+                        r"\bphp(\d+)?(-fpm|-cli|-cgi)?( +-\S+)* +(\S*/)*([^ /]+\.php)",
+                    )
+                    .unwrap(),
+                    only_in_container: false,
+                    match_type: ProcessMatchType::CmdWithArgs,
+                    rewrite_name: "$5".to_string(),
+                    enabled_features: vec![
+                        "ebpf.profile.on_cpu".to_string(),
+                        "proc.gprocess_info".to_string(),
+                    ],
+                    ..Default::default()
+                },
+                ProcessMatcher {
+                    match_regex: Regex::new(r"\b(node|nodejs)( +--\S+)* +(\S*/)*([^ /]+\.js)")
+                        .unwrap(),
                     only_in_container: false,
                     match_type: ProcessMatchType::CmdWithArgs,
                     rewrite_name: "$4".to_string(),
@@ -612,7 +686,10 @@ impl Default for Proc {
                 },
             ],
             symbol_table: SymbolTable::default(),
-        }
+        };
+        p.process_blacklist.sort_unstable();
+        p.process_blacklist.dedup();
+        p
     }
 }
 
@@ -775,7 +852,12 @@ pub struct Libpcap {
 
 impl Default for Libpcap {
     fn default() -> Self {
-        Self { enabled: false }
+        Self {
+            #[cfg(target_os = "linux")]
+            enabled: false,
+            #[cfg(target_os = "windows")]
+            enabled: true,
+        }
     }
 }
 
@@ -845,7 +927,7 @@ impl Default for CbpfTunning {
 pub struct PreProcess {
     pub tunnel_decap_protocols: Vec<u8>,
     pub tunnel_trim_protocols: Vec<String>,
-    pub packet_segmentation_reassembly: Vec<u16>,
+    pub packet_segmentation_reassembly: Vec<String>,
 }
 
 impl Default for PreProcess {
@@ -950,6 +1032,7 @@ impl Default for EbpfSocketKprobePorts {
 #[serde(default)]
 pub struct EbpfSocketKprobe {
     pub disabled: bool,
+    pub enable_unix_socket: bool,
     pub blacklist: EbpfSocketKprobePorts,
     pub whitelist: EbpfSocketKprobePorts,
 }
@@ -960,6 +1043,7 @@ pub struct EbpfSocketTunning {
     pub max_capture_rate: u64,
     pub syscall_trace_id_disabled: bool,
     pub map_prealloc_disabled: bool,
+    pub fentry_enabled: bool,
 }
 
 #[derive(Clone, Default, Debug, Deserialize, PartialEq, Eq)]
@@ -967,8 +1051,39 @@ pub struct EbpfSocketTunning {
 pub struct EbpfSocket {
     pub uprobe: EbpfSocketUprobe,
     pub kprobe: EbpfSocketKprobe,
+    pub sock_ops: EbpfSocketSockOps,
     pub tunning: EbpfSocketTunning,
     pub preprocess: EbpfSocketPreprocess,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct EbpfSocketSockOps {
+    pub tcp_option_trace: EbpfTcpOptionTrace,
+}
+
+impl Default for EbpfSocketSockOps {
+    fn default() -> Self {
+        Self {
+            tcp_option_trace: EbpfTcpOptionTrace::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct EbpfTcpOptionTrace {
+    pub enabled: bool,
+    pub sampling_window_bytes: u32,
+}
+
+impl Default for EbpfTcpOptionTrace {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sampling_window_bytes: 16 * 1024,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -977,6 +1092,7 @@ pub struct EbpfFileIoEvent {
     pub collect_mode: usize,
     #[serde(with = "humantime_serde")]
     pub minimal_duration: Duration,
+    pub enable_virtual_file_collect: bool,
 }
 
 impl Default for EbpfFileIoEvent {
@@ -984,6 +1100,7 @@ impl Default for EbpfFileIoEvent {
         Self {
             collect_mode: 1,
             minimal_duration: Duration::from_millis(1),
+            enable_virtual_file_collect: false,
         }
     }
 }
@@ -1038,6 +1155,10 @@ pub struct EbpfProfileMemory {
     #[serde(with = "humantime_serde")]
     pub report_interval: Duration,
     pub allocated_addresses_lru_len: u32,
+    pub sort_length: u32,
+    #[serde(with = "humantime_serde")]
+    pub sort_interval: Duration,
+    pub queue_size: usize,
 }
 
 impl Default for EbpfProfileMemory {
@@ -1046,6 +1167,9 @@ impl Default for EbpfProfileMemory {
             disabled: true,
             report_interval: Duration::from_secs(10),
             allocated_addresses_lru_len: 131072,
+            sort_length: 16384,
+            sort_interval: Duration::from_millis(1500),
+            queue_size: 32768,
         }
     }
 }
@@ -1084,6 +1208,26 @@ impl Default for Unwinding {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct EbpfProfileLanguages {
+    pub python_disabled: bool,
+    pub php_disabled: bool,
+    pub nodejs_disabled: bool,
+    pub lua_disabled: bool,
+}
+
+impl Default for EbpfProfileLanguages {
+    fn default() -> Self {
+        Self {
+            python_disabled: false,
+            php_disabled: false,
+            nodejs_disabled: false,
+            lua_disabled: false,
+        }
+    }
+}
+
 #[derive(Clone, Default, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct EbpfProfile {
@@ -1092,6 +1236,7 @@ pub struct EbpfProfile {
     pub memory: EbpfProfileMemory,
     pub unwinding: Unwinding,
     pub preprocess: EbpfProfilePreprocess,
+    pub languages: EbpfProfileLanguages,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -1099,6 +1244,7 @@ pub struct EbpfProfile {
 pub struct EbpfTunning {
     pub collector_queue_size: usize,
     pub userspace_worker_threads: i32,
+    pub kick_kern_nice: i32,
     pub perf_pages_count: u32,
     pub kernel_ring_size: u32,
     pub max_socket_entries: u32,
@@ -1111,6 +1257,7 @@ impl Default for EbpfTunning {
         Self {
             collector_queue_size: 65535,
             userspace_worker_threads: 1,
+            kick_kern_nice: 0,
             perf_pages_count: 128,
             kernel_ring_size: 65536,
             max_socket_entries: 131072,
@@ -1120,21 +1267,168 @@ impl Default for EbpfTunning {
     }
 }
 
+impl EbpfTunning {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if !(-20..=19).contains(&self.kick_kern_nice) {
+            return Err(format!(
+                "kick_kern_nice {} not in [-20, 19]",
+                self.kick_kern_nice
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct NicOptimizeConfig {
+    pub interface: String,
+    pub rx_ring_size: u64,
+    pub rss_channel_count: u64,
+    pub irq_cpu_list: String,
+    pub xdp_cpu_redirect: bool,
+    pub xdp_queue_size: u64,
+    pub xdp_cpu_redirect_list: String,
+}
+
+const XDP_QUEUE_SIZE_MIN: u64 = 512;
+const XDP_QUEUE_SIZE_MAX: u64 = 8192;
+
+impl Default for NicOptimizeConfig {
+    fn default() -> Self {
+        Self {
+            interface: "".to_string(),
+            rx_ring_size: 0,
+            rss_channel_count: 0,
+            irq_cpu_list: "".to_string(),
+            xdp_cpu_redirect: false,
+            xdp_queue_size: 2048,
+            xdp_cpu_redirect_list: "".to_string(),
+        }
+    }
+}
+
+impl NicOptimizeConfig {
+    fn validate(&self) -> Result<(), String> {
+        if !(XDP_QUEUE_SIZE_MIN..=XDP_QUEUE_SIZE_MAX).contains(&self.xdp_queue_size) {
+            return Err(format!(
+                "xdp_queue_size {} for interface {} not in [{}, {}]",
+                self.xdp_queue_size, self.interface, XDP_QUEUE_SIZE_MIN, XDP_QUEUE_SIZE_MAX,
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(feature = "extended_observability")]
+    pub fn apply(&self) {
+        if let Err(e) = self.validate() {
+            warn!(
+                "Skip NIC optimization for interface '{}': {}",
+                self.interface, e
+            );
+            return;
+        }
+
+        let to_cstring = |field: &str, value: &str| {
+            CString::new(value)
+                .map_err(|_| {
+                    warn!(
+                        "Skip NIC optimization for interface {:?}: {} contains NUL byte",
+                        self.interface, field
+                    );
+                })
+                .ok()
+        };
+
+        let Some(nic_name) = to_cstring("interface", self.interface.as_str()) else {
+            return;
+        };
+        let Some(irq_cpu) = to_cstring("irq_cpu_list", self.irq_cpu_list.as_str()) else {
+            return;
+        };
+        let Some(xdp_cpu) =
+            to_cstring("xdp_cpu_redirect_list", self.xdp_cpu_redirect_list.as_str())
+        else {
+            return;
+        };
+
+        let ret = unsafe {
+            ebpf::nic_optimize_config(
+                nic_name.as_ptr(),
+                self.rx_ring_size as c_int,
+                self.rss_channel_count as c_int,
+                irq_cpu.as_ptr(),
+                self.xdp_cpu_redirect,
+                self.xdp_queue_size as c_int,
+                xdp_cpu.as_ptr(),
+            )
+        };
+
+        if ret != 0 {
+            warn!(
+                "Failed to configure NIC optimization for interface '{}' \
+                (ret={}, rx_ring_size={}, rss_channel_count={}, \
+                xdp_cpu_redirect={}, xdp_queue_size={})",
+                self.interface,
+                ret,
+                self.rx_ring_size,
+                self.rss_channel_count,
+                self.xdp_cpu_redirect,
+                self.xdp_queue_size,
+            );
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct EbpfNetwork {
+    pub nic_opt_enabled: bool,
+    pub nic_optimize: Vec<NicOptimizeConfig>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct EbpfSocketPreprocess {
     pub out_of_order_reassembly_cache_size: usize,
     pub out_of_order_reassembly_protocols: Vec<String>,
+    pub out_of_order_reassembly_timeout: Duration,
     pub segmentation_reassembly_protocols: Vec<String>,
 }
 
 impl Default for EbpfSocketPreprocess {
     fn default() -> Self {
         Self {
-            out_of_order_reassembly_cache_size: 16,
+            out_of_order_reassembly_cache_size: 256,
             out_of_order_reassembly_protocols: vec![],
+            out_of_order_reassembly_timeout: Duration::from_millis(100),
             segmentation_reassembly_protocols: vec![],
         }
+    }
+}
+
+impl EbpfSocketPreprocess {
+    fn adjust_http2(protocols: &mut Vec<String>) {
+        let bitmap = L7ProtocolBitmap::from(protocols.as_slice());
+
+        if bitmap.is_enabled(L7Protocol::Http2)
+            || bitmap.is_enabled(L7Protocol::Grpc)
+            || bitmap.is_enabled(L7Protocol::Triple)
+        {
+            protocols.push("HTTP2".to_string());
+            protocols.push("Triple".to_string());
+            protocols.push("gRPC".to_string());
+        }
+        protocols.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        protocols.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    }
+
+    fn adjust(&mut self) {
+        Self::adjust_http2(&mut self.out_of_order_reassembly_protocols);
+        Self::adjust_http2(&mut self.segmentation_reassembly_protocols);
     }
 }
 
@@ -1146,6 +1440,7 @@ pub struct Ebpf {
     pub file: EbpfFile,
     pub profile: EbpfProfile,
     pub tunning: EbpfTunning,
+    pub network: EbpfNetwork,
     #[serde(skip)]
     pub java_symbol_file_refresh_defer_interval: i32,
 }
@@ -1158,6 +1453,7 @@ impl Default for Ebpf {
             file: EbpfFile::default(),
             profile: EbpfProfile::default(),
             tunning: EbpfTunning::default(),
+            network: EbpfNetwork::default(),
             java_symbol_file_refresh_defer_interval: 60,
         }
     }
@@ -1283,6 +1579,10 @@ impl Default for Kubernetes {
                 },
                 ApiResources {
                     name: "ingresses".to_string(),
+                    ..Default::default()
+                },
+                ApiResources {
+                    name: "configmaps".to_string(),
                     ..Default::default()
                 },
             ],
@@ -1417,6 +1717,23 @@ pub struct Inputs {
     pub vector: Vector,
 }
 
+impl Inputs {
+    fn adjust(&mut self) {
+        // DPDK from eBPF
+        if self.ebpf.tunning.userspace_worker_threads as usize
+            != self.cbpf.af_packet.tunning.packet_fanout_count
+            && self.cbpf.special_network.dpdk.source == DpdkSource::Ebpf
+        {
+            debug!("Update inputs.cbpf.af_packet.tunning.packet_fanout_count with self.inputs.ebpf.tunning.userspace_worker_threads({}) when self.inputs.cbpf.special_network.dpdk.source is {:?}",
+                self.ebpf.tunning.userspace_worker_threads, self.cbpf.special_network.dpdk.source);
+            self.cbpf.af_packet.tunning.packet_fanout_count =
+                self.ebpf.tunning.userspace_worker_threads as usize;
+        }
+
+        self.ebpf.socket.preprocess.adjust();
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Policy {
@@ -1487,6 +1804,7 @@ impl Default for TcpHeader {
 #[serde(default)]
 pub struct PcapStream {
     pub receiver_queue_size: usize,
+    pub sender_queue_size: usize,
     pub buffer_size_per_flow: u32,
     pub total_buffer_size: u64,
     #[serde(with = "humantime_serde")]
@@ -1497,6 +1815,7 @@ impl Default for PcapStream {
     fn default() -> Self {
         Self {
             receiver_queue_size: 65536,
+            sender_queue_size: 8192,
             buffer_size_per_flow: 65536,
             total_buffer_size: 88304,
             flush_interval: Duration::from_secs(60),
@@ -1547,25 +1866,137 @@ impl Default for OracleConfig {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Iso8583Config {
+    pub extract_fields: String,
+    pub translation_enabled: bool,
+    pub pan_obfuscate: bool,
+}
+
+impl Default for Iso8583Config {
+    fn default() -> Self {
+        Self {
+            extract_fields: "2,7,11,32,33".to_string(),
+            translation_enabled: true,
+            pan_obfuscate: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct WebSphereMqConfig {
+    pub parse_xml_enabled: bool,
+    pub decompress_enabled: bool,
+    pub filter_attributes_enabled: bool,
+}
+
+impl Default for WebSphereMqConfig {
+    fn default() -> Self {
+        Self {
+            parse_xml_enabled: true,
+            decompress_enabled: true,
+            filter_attributes_enabled: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct NetSignConfig {
+    pub extract_biz_data_enabled: bool,
+}
+
+impl Default for NetSignConfig {
+    fn default() -> Self {
+        Self {
+            extract_biz_data_enabled: false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct MysqlConfig {
     pub decompress_payload: bool,
+    pub endpoint_disabled: bool,
 }
 
 impl Default for MysqlConfig {
     fn default() -> Self {
         Self {
             decompress_payload: true,
+            endpoint_disabled: true,
         }
     }
 }
 
-#[derive(Clone, Copy, Default, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GrpcConfig {
+    pub streaming_data_enabled: bool,
+}
+
+impl Default for GrpcConfig {
+    fn default() -> Self {
+        Self {
+            streaming_data_enabled: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct InferenceWhitelist {
+    pub process_name: String,
+    pub port_list: Vec<u16>,
+}
+
+impl InferenceWhitelist {
+    fn format_name(name: &[u8]) -> &[u8] {
+        for i in (0..name.len()).rev() {
+            if name[i] == 0 {
+                return &name[..i];
+            }
+        }
+
+        name
+    }
+
+    pub fn is_matched(&self, name: &[u8], src_port: u16, dst_port: u16) -> bool {
+        if Self::format_name(name) != self.process_name.as_bytes() {
+            return false;
+        }
+
+        for p in self.port_list.iter() {
+            if *p == src_port || *p == dst_port {
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
+impl Default for InferenceWhitelist {
+    fn default() -> Self {
+        Self {
+            process_name: "envoy".to_string(),
+            port_list: vec![15001, 15006],
+        }
+    }
+}
+
+#[derive(Clone, Default, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ProtocolSpecialConfig {
     pub oracle: OracleConfig,
+    pub iso8583: Iso8583Config,
+    pub web_sphere_mq: WebSphereMqConfig,
+    pub net_sign: NetSignConfig,
     pub mysql: MysqlConfig,
+    pub grpc: GrpcConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -1574,15 +2005,20 @@ pub struct ApplicationProtocolInference {
     pub inference_max_retries: usize,
     #[serde(with = "humantime_serde")]
     pub inference_result_ttl: Duration,
+    pub inference_whitelist: Vec<InferenceWhitelist>,
     pub enabled_protocols: Vec<String>,
     pub protocol_special_config: ProtocolSpecialConfig,
+    #[deprecated]
+    #[cfg(feature = "enterprise")]
+    pub custom_protocols: Vec<CustomProtocolConfig>,
 }
 
 impl Default for ApplicationProtocolInference {
     fn default() -> Self {
         Self {
-            inference_max_retries: 5,
+            inference_max_retries: 128,
             inference_result_ttl: Duration::from_secs(60),
+            inference_whitelist: vec![InferenceWhitelist::default()],
             enabled_protocols: vec![
                 "HTTP".to_string(),
                 "HTTP2".to_string(),
@@ -1593,6 +2029,8 @@ impl Default for ApplicationProtocolInference {
                 "TLS".to_string(),
             ],
             protocol_special_config: ProtocolSpecialConfig::default(),
+            #[cfg(feature = "enterprise")]
+            custom_protocols: Default::default(),
         }
     }
 }
@@ -1626,9 +2064,13 @@ impl Default for Filters {
                 ("bRPC".to_string(), "1-65535".to_string()),
                 ("Tars".to_string(), "1-65535".to_string()),
                 ("SomeIP".to_string(), "1-65535".to_string()),
+                ("ISO8583".to_string(), "1-65535".to_string()),
+                ("NetSign".to_string(), "1-65535".to_string()),
+                ("Triple".to_string(), "1-65535".to_string()),
                 ("MySQL".to_string(), "1-65535".to_string()),
                 ("PostgreSQL".to_string(), "1-65535".to_string()),
                 ("Oracle".to_string(), "1521".to_string()),
+                ("Dameng".to_string(), "5236".to_string()),
                 ("Redis".to_string(), "1-65535".to_string()),
                 ("MongoDB".to_string(), "1-65535".to_string()),
                 ("Memcached".to_string(), "11211".to_string()),
@@ -1640,6 +2082,7 @@ impl Default for Filters {
                 ("Pulsar".to_string(), "1-65535".to_string()),
                 ("ZMTP".to_string(), "1-65535".to_string()),
                 ("RocketMQ".to_string(), "1-65535".to_string()),
+                ("WebSphereMQ".to_string(), "1-65535".to_string()),
                 ("DNS".to_string(), "53,5353".to_string()),
                 ("TLS".to_string(), "443,6443".to_string()),
                 ("PING".to_string(), "1-65535".to_string()),
@@ -1655,9 +2098,13 @@ impl Default for Filters {
                 ("bRPC".to_string(), vec![]),
                 ("Tars".to_string(), vec![]),
                 ("SomeIP".to_string(), vec![]),
+                ("ISO8583".to_string(), vec![]),
+                ("NetSign".to_string(), vec![]),
+                ("Triple".to_string(), vec![]),
                 ("MySQL".to_string(), vec![]),
                 ("PostgreSQL".to_string(), vec![]),
                 ("Oracle".to_string(), vec![]),
+                ("Dameng".to_string(), vec![]),
                 ("Redis".to_string(), vec![]),
                 ("MongoDB".to_string(), vec![]),
                 ("Memcached".to_string(), vec![]),
@@ -1669,6 +2116,7 @@ impl Default for Filters {
                 ("Pulsar".to_string(), vec![]),
                 ("ZMTP".to_string(), vec![]),
                 ("RocketMQ".to_string(), vec![]),
+                ("WebSphereMQ".to_string(), vec![]),
                 ("DNS".to_string(), vec![]),
                 ("TLS".to_string(), vec![]),
                 ("PING".to_string(), vec![]),
@@ -1708,9 +2156,31 @@ pub struct Timeouts {
 impl Default for Timeouts {
     fn default() -> Self {
         Self {
-            tcp_request_timeout: Duration::from_secs(1800),
+            tcp_request_timeout: Duration::from_secs(300),
             udp_request_timeout: Duration::from_secs(150),
             session_aggregate: vec![],
+        }
+    }
+}
+
+impl Timeouts {
+    pub fn max(&self) -> Duration {
+        let max = self
+            .session_aggregate
+            .iter()
+            .map(|app| app.timeout)
+            .max()
+            .unwrap_or(SessionTimeout::DEFAULT);
+
+        max.max(self.tcp_request_timeout)
+            .max(self.udp_request_timeout)
+    }
+
+    pub fn l7_default_timeout(protocol: L7Protocol) -> Duration {
+        match protocol {
+            L7Protocol::DNS => SessionTimeout::DNS_DEFAULT,
+            L7Protocol::TLS => SessionTimeout::TLS_DEFAULT,
+            _ => SessionTimeout::DEFAULT,
         }
     }
 }
@@ -1720,6 +2190,8 @@ impl Default for Timeouts {
 pub struct TracingTag {
     pub http_real_client: Vec<String>,
     pub x_request_id: Vec<String>,
+    pub multiple_trace_id_collection: bool,
+    pub copy_apm_trace_id: bool,
     pub apm_trace_id: Vec<String>,
     pub apm_span_id: Vec<String>,
 }
@@ -1729,6 +2201,8 @@ impl Default for TracingTag {
         Self {
             http_real_client: vec!["X_Forwarded_For".to_string()],
             x_request_id: vec!["X_Request_ID".to_string()],
+            multiple_trace_id_collection: true,
+            copy_apm_trace_id: false,
             apm_trace_id: vec!["traceparent".to_string(), "sw8".to_string()],
             apm_span_id: vec!["traceparent".to_string(), "sw8".to_string()],
         }
@@ -1775,11 +2249,35 @@ pub struct CustomFields {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+pub struct RequestLogTagExtractionRaw {
+    pub error_request_header: usize,
+    pub error_response_header: usize,
+    pub error_request_payload: usize,
+    pub error_response_payload: usize,
+}
+
+impl Default for RequestLogTagExtractionRaw {
+    fn default() -> Self {
+        Self {
+            error_request_header: 0,
+            error_response_header: 0,
+            error_request_payload: 0,
+            error_response_payload: 256,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct RequestLogTagExtraction {
     pub tracing_tag: TracingTag,
     pub http_endpoint: HttpEndpoint,
-    pub custom_fields: HashMap<String, Vec<CustomFields>>,
     pub obfuscate_protocols: Vec<String>,
+    pub custom_fields: HashMap<String, Vec<CustomFields>>,
+    #[deprecated]
+    #[cfg(feature = "enterprise")]
+    pub custom_field_policies: Vec<enterprise_utils::l7::custom_policy::config::CustomFieldPolicy>,
+    pub raw: RequestLogTagExtractionRaw,
 }
 
 impl Default for RequestLogTagExtraction {
@@ -1792,6 +2290,9 @@ impl Default for RequestLogTagExtraction {
                 ("HTTP2".to_string(), vec![]),
             ]),
             obfuscate_protocols: vec!["Redis".to_string()],
+            #[cfg(feature = "enterprise")]
+            custom_field_policies: Default::default(),
+            raw: RequestLogTagExtractionRaw::default(),
         }
     }
 }
@@ -1898,6 +2399,7 @@ impl Default for Conntrack {
 #[serde(default)]
 pub struct ProcessorsFlowLogTunning {
     pub flow_map_hash_slots: u32,
+    pub rrt_cache_capacity: u32,
     pub concurrent_flow_limit: u32,
     pub memory_pool_size: usize,
     pub max_batched_buffer_size: usize,
@@ -1910,6 +2412,7 @@ impl Default for ProcessorsFlowLogTunning {
     fn default() -> Self {
         Self {
             flow_map_hash_slots: 131072,
+            rrt_cache_capacity: 16000,
             concurrent_flow_limit: 65535,
             memory_pool_size: 65536,
             max_batched_buffer_size: 131072,
@@ -2067,20 +2570,44 @@ impl Default for TxThroughput {
     }
 }
 
-#[derive(Clone, Copy, Default, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct FreeDisk {
+    pub percentage_trigger_threshold: u8,
+    #[serde(deserialize_with = "deser_u64_with_giga_unit")]
+    pub absolute_trigger_threshold: u64,
+    pub directories: Vec<String>,
+}
+
+impl Default for FreeDisk {
+    fn default() -> Self {
+        Self {
+            percentage_trigger_threshold: 15,
+            absolute_trigger_threshold: 10 << 30,
+            #[cfg(not(target_os = "windows"))]
+            directories: vec!["/".to_string()],
+            #[cfg(target_os = "windows")]
+            directories: vec!["c:\\".to_string()],
+        }
+    }
+}
+
+#[derive(Clone, Default, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct CircuitBreakers {
     pub sys_memory_percentage: SysMemoryPercentage,
     pub relative_sys_load: RelativeSysLoad,
     pub tx_throughput: TxThroughput,
+    pub free_disk: FreeDisk,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Tunning {
     pub cpu_affinity: Vec<usize>,
-    pub process_scheduling_priority: usize,
+    pub process_scheduling_priority: isize,
     pub idle_memory_trimming: bool,
+    pub swap_disabled: bool,
     pub page_cache_reclaim_percentage: u8,
     #[serde(with = "humantime_serde")]
     pub resource_monitoring_interval: Duration,
@@ -2092,6 +2619,7 @@ impl Default for Tunning {
             cpu_affinity: vec![],
             process_scheduling_priority: 0,
             idle_memory_trimming: true,
+            swap_disabled: false,
             page_cache_reclaim_percentage: 100,
             resource_monitoring_interval: Duration::from_secs(10),
         }
@@ -2154,7 +2682,7 @@ pub struct Communication {
     pub max_escape_duration: Duration,
     pub ingester_ip: String,
     pub ingester_port: u16,
-    #[serde(deserialize_with = "deser_usize_with_mega_unit")]
+    #[serde(skip)]
     pub grpc_buffer_size: usize,
     pub max_throughput_to_ingester: u64,
     #[serde(deserialize_with = "to_traffic_overflow_action")]
@@ -2163,6 +2691,8 @@ pub struct Communication {
     pub proxy_controller_ip: String,
     pub proxy_controller_port: u16,
 }
+
+pub const GRPC_BUFFER_SIZE_MIN: usize = 1 << 20;
 
 impl Default for Communication {
     fn default() -> Self {
@@ -2173,7 +2703,7 @@ impl Default for Communication {
             proxy_controller_port: 30035,
             ingester_ip: "".to_string(),
             ingester_port: 30033,
-            grpc_buffer_size: 5 << 20,
+            grpc_buffer_size: GRPC_BUFFER_SIZE_MIN,
             max_throughput_to_ingester: 100,
             ingester_traffic_overflow_action: TrafficOverflowAction::Waiting,
             request_via_nat_ip: false,
@@ -2192,7 +2722,7 @@ pub struct Log {
 impl Default for Log {
     fn default() -> Self {
         Self {
-            log_level: "info".to_string(),
+            log_level: "INFO".to_string(),
             log_file: "/var/log/deepflow-agent/deepflow-agent.log".to_string(),
             log_backhaul_enabled: true,
         }
@@ -2210,14 +2740,12 @@ pub struct Profile {
 pub struct Debug {
     pub enabled: bool,
     pub local_udp_port: u16,
-    pub debug_metrics_enabled: bool,
 }
 
 impl Default for Debug {
     fn default() -> Self {
         Self {
             local_udp_port: 0,
-            debug_metrics_enabled: false,
             enabled: true,
         }
     }
@@ -2302,6 +2830,21 @@ pub struct GlobalCommon {
     #[serde(deserialize_with = "to_agent_type")]
     pub agent_type: agent::AgentType,
     pub secret_key: String,
+}
+
+impl GlobalCommon {
+    pub fn update(&mut self, other: Self) {
+        self.kubernetes_api_enabled = other.kubernetes_api_enabled;
+        self.enabled = other.enabled;
+        self.region_id = other.region_id;
+        self.pod_cluster_id = other.pod_cluster_id;
+        self.vpc_id = other.vpc_id;
+        self.agent_id = other.agent_id;
+        self.team_id = other.team_id;
+        self.organize_id = other.organize_id;
+        self.agent_type = other.agent_type;
+        self.secret_key = other.secret_key;
+    }
 }
 
 #[derive(Clone, Default, Debug, Deserialize, PartialEq, Eq)]
@@ -2588,6 +3131,20 @@ pub struct UserConfig {
     pub processors: Processors,
     pub plugins: Plugins,
     pub dev: Dev,
+    #[serde(skip)]
+    #[cfg(feature = "enterprise")]
+    pub custom_app: CustomApp,
+}
+
+#[cfg(feature = "enterprise")]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct CustomApp {
+    pub version: u64,
+    // used in UserConfig::get_protocol_port()
+    pub custom_protocol_port_ranges: String,
+    // used in L7LogDynamicConfig
+    pub extra_headers: std::collections::HashSet<String>,
+    pub config: Option<enterprise_utils::l7::custom_policy::config::CustomApp>,
 }
 
 const MB: u64 = 1048576;
@@ -2596,20 +3153,12 @@ impl UserConfig {
     const DEFAULT_DNS_PORTS: &'static str = "53,5353";
     const DEFAULT_TLS_PORTS: &'static str = "443,6443";
     const DEFAULT_ORACLE_PORTS: &'static str = "1521";
+    const DEFAULT_DAMENG_PORTS: &'static str = "5236";
     const DEFAULT_MEMCACHED_PORTS: &'static str = "11211";
     const PACKET_FANOUT_MODE_MAX: u32 = 7;
 
     pub fn adjust(&mut self) {
-        // DPDK from eBPF
-        if self.inputs.ebpf.tunning.userspace_worker_threads as usize
-            != self.inputs.cbpf.af_packet.tunning.packet_fanout_count
-            && self.inputs.cbpf.special_network.dpdk.source == DpdkSource::Ebpf
-        {
-            debug!("Update inputs.cbpf.af_packet.tunning.packet_fanout_count with self.inputs.ebpf.tunning.userspace_worker_threads({}) when self.inputs.cbpf.special_network.dpdk.source is {:?}",
-                self.inputs.ebpf.tunning.userspace_worker_threads, self.inputs.cbpf.special_network.dpdk.source);
-            self.inputs.cbpf.af_packet.tunning.packet_fanout_count =
-                self.inputs.ebpf.tunning.userspace_worker_threads as usize;
-        }
+        self.inputs.adjust();
     }
 
     pub fn get_fast_path_map_size(&self, mem_size: u64) -> usize {
@@ -2656,7 +3205,7 @@ impl UserConfig {
         #[cfg(feature = "enterprise")]
         {
             let tls_str =
-                L7ProtocolParser::TLS(crate::flow_generator::protocol_logs::tls::TlsLog::default())
+                L7ProtocolParser::TLS(crate::flow_generator::protocol_logs::TlsLog::default())
                     .as_str();
             // tls default only parse 443,6443 port. when l7_protocol_ports config without TLS, need to reserve the tls default config.
             if !self
@@ -2669,7 +3218,7 @@ impl UserConfig {
                 new.insert(tls_str.to_string(), Self::DEFAULT_TLS_PORTS.to_string());
             }
             let oracle_str = L7ProtocolParser::Oracle(
-                crate::flow_generator::protocol_logs::sql::OracleLog::default(),
+                crate::flow_generator::protocol_logs::OracleLog::default(),
             )
             .as_str();
             // oracle default only parse 1521 port. when l7_protocol_ports config without ORACLE, need to reserve the oracle default config.
@@ -2683,6 +3232,23 @@ impl UserConfig {
                 new.insert(
                     oracle_str.to_string(),
                     Self::DEFAULT_ORACLE_PORTS.to_string(),
+                );
+            }
+            let dameng_str = L7ProtocolParser::Dameng(
+                crate::flow_generator::protocol_logs::DamengLog::default(),
+            )
+            .as_str();
+            // dameng default only parse 5236 port. when l7_protocol_ports config without DAMENG, need to reserve the dameng default config.
+            if !self
+                .processors
+                .request_log
+                .filters
+                .port_number_prefilters
+                .contains_key(dameng_str)
+            {
+                new.insert(
+                    dameng_str.to_string(),
+                    Self::DEFAULT_DAMENG_PORTS.to_string(),
                 );
             }
         }
@@ -2699,6 +3265,23 @@ impl UserConfig {
                 memcached_str.to_string(),
                 Self::DEFAULT_MEMCACHED_PORTS.to_string(),
             );
+        }
+
+        #[cfg(feature = "enterprise")]
+        {
+            let custom_ports = &self.custom_app.custom_protocol_port_ranges;
+            if !custom_ports.is_empty() {
+                let custom_str = L7ProtocolParser::Custom(Default::default()).as_str();
+                let ranges = new
+                    .entry(custom_str.to_string())
+                    .or_insert_with(|| custom_ports.clone());
+                if ranges.is_empty() {
+                    *ranges = custom_ports.clone();
+                } else {
+                    ranges.push(',');
+                    ranges.push_str(custom_ports);
+                }
+            }
         }
 
         new
@@ -2836,6 +3419,15 @@ impl UserConfig {
             )));
         }
 
+        for nic in &self.inputs.ebpf.network.nic_optimize {
+            nic.validate().map_err(ConfigError::RuntimeConfigInvalid)?;
+        }
+        self.inputs
+            .ebpf
+            .tunning
+            .validate()
+            .map_err(ConfigError::RuntimeConfigInvalid)?;
+
         Ok(())
     }
 
@@ -2846,7 +3438,6 @@ impl UserConfig {
         self.global.communication.proxy_controller_ip = "127.0.0.1".to_string();
         self.global.communication.proxy_controller_port = 30035;
         self.global.ntp.enabled = false;
-        self.inputs.cbpf.af_packet.interface_regex = "".to_string();
         self.outputs.flow_metrics.filters.apm_metrics = true;
         self.outputs.flow_metrics.filters.npm_metrics = true;
         self.outputs.flow_metrics.filters.npm_metrics_concurrent = true;
@@ -2862,7 +3453,11 @@ impl UserConfig {
         config
     }
 
-    pub fn set_dynamic_config(&mut self, dynamic_config: &agent::DynamicConfig) {
+    pub fn set_dynamic_config_and_grpc_buffer_size(
+        &mut self,
+        dynamic_config: &agent::DynamicConfig,
+        new_grpc_buffer_size: u64,
+    ) {
         self.global.common.kubernetes_api_enabled = dynamic_config.kubernetes_api_enabled();
         self.global.common.enabled = dynamic_config.enabled();
         self.global.common.region_id = dynamic_config.region_id();
@@ -2874,6 +3469,7 @@ impl UserConfig {
         self.global.common.agent_type = dynamic_config.agent_type();
         self.global.common.secret_key = dynamic_config.secret_key().to_string();
         self.global.self_monitoring.hostname = dynamic_config.hostname().to_string();
+        self.global.communication.grpc_buffer_size = new_grpc_buffer_size as usize;
     }
 }
 
@@ -3122,6 +3718,45 @@ pub struct OracleParseConfig {
     pub resp_0x04_extra_byte: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Iso8583ParseConfig {
+    pub extract_fields: Bitmap,
+    pub translation_enabled: bool,
+    pub pan_obfuscate: bool,
+}
+
+impl Default for Iso8583ParseConfig {
+    fn default() -> Self {
+        Iso8583ParseConfig {
+            extract_fields: Bitmap::new(0, false),
+            translation_enabled: true,
+            pan_obfuscate: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebSphereMqParseConfig {
+    pub parse_xml_enabled: bool,
+    pub decompress_enabled: bool,
+    pub filter_attributes_enabled: bool,
+}
+
+impl Default for WebSphereMqParseConfig {
+    fn default() -> Self {
+        Self {
+            parse_xml_enabled: true,
+            decompress_enabled: true,
+            filter_attributes_enabled: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct NetSignParseConfig {
+    pub extract_biz_data_enabled: bool,
+}
+
 #[derive(Clone, Default, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct BondGroup {
@@ -3323,6 +3958,13 @@ where
     Ok(usize::deserialize(deserializer)? << 20)
 }
 
+fn deser_u64_with_giga_unit<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(u64::deserialize(deserializer)? << 30)
+}
+
 // `humantime` will not parse "0" as Duration::ZERO
 // If "0" is a valid option for a duration field, use this deserializer
 //     #[serde(deserialize_with = "deser_humantime_with_zero")]
@@ -3341,11 +3983,38 @@ where
     }
 }
 
+fn deser_to_sorted_strings<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let mut v = Vec::<String>::deserialize(deserializer)?;
+    v.sort_unstable();
+    v.dedup();
+    Ok(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::fs;
+
+    fn process_data_for_cmdline(cmdline: &str) -> ProcessData {
+        ProcessData {
+            name: "java".to_string(),
+            pid: 1,
+            ppid: 0,
+            process_name: "java".to_string(),
+            cmd: "/usr/bin/java".to_string(),
+            cmd_with_args: cmdline.split(' ').map(ToString::to_string).collect(),
+            user_id: 0,
+            user: "root".to_string(),
+            start_time: Duration::ZERO,
+            os_app_tags: vec![],
+            netns_id: 0,
+            container_id: "".to_string(),
+        }
+    }
 
     #[test]
     fn read_yaml_file() {
@@ -3354,6 +4023,8 @@ mod tests {
             .expect("failed loading config file");
         assert_eq!(c.controller_ips.len(), 1);
         assert_eq!(&c.controller_ips[0], "127.0.0.1");
+        assert!(c.liveness_probe_enabled);
+        assert_eq!(c.liveness_probe_port, 39090);
     }
 
     #[test]
@@ -3436,6 +4107,51 @@ enabled: true
 "#;
         let proc: Proc = serde_yaml::from_str(default_matcher_yaml).unwrap();
         assert_eq!(proc.process_matcher, Proc::default().process_matcher);
+    }
+
+    #[test]
+    fn java_classpath_process_matcher_rewrites_to_class_name() {
+        let matcher = &Proc::default().process_matcher[1];
+        let cmdlines = [
+            "/usr/bin/java -Xms512m -classpath /app/app.jar:/app/lib/* com.example.Main arg1",
+            "/usr/bin/java -Xms512m -cp /app/app.jar:/app/lib/* com.example.Main arg1",
+        ];
+
+        for cmdline in cmdlines {
+            let rewritten = matcher
+                .get_process_data(&process_data_for_cmdline(cmdline), &HashMap::new())
+                .unwrap();
+            assert_eq!(rewritten.name, "com.example.Main");
+        }
+    }
+
+    #[test]
+    fn parse_java_classpath_process_matcher_and_rewrite() {
+        let yaml = r#"
+process_matcher:
+- match_regex: \bjava( +\S+)* +-(?:cp|classpath) +\S+ +(?P<CLASS_NAME>[$_A-Za-z][$_0-9A-Za-z]*(?:\.[$_A-Za-z][$_0-9A-Za-z]*)*)
+  match_type: cmdline_with_args
+  match_languages: []
+  match_usernames: []
+  only_in_container: false
+  only_with_tag: false
+  ignore: false
+  rewrite_name: ${CLASS_NAME}
+  enabled_features: [ebpf.profile.on_cpu, proc.gprocess_info]
+"#;
+        let proc: Proc = serde_yaml::from_str(yaml).unwrap();
+        let matcher = &proc.process_matcher[0];
+
+        assert_eq!(matcher.rewrite_name, "${CLASS_NAME}");
+        let rewritten = matcher
+            .get_process_data(
+                &process_data_for_cmdline(
+                    "/usr/bin/java -classpath /app/app.jar:/app/lib/* com.example.Main arg1",
+                ),
+                &HashMap::new(),
+            )
+            .unwrap();
+        assert_eq!(rewritten.name, "com.example.Main");
     }
 
     #[test]

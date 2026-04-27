@@ -29,12 +29,12 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/http/service"
 	resoureservice "github.com/deepflowio/deepflow/server/controller/http/service/resource"
 	"github.com/deepflowio/deepflow/server/controller/monitor"
+	"github.com/deepflowio/deepflow/server/controller/monitor/bill"
 	"github.com/deepflowio/deepflow/server/controller/monitor/license"
 	"github.com/deepflowio/deepflow/server/controller/monitor/vtap"
 	"github.com/deepflowio/deepflow/server/controller/prometheus"
 	"github.com/deepflowio/deepflow/server/controller/recorder"
 	"github.com/deepflowio/deepflow/server/controller/tagrecorder"
-	tagrecordercheck "github.com/deepflowio/deepflow/server/controller/tagrecorder/check"
 )
 
 func IsMasterRegion(cfg *config.ControllerConfig) bool {
@@ -64,7 +64,7 @@ func IsMasterController(cfg *config.ControllerConfig) bool {
 }
 
 // migrate db by master region master controller
-func migrateMySQL(cfg *config.ControllerConfig) {
+func migrateMetadb(cfg *config.ControllerConfig) {
 	err := migrator.Migrate(cfg.MetadbCfg)
 	if err != nil {
 		log.Errorf("migrate metadb failed: %s", err.Error())
@@ -97,12 +97,11 @@ func checkAndStartMasterFunctions(
 	vtapCheck := vtap.NewVTapCheck(cfg.MonitorCfg, ctx)
 	vtapRebalanceCheck := vtap.NewRebalanceCheck(cfg.MonitorCfg, ctx)
 	vtapLicenseAllocation := license.NewVTapLicenseAllocation(cfg.MonitorCfg, ctx)
+	billCheck := bill.NewBillCheck(cfg.BillingMethod, cfg.MonitorCfg, ctx)
 	recorderResource := recorder.GetResource()
 	domainChecker := resoureservice.NewDomainCheck(ctx)
 	prometheus := prometheus.GetSingleton()
 	tagRecorder := tagrecorder.GetSingleton()
-	tagrecordercheck.GetSingleton().Init(ctx, *cfg)
-	tr := tagrecordercheck.GetSingleton()
 	deletedORGChecker := service.GetDeletedORGChecker(ctx, cfg.FPermit)
 
 	httpService := http.GetSingleton()
@@ -124,7 +123,7 @@ func checkAndStartMasterFunctions(
 
 				sCtx, sCancel = context.WithCancel(ctx)
 
-				migrateMySQL(cfg)
+				migrateMetadb(cfg)
 
 				// 启动资源ID管理器
 				err := recorderResource.IDManagers.Start(sCtx)
@@ -136,7 +135,6 @@ func checkAndStartMasterFunctions(
 
 				// 启动tagrecorder
 				tagRecorder.UpdaterManager.Start(sCtx)
-				tr.Check()
 
 				// 控制器检查
 				controllerCheck.Start(sCtx)
@@ -154,6 +152,9 @@ func checkAndStartMasterFunctions(
 				if cfg.BillingMethod == common.BILLING_METHOD_LICENSE {
 					vtapLicenseAllocation.Start(sCtx)
 				}
+
+				// bill check
+				billCheck.Start(sCtx)
 
 				// 资源数据清理
 				recorderResource.Cleaners.Start(sCtx)

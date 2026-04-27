@@ -30,7 +30,7 @@ use std::{
     time::Duration,
 };
 
-use log::{debug, error, info};
+use log::{debug, error, info, trace};
 use nix::sys::utsname::uname;
 use procfs::process::all_processes_with_root;
 
@@ -260,6 +260,7 @@ fn get_num_from_status_file(pattern: &str, value: &str) -> Result<u32> {
 
 type ProcessListenerCallback = fn(pids: &Vec<u32>, process_datas: &Vec<ProcessData>);
 
+#[derive(Default, Debug)]
 struct ProcessNode {
     process_matcher: Vec<ProcessMatcher>,
 
@@ -269,12 +270,38 @@ struct ProcessNode {
     callback: Option<ProcessListenerCallback>,
 }
 
+#[derive(Default, Debug)]
+struct Features {
+    blacklist: Vec<String>,
+    features: HashMap<String, ProcessNode>,
+}
+
+struct Config {
+    proc_root: String,
+    user: String,
+    command: Vec<String>,
+}
+
+impl Config {
+    fn new(proc_root: String, user: String, command: Vec<String>) -> Self {
+        Self {
+            proc_root,
+            user,
+            command,
+        }
+    }
+
+    fn update(&mut self, proc_root: String, user: String, command: Vec<String>) {
+        self.proc_root = proc_root;
+        self.user = user;
+        self.command = command;
+    }
+}
+
 pub struct ProcessListener {
-    features: Arc<RwLock<HashMap<String, ProcessNode>>>,
+    features: Arc<RwLock<Features>>,
     running: Arc<AtomicBool>,
-    proc_root: Arc<RwLock<String>>,
-    user: Arc<RwLock<String>>,
-    command: Arc<RwLock<Vec<String>>>,
+    config: Arc<RwLock<Config>>,
 
     thread_handle: Mutex<Option<JoinHandle<()>>>,
 }
@@ -283,72 +310,85 @@ impl ProcessListener {
     const INTERVAL: usize = 10;
 
     pub fn new(
+        process_blacklist: &Vec<String>,
         process_matcher: &Vec<ProcessMatcher>,
         proc_root: String,
         user: String,
         command: Vec<String>,
     ) -> Self {
         let listener = Self {
-            features: Arc::new(RwLock::new(HashMap::new())),
+            features: Default::default(),
             running: Arc::new(AtomicBool::new(false)),
             thread_handle: Mutex::new(None),
-            proc_root: Arc::new(RwLock::new(proc_root)),
-            user: Arc::new(RwLock::new(user)),
-            command: Arc::new(RwLock::new(command)),
+            config: Arc::new(RwLock::new(Config::new(proc_root, user, command))),
         };
 
-        listener.set(process_matcher);
+        listener.set(process_blacklist, process_matcher);
 
         listener
     }
 
     pub fn on_config_change(
         &self,
+        process_blacklist: &Vec<String>,
         process_matcher: &Vec<ProcessMatcher>,
         proc_root: String,
         user: String,
         command: Vec<String>,
     ) {
-        self.set(process_matcher);
-
-        *self.proc_root.write().unwrap() = proc_root;
-        *self.user.write().unwrap() = user;
-        *self.command.write().unwrap() = command;
+        self.config
+            .write()
+            .unwrap()
+            .update(proc_root, user, command);
+        self.set(process_blacklist, process_matcher);
     }
 
-    pub fn set(&self, process_matcher: &Vec<ProcessMatcher>) {
+    pub fn set(&self, process_blacklist: &Vec<String>, process_matcher: &Vec<ProcessMatcher>) {
         let mut features: HashMap<String, ProcessNode> = HashMap::new();
+        let mut current = self.features.write().unwrap();
 
         for matcher in process_matcher.iter() {
             for feature in matcher.enabled_features.iter() {
                 if let Some(node) = features.get_mut(feature) {
                     node.process_matcher.push(matcher.clone());
                 } else {
-                    let _ = features.insert(
-                        feature.to_string(),
-                        ProcessNode {
-                            process_matcher: vec![matcher.clone()],
-                            pids: vec![],
-                            process_datas: vec![],
-                            callback: None,
-                        },
-                    );
+                    let mut node = ProcessNode {
+                        process_matcher: vec![matcher.clone()],
+                        ..Default::default()
+                    };
+                    if let Some(mut last_node) = current.features.remove(feature) {
+                        node.callback = last_node.callback.take();
+                        node.pids = last_node.pids;
+                        node.process_datas = last_node.process_datas;
+                    }
+
+                    let _ = features.insert(feature.to_string(), node);
                 }
             }
         }
 
-        *self.features.write().unwrap() = features;
+        for (feature, mut node) in current.features.drain() {
+            if node.callback.is_some() {
+                node.process_matcher.clear();
+                features.insert(feature, node);
+            }
+        }
+
+        *current = Features {
+            blacklist: process_blacklist.clone(),
+            features,
+        };
     }
 
     pub fn register(&self, feature: &str, callback: ProcessListenerCallback) {
         info!("Process listener register feature {}", feature);
         let mut features = self.features.write().unwrap();
-        if let Some(node) = features.get_mut(&feature.to_string()) {
+        if let Some(node) = features.features.get_mut(&feature.to_string()) {
             node.pids = vec![];
             node.process_datas = vec![];
             node.callback = Some(callback);
         } else {
-            let _ = features.insert(
+            let _ = features.features.insert(
                 feature.to_string(),
                 ProcessNode {
                     process_matcher: vec![],
@@ -371,10 +411,11 @@ impl ProcessListener {
     fn process(
         process_data_cache: &mut HashMap<i32, ProcessData>,
         proc_root: &str,
-        features: &mut HashMap<String, ProcessNode>,
+        features: &mut Features,
         user: &str,
         command: &[String],
     ) {
+        let (blacklist, features) = (&mut features.blacklist, &mut features.features);
         if features.is_empty() {
             return;
         }
@@ -403,6 +444,21 @@ impl ProcessListener {
                     continue;
                 }
             };
+            match process.status().map(|s| s.name) {
+                // not found
+                Ok(name) if blacklist.binary_search(&name).is_err() => (),
+                Ok(name) => {
+                    trace!(
+                        "process {name} (pid#{}) ignored because it is in blacklist",
+                        process.pid
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    debug!("get process status failed: {}", e);
+                    continue;
+                }
+            }
             alive_pids.insert(process.pid);
             if let Some(old_data) = process_data_cache.get(&process.pid) {
                 if let Some(start_time) = process.stat().ok().and_then(|stat| stat.starttime().ok())
@@ -420,7 +476,9 @@ impl ProcessListener {
         process_data_cache.retain(|pid, _| alive_pids.contains(pid));
 
         for (key, value) in features.iter_mut() {
-            if value.process_matcher.is_empty() || value.callback.is_none() {
+            if (value.process_matcher.is_empty() && value.pids.is_empty())
+                || value.callback.is_none()
+            {
                 continue;
             }
 
@@ -450,7 +508,7 @@ impl ProcessListener {
             process_datas.merge_and_dedup();
 
             if pids != value.pids {
-                info!("Feature {} update {} pids {:?}.", key, pids.len(), pids);
+                debug!("Feature {} update {} pids {:?}.", key, pids.len(), pids);
                 value.callback.as_ref().unwrap()(&pids, &process_datas);
                 value.pids = pids;
                 value.process_datas = process_datas;
@@ -465,9 +523,7 @@ impl ProcessListener {
         info!("Startting process listener ...");
         let features = self.features.clone();
         let running = self.running.clone();
-        let proc_root = self.proc_root.clone();
-        let user = self.user.clone();
-        let command = self.command.clone();
+        let config = self.config.clone();
 
         running.store(true, Relaxed);
         *self.thread_handle.lock().unwrap() = Some(
@@ -483,17 +539,19 @@ impl ProcessListener {
                             continue;
                         }
                         count = 0;
-                        let proc = proc_root.read().unwrap();
-                        let user = user.read().unwrap();
-                        let command = command.read().unwrap();
+                        let current_config = config.read().unwrap();
+                        let mut features = features.write().unwrap();
 
                         Self::process(
                             &mut process_data,
-                            &proc,
-                            &mut features.write().unwrap(),
-                            &user,
-                            &command,
+                            &current_config.proc_root,
+                            &mut features,
+                            &current_config.user,
+                            &current_config.command,
                         );
+
+                        drop(features);
+                        drop(current_config);
                     }
                 })
                 .unwrap(),

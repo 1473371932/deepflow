@@ -434,19 +434,19 @@ func NewAgentIDToReq() *AgentIDToReq {
 	}
 }
 
-// (vtap_id + pid): gpid
-type IDToGPID map[uint64]uint32
+// (vtap_id + pid): gid
+type IDToGID map[uint64]uint32
 
 func generateVPKey(agentId uint32, pid uint32) uint64 {
 	return uint64(agentId)<<32 | uint64(pid)
 }
 
-func (p IDToGPID) getData(agentId uint32, pid uint32) uint32 {
+func (p IDToGID) getData(agentId uint32, pid uint32) uint32 {
 	return p[generateVPKey(agentId, pid)]
 }
 
-func (p IDToGPID) addData(process *models.Process) {
-	p[generateVPKey(uint32(process.VTapID), uint32(process.PID))] = uint32(process.ID)
+func (p IDToGID) addData(process *models.Process) {
+	p[generateVPKey(uint32(process.VTapID), uint32(process.PID))] = process.GID
 }
 
 type RealServerData struct {
@@ -559,7 +559,7 @@ type ProcessInfo struct {
 	sendGPIDReq            *AgentIDToReq
 	agentIdToLocalGPIDReq  *AgentIDToReq
 	agentIdToShareGPIDReq  *AgentIDToReq
-	agentIdAndPIDToGPID    IDToGPID
+	agentIdAndPIDToGPID    IDToGID
 	rvData                 RVData
 	globalLocalEntries     EntryData
 	realClientToRealServer *U128IDMap
@@ -574,7 +574,7 @@ func NewProcessInfo(db *gorm.DB, cfg *config.Config, orgID int) *ProcessInfo {
 		sendGPIDReq:            NewAgentIDToReq(),
 		agentIdToLocalGPIDReq:  NewAgentIDToReq(),
 		agentIdToShareGPIDReq:  NewAgentIDToReq(),
-		agentIdAndPIDToGPID:    make(IDToGPID),
+		agentIdAndPIDToGPID:    make(IDToGID),
 		rvData:                 NewRVData(),
 		globalLocalEntries:     NewEntryData(),
 		realClientToRealServer: NewU128IDMapNoStats("trisolaris-real-pid", CACHE_SIZE),
@@ -805,12 +805,12 @@ func (p *ProcessInfo) releaseGlobalLocalEntries(data EntryData) {
 }
 
 func (p *ProcessInfo) getGPIDInfoFromDB() {
-	processes, err := dbmgr.DBMgr[models.Process](p.db).GetFields([]string{"id", "vtap_id", "pid"})
+	processes, err := dbmgr.DBMgr[models.Process](p.db).GetFields([]string{"id", "vtap_id", "pid", "gid"})
 	if err != nil {
 		log.Error(p.Log(err.Error()))
 		return
 	}
-	newVtapIDAndPIDToGPID := make(IDToGPID)
+	newVtapIDAndPIDToGPID := make(IDToGID)
 	for _, process := range processes {
 		newVtapIDAndPIDToGPID.addData(process)
 	}

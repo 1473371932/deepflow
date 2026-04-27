@@ -38,10 +38,6 @@ pub enum Error {
     DubboHeaderParseFailed,
     #[error("http header parse failed")]
     HttpHeaderParseFailed,
-    #[error("kafka log parse failed")]
-    KafkaLogParseFailed,
-    #[error("kafka perf parse failed")]
-    KafkaPerfParseFailed,
     #[error("mqtt log parse failed")]
     MqttLogParseFailed,
     #[error("mqtt perf parse failed")]
@@ -97,6 +93,8 @@ pub enum Error {
     SoReturnUnexpectVal,
     #[error("so plugin parse fail")]
     SoParseFail,
+    #[error("custom protocol policy parse fail")]
+    CustomPolicyParseFail,
     #[error("{proto:?} log parse failed: {reason}")]
     L7LogParseFailed {
         proto: L7Protocol,

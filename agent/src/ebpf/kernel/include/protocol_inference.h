@@ -20,26 +20,25 @@
  */
 
 /*
- * Due to the limitation of the number of eBPF instructions to 4096 in Linux
- * kernels lower than version 5.2, the protocol inference code, when augmented
- * with new protocols, easily exceeds the instruction limit. To address this
- * issue, we have split the protocol inference into two separate programs.
+ * Due to the limitation of 4096 eBPF instructions in Linux kernels below version 5.2,
+ * the protocol inference code can easily exceed this limit when more protocols are added.
+ * To address this issue, the protocol inference logic has been split into three separate programs.
  * The updated workflow is as follows:
  *
- * [openssl Uprobe] ----------------
- *                                 |
- *                                \|/
- * [syscall Kprobe/tracepoint] --> [protocol infer] --> [data submit] --> [output data]
- *       |                                                                ^
- *       |                                                                |
- *       |----general file io------> [io event] ---------------------------
+ * [openssl Uprobe] --
+ *                   |
+ *                  \|/
+ * [syscall Kprobe/tracepoint] --> [protocol inference 2] --> [protocol inference 3] --> [data submission] --> [data output]
+ *       |                                                                                                       /|\
+ *       |                                                                                                        |
+ *       |----- general file I/O -----> [I/O event handling] ------------------------------------------------------
  *
  * Explanation:
- *   `[openssl Uprobe]` and `[syscall Kprobe/tracepoint]` encompass the preparation
- *   work for eBPF probe entry and a portion of Layer 7 (L7) protocol inference.
- *   `[protocol infer]` represents the second part of L7 protocol inference, and
- *   newly added protocol inference code can be placed within the `infer_protocol_2()`
- *   interface.
+ *   `[openssl Uprobe]` and `[syscall Kprobe/tracepoint]` perform initial setup for eBPF probe entry,
+ *   and contain the first part of Layer 7 (L7) protocol inference logic.
+ *   `protocol inference 2` : part 2 of protocol inference
+ *   `protocol inference 3` : part 3 of protocol inference
+ *   Newly added protocol inference code is recommended to be placed within the `infer_protocol_3()` interface.
  */
 #ifndef DF_BPF_PROTO_INFER_H
 #define DF_BPF_PROTO_INFER_H
@@ -110,6 +109,9 @@ __protocol_port_check(enum traffic_protocol proto,
 	if (!is_protocol_enabled(proto)) {
 		return false;
 	}
+
+	if (conn_info->sk_type == SOCK_UNIX)
+		return true;
 
 	__u32 key = proto;
 	ports_bitmap_t *ports = proto_ports_bitmap__lookup(&key);
@@ -235,9 +237,16 @@ static __inline bool is_current_comm(char *comm)
 
 static __inline int is_http_response(const char *data)
 {
+	/*
+	 * Here, we have removed HTTP/1.x 1xx-type responses because if a server
+	 * returns two consecutive responses - such as HTTP 100 and HTTP 200 -
+	 * after an HTTP request, the upper layer will not process the HTTP 100
+	 * response. This results in the HTTP request and the HTTP 200 response
+	 * failing to be merged.
+	 */
 	return (data[0] == 'H' && data[1] == 'T' && data[2] == 'T'
 		&& data[3] == 'P' && data[4] == '/' && data[5] == '1'
-		&& data[6] == '.' && data[8] == ' ');
+		&& data[6] == '.' && data[8] == ' ' && data[9] != '1');
 }
 
 static __inline int is_http_request(const char *data, int data_len,
@@ -448,25 +457,11 @@ static __inline enum message_type parse_http2_headers_frame(const char
 	if (conn_info->prev_count == HTTPV2_FRAME_PROTO_SZ) {
 		return MSG_REQUEST;
 	}
+
 	// fixed 9-octet header
 	if (count < HTTPV2_FRAME_PROTO_SZ)
 		return MSG_UNKNOWN;
 
-	/*
-	 * The frame payload length (excluding the initial 9 bytes) must not
-	 * exceed the actual length of the system call.
-	 */
-	if ((__bpf_ntohl(*(__u32 *) buf_kern) >> 8) > syscall_len - HTTPV2_FRAME_PROTO_SZ)
-		return MSG_UNKNOWN;
-
-	/*
-	 * The highest bit of the 5th byte (i.e., the first byte of the Stream
-	 * Identifier) must be 0, indicating that the reserved bit (R) is 0;
-	 * otherwise, it violates the HTTP/2 specification.
-	 */
-	if (buf_kern[5] >> 7 != 0)
-		return MSG_UNKNOWN;
-	
 	__u32 offset = 0;
 	__u8 flags_unset = 0, flags_padding = 0, flags_priority = 0;
 	__u8 type = 0, reserve = 0, static_table_idx, i, block_fragment_offset;
@@ -479,6 +474,21 @@ static __inline enum message_type parse_http2_headers_frame(const char
 	if (is_first && is_http2_magic(buf_src, count)) {
 		static const int HTTP2_MAGIC_SIZE = 24;
 		offset = HTTP2_MAGIC_SIZE;
+	} else {
+		/*
+	 	 * The frame payload length (excluding the initial 9 bytes) must not
+		 * exceed the actual length of the system call.
+	 	 */
+		if ((__bpf_ntohl(*(__u32 *) buf_kern) >> 8) > syscall_len - HTTPV2_FRAME_PROTO_SZ)
+			return MSG_UNKNOWN;
+
+		/*
+		 * The highest bit of the 5th byte (i.e., the first byte of the Stream
+		 * Identifier) must be 0, indicating that the reserved bit (R) is 0;
+		 * otherwise, it violates the HTTP/2 specification.
+		 */
+		if (buf_kern[5] >> 7 != 0)
+			return MSG_UNKNOWN;
 	}
 
 	/*
@@ -674,7 +684,7 @@ static __inline enum message_type infer_http_message(const char *buf,
 }
 
 // MySQL and Kafka need the previous n bytes of data for inference
-static __inline void check_and_fetch_prev_data(struct conn_info_s *conn_info)
+static __inline __u32 check_and_fetch_prev_data(struct conn_info_s *conn_info)
 {
 	if (conn_info->socket_info_ptr != NULL &&
 	    conn_info->socket_info_ptr->prev_data_len > 0) {
@@ -709,6 +719,7 @@ static __inline void check_and_fetch_prev_data(struct conn_info_s *conn_info)
 		conn_info->socket_info_ptr->prev_data_len = 0;
 	}
 
+	return conn_info->prev_count;
 }
 
 // MySQL packet:
@@ -938,14 +949,19 @@ static __inline bool infer_pgsql_startup_message(const char *buf, size_t count)
 /*
  * ref: https://developer.aliyun.com/article/751984
  * | char tag | int32 len | payload |
- * tag 的取值参考 src/flow_generator/protocol_logs/sql/postgresql.rs
+ * tag ref: src/flow_generator/protocol_logs/sql/postgresql.rs
+ *
+ * Message flow patterns in PostgreSQL protocol:
+ * 'P' (Parse) is usually followed by 'B' (Bind), but sometimes directly followed by 'S' (Sync).
+ * 'B' (Bind) is usually followed by 'E' (Execute), or sometimes 'S' (Sync).
+ * 'E' (Execute) is usually followed by 'S' (Sync).
+ * 'S' (Sync) generally does not have any message following it; it signals the end of a batch of messages.
+ * The 'Q' (Query) and 'C' (Close) messages always end with a null terminator character '\0'.
  */
 static __inline enum message_type infer_pgsql_query_message(const char *buf,
 							    const char *s_buf,
 							    size_t count)
 {
-	// Only a judgement query.
-	static const char tag_q = 'Q';
 	// In the protocol format, the size of the "len" field is 4 bytes,
 	// and the minimum command length is 4 bytes for "COPY/MOVE",
 	// The minimal length is therefore 8.
@@ -961,10 +977,34 @@ static __inline enum message_type infer_pgsql_query_message(const char *buf,
 	if (count < min_msg_len) {
 		return MSG_UNKNOWN;
 	}
-	// Tag check
-	if (buf[0] != tag_q) {
+
+	char tag = buf[0];
+
+	/*
+	 * NOTE:
+	 * In Linux 4.14, the eBPF verifier is very strict on complex boolean
+	 * expressions. The original explicit comparison:
+	 *
+	 *   if (tag != 'Q' && tag != 'P' && tag != 'B' &&
+	 *       tag != 'E' && tag != 'S' && tag != 'C')
+	 *
+	 * may fail verifier checks due to excessive branching and state explosion.
+	 *
+	 * To keep the program verifier-friendly, we intentionally simplify the
+	 * condition to a range check:
+	 *
+	 *   if (tag < 'B' || tag > 'S')
+	 *
+	 * This relaxes the validation and allows some non-target tag values
+	 * within ['B', 'S'], but is acceptable because:
+	 *   1) This is only a fast pre-filter.
+	 *   2) Invalid tags will be rejected by subsequent length/content checks.
+	 *
+	 * This trade-off is required for compatibility with Linux 4.14 eBPF verifier.
+	 */
+	if (tag < 'B' || tag > 'S')
 		return MSG_UNKNOWN;
-	}
+
 	// Payload length check
 	__u32 length;
 	bpf_probe_read_user(&length, sizeof(length), s_buf + 1);
@@ -972,17 +1012,26 @@ static __inline enum message_type infer_pgsql_query_message(const char *buf,
 	if (length < min_payload_len || length > max_payload_len) {
 		return MSG_UNKNOWN;
 	}
+
 	// If the input includes a whole message (1 byte tag + length),
 	// check the last character.
 	if (length + 1 <= (__u32) count) {
 		char last_char = ' ';	//Non-zero initial value
 		bpf_probe_read_user(&last_char, sizeof(last_char),
 				    s_buf + length);
-		if (last_char != '\0')
-			return MSG_UNKNOWN;
+		if (last_char == '\0' && (tag == 'Q' || tag == 'C'))
+			return MSG_REQUEST;
 	}
 
-	return MSG_REQUEST;
+	size_t pos = length + 1;
+	if (pos + 5 > count)
+		return MSG_UNKNOWN;
+
+	bpf_probe_read_user(&tag, sizeof(tag), s_buf + pos);
+	if (tag == 'B' || tag == 'E' || tag == 'S')
+		return MSG_REQUEST;
+
+	return MSG_UNKNOWN;
 }
 
 static __inline enum message_type infer_postgre_message(const char *buf,
@@ -1013,12 +1062,8 @@ static __inline enum message_type infer_postgre_message(const char *buf,
 		case 'C': case 'E': case 'S': case 'D': case 'H': case 'd':
 		case 'c':
 			return MSG_REQUEST;
-		case 'Z': case 'I': case '1': case '2': case '3': case 'K':
-		case 'T': case 'n': case 'N': case 't': case 'G': case 'W':
-		case 'R':
-			return MSG_RESPONSE;
 		default:
-			return MSG_UNKNOWN;
+			return MSG_RESPONSE;
 		}
 		/* *INDENT-ON* */
 	}
@@ -1029,23 +1074,51 @@ static __inline enum message_type infer_postgre_message(const char *buf,
 	return infer_pgsql_query_message(infer_buf, buf, count);
 }
 
+#define TNS_HEADER_LENGTH_OFFSET 0
+#define TNS_HEADER_CHECKSUM_OFFSET 2
+#define TNS_HEADER_TYPE_OFFSET 4
+#define TNS_TYPE_DATA_DATA_ID_OFFSET 10
+#define TNS_TYPE_DATA_CALL_ID_OFFSET 11
+
+#define TNS_RESP_DATA_ID_RET_STATUS 0x04
+#define TNS_RESP_DATA_ID_RET_PARAM 0x08
+#define TNS_RESP_DATA_ID_DESC_INFO 0x10
+
+#define TNS_REQ_DATA_ID_PIGGY_BACK_FUNC 0x11
+#define TNS_REQ_DATA_ID_USER_OCI_FUNC 0x3
+
+#define TNS_REQ_CALL_ID_USER_CURSOR_CLOSE_ALL 0x69
+#define TNS_REQ_CALL_ID_USER_BUNDLED_EXEC_CALL 0x5e
+#define TNS_REQ_CALL_ID_USER_SESS_SWITCH_OIGGY_BACK 0x6e
+
+#define TNS_TYPE_CONNECT    0x01
+#define TNS_TYPE_ACCEPT     0x02
+#define TNS_TYPE_ACK        0x03
+#define TNS_TYPE_REFUSE     0x04
+#define TNS_TYPE_REDIRECT   0x05
+#define TNS_TYPE_DATA       0x06
+#define TNS_TYPE_NULL       0x07
+#define TNS_TYPE_ABORT      0x09
+#define TNS_TYPE_RESEND     0x0b
+#define TNS_TYPE_MARKER     0x0c
+#define TNS_TYPE_ATTENTION  0x0d
+#define TNS_TYPE_CONTROL    0x0e
+#define TNS_TYPE_DD         0x0f
+
+static __inline bool is_tns_packet_type(const char ty) {
+	if (ty == 0x08 || ty == 0x0a) {
+		return false;
+	}
+	if (ty >= TNS_TYPE_CONNECT && ty <= TNS_TYPE_DD) {
+		return true;
+	}
+	return false;
+}
+
 static __inline enum message_type infer_oracle_tns_message(const char *buf,
-							   size_t count,
-							   struct conn_info_s
-							   *conn_info)
+								size_t count,
+								struct conn_info_s *conn_info)
 {
-#define OEACLE_INFER_BUF_SIZE 12
-#define PKT_TYPE_DATA 6
-#define RESP_DATA_ID_RET_STATUS 0x04
-#define RESP_DATA_ID_RET_PARAM 0x08
-#define RESP_DATA_ID_DESC_INFO 0x10
-
-#define REQ_DATA_ID_PIGGY_BACK_FUNC 0x11
-#define REQ_DATA_ID_USER_OCI_FUNC 0x3
-
-#define REQ_CALL_ID_USER_CURSOR_CLOSE_ALL 0x69
-#define REQ_CALL_ID_USER_BUNDLED_EXEC_CALL 0x5e
-#define REQ_CALL_ID_USER_SESS_SWITCH_OIGGY_BACK 0x6e
 
 	if (!protocol_port_check_2(PROTO_ORACLE, conn_info))
 		return MSG_UNKNOWN;
@@ -1058,28 +1131,342 @@ static __inline enum message_type infer_oracle_tns_message(const char *buf,
 			return MSG_UNKNOWN;
 	}
 
-	char pkt_type = buf[4];
-	char data_id = buf[10];
-	char call_id = buf[11];
-	if (pkt_type != PKT_TYPE_DATA) {
+	if (!is_tns_packet_type(buf[TNS_HEADER_TYPE_OFFSET])) {
 		return MSG_UNKNOWN;
 	}
 
-	if (data_id == RESP_DATA_ID_RET_STATUS
-	    || data_id == RESP_DATA_ID_RET_PARAM
-	    || data_id == RESP_DATA_ID_DESC_INFO) {
+	__u16 checksum = __bpf_ntohs(*(__u16 *)(buf + TNS_HEADER_CHECKSUM_OFFSET));
+	__u32 length = 0;
+	// TNS header can have 2/4 bytes length field
+	// ref: https://github.com/wireshark/wireshark/blob/d124e488b418acc2482fa2ae59ac69d5586d0d37/epan/dissectors/packet-tns.c#L1298
+	if (checksum == 0 || checksum == 4) {
+		length = (__u32)__bpf_ntohs(*(__u16 *)(buf + TNS_HEADER_LENGTH_OFFSET));
+	} else {
+		length = __bpf_ntohl(*(__u32 *)(buf + TNS_HEADER_LENGTH_OFFSET));
+	}
+
+	const char *infer_ptr = conn_info->syscall_infer_addr;
+	char pkt_type = 0;
+
+	// if count is larger than length, there are multiple TNS packets
+	// check the next packet for higher accuracy
+	if (count > length + TNS_HEADER_TYPE_OFFSET) {
+		if (bpf_probe_read_user(&pkt_type, sizeof(pkt_type), infer_ptr + length + TNS_HEADER_TYPE_OFFSET) == 0 && !is_tns_packet_type(pkt_type)) {
+			return MSG_UNKNOWN;
+		}
+	}
+
+	pkt_type = buf[TNS_HEADER_TYPE_OFFSET];
+	switch (pkt_type) {
+		case TNS_TYPE_CONNECT:
+			if (length < 26) {
+				return MSG_UNKNOWN;
+			}
+			return MSG_REQUEST;
+		case TNS_TYPE_ACCEPT:
+			if (length < 16) {
+				return MSG_UNKNOWN;
+			}
+			return MSG_RESPONSE;
+		case TNS_TYPE_REFUSE:
+			if (length < 4) {
+				return MSG_UNKNOWN;
+			}
+			return MSG_RESPONSE;
+		case TNS_TYPE_REDIRECT:
+			if (length < 2) {
+				return MSG_UNKNOWN;
+			}
+			return MSG_RESPONSE;
+		case TNS_TYPE_ABORT:
+			if (length < 2) {
+				return MSG_UNKNOWN;
+			}
+			break;
+		case TNS_TYPE_MARKER:
+			if (length < 3) {
+				return MSG_UNKNOWN;
+			}
+			break;
+		case TNS_TYPE_ATTENTION:
+			if (length < 3) {
+				return MSG_UNKNOWN;
+			}
+			return MSG_REQUEST;
+		case TNS_TYPE_CONTROL:
+			if (length < 2) {
+				return MSG_UNKNOWN;
+			}
+			return MSG_REQUEST;
+		default:
+			break;
+	}
+
+	// use upper layer to infer the message type
+	if (pkt_type != TNS_TYPE_DATA) {
+		return MSG_REQUEST;
+	}
+
+	char data_id = buf[TNS_TYPE_DATA_DATA_ID_OFFSET];
+	char call_id = buf[TNS_TYPE_DATA_CALL_ID_OFFSET];
+
+	if (data_id == TNS_RESP_DATA_ID_RET_STATUS
+	    || data_id == TNS_RESP_DATA_ID_RET_PARAM
+	    || data_id == TNS_RESP_DATA_ID_DESC_INFO) {
 		return MSG_RESPONSE;
-	} else if ((data_id == REQ_DATA_ID_PIGGY_BACK_FUNC
-		    && call_id == REQ_CALL_ID_USER_CURSOR_CLOSE_ALL)
-		   || (data_id == REQ_DATA_ID_PIGGY_BACK_FUNC
-		       && call_id == REQ_CALL_ID_USER_SESS_SWITCH_OIGGY_BACK)
-		   || (data_id == REQ_DATA_ID_USER_OCI_FUNC
-		       && call_id == REQ_CALL_ID_USER_BUNDLED_EXEC_CALL)
+	} else if ((data_id == TNS_REQ_DATA_ID_PIGGY_BACK_FUNC
+		    && call_id == TNS_REQ_CALL_ID_USER_CURSOR_CLOSE_ALL)
+		   || (data_id == TNS_REQ_DATA_ID_PIGGY_BACK_FUNC
+		       && call_id == TNS_REQ_CALL_ID_USER_SESS_SWITCH_OIGGY_BACK)
+		   || (data_id == TNS_REQ_DATA_ID_USER_OCI_FUNC
+		       && call_id == TNS_REQ_CALL_ID_USER_BUNDLED_EXEC_CALL)
 	    ) {
 		return MSG_REQUEST;
 	} else {
+		// use upper layer to infer the message type
+		return MSG_REQUEST;
+	}
+}
+
+#define DAMENG_HEADER_LEN 64
+#define DAMENG_HEADER_MSG_TYPE_OFFSET 4
+#define DAMENG_HEADER_BODY_LEN_OFFSET 6
+#define DAMENG_HEADER_RET_CODE_OFFSET 10
+#define DAMENG_INFER_HEADER_LEN 14
+
+static __inline __u16 read_u16_le(const char *p)
+{
+	return (__u16)(__u8)p[0] | ((__u16)(__u8)p[1] << 8);
+}
+
+static __inline __u32 read_u32_le(const char *p)
+{
+	return (__u32)(__u8)p[0] | ((__u32)(__u8)p[1] << 8)
+		| ((__u32)(__u8)p[2] << 16) | ((__u32)(__u8)p[3] << 24);
+}
+
+static __inline __s32 read_s32_le(const char *p)
+{
+	return (__s32)read_u32_le(p);
+}
+
+static __inline bool dameng_is_valid_response_ret_code(__s32 ret_code)
+{
+	/*
+	 * Source: DM Programmer Appendix "DM服务器错误码汇编"
+	 * warning: (520, 0) => 1..=519
+	 * errors: (-1, -14999)
+	 */
+	return ret_code == 0 || (ret_code >= 1 && ret_code <= 519)
+		|| (ret_code >= -14999 && ret_code <= -1);
+}
+
+static __inline enum message_type infer_dameng_msg_type(__u16 msg_type,
+						       __s32 ret_code)
+{
+	switch (msg_type) {
+	case 0x00:
+	case 0xbb:
+		if (dameng_is_valid_response_ret_code(ret_code))
+			return MSG_RESPONSE;
+		return MSG_UNKNOWN;
+	case 0x03:
+	case 0x04:
+	case 0x05:
+	case 0x07:
+	case 0x08:
+	case 0x0d:
+	case 0x1d:
+	case 0x20:
+	case 0x2c:
+	case 0xc8:
+		if (ret_code == 0)
+			return MSG_REQUEST;
+		return MSG_UNKNOWN;
+	default:
 		return MSG_UNKNOWN;
 	}
+}
+
+static __inline enum message_type infer_dameng_message(const char *buf,
+						      size_t count,
+						      struct conn_info_s *conn_info)
+{
+	(void)buf;
+	(void)count;
+
+	if (!protocol_port_check_2(PROTO_DAMENG, conn_info))
+		return MSG_UNKNOWN;
+	if (conn_info->tuple.l4_protocol != IPPROTO_TCP)
+		return MSG_UNKNOWN;
+
+	if (is_infer_socket_valid(conn_info->socket_info_ptr)) {
+		if (conn_info->socket_info_ptr->l7_proto != PROTO_DAMENG)
+			return MSG_UNKNOWN;
+	}
+
+	if (count < DAMENG_INFER_HEADER_LEN)
+		return MSG_UNKNOWN;
+
+	__u16 msg_type = read_u16_le(buf + DAMENG_HEADER_MSG_TYPE_OFFSET);
+	__s32 ret_code = read_s32_le(buf + DAMENG_HEADER_RET_CODE_OFFSET);
+
+	return infer_dameng_msg_type(msg_type, ret_code);
+}
+
+// https://en.wikipedia.org/wiki/ISO_8583
+static __inline enum message_type infer_iso8583_message(const char *buf,
+						     size_t count,
+						     const char *ptr,
+						     __u32 infer_len,
+						     struct conn_info_s
+						     *conn_info)
+{
+#define CUPS_HEADER_SIZE 0x2e
+#define CUPS_HEADER_FLAG_1 0x02
+#define CUPS_HEADER_FLAG_2 0x82
+
+	if (!protocol_port_check_2(PROTO_ISO8583, conn_info))
+		return MSG_UNKNOWN;
+	if (conn_info->tuple.l4_protocol != IPPROTO_TCP || count < 58 || infer_len < 53) {
+		return MSG_UNKNOWN;
+	}
+	if (is_infer_socket_valid(conn_info->socket_info_ptr)) {
+		if (conn_info->socket_info_ptr->l7_proto != PROTO_ISO8583)
+			return MSG_UNKNOWN;
+	}
+
+	char buffer[8];
+	// Check for ISO8583 CUPS header patterns
+	if (buf[0] == CUPS_HEADER_SIZE && (buf[1] == CUPS_HEADER_FLAG_1 || (uint8_t)buf[1] == CUPS_HEADER_FLAG_2)) {
+            bpf_probe_read_user(buffer, 8, ptr + 41);
+	} else if (buf[4] == CUPS_HEADER_SIZE && (buf[5] == CUPS_HEADER_FLAG_1 || (uint8_t)buf[5] == CUPS_HEADER_FLAG_2)) {
+			bpf_probe_read_user(buffer, 8, ptr + 45);
+	} else {
+		return MSG_UNKNOWN;
+	}
+
+	if (buffer[0] != '0' || buffer[1] != '0' || buffer[2] != '0' || buffer[3] != '0' || buffer[4] != '0') {
+		return MSG_UNKNOWN;
+	}
+	if (buffer[7] % 2 == 1) {
+		return MSG_RESPONSE;
+	}
+	return MSG_REQUEST;
+}
+
+/*
+ * NetSign (签名验签) protocol identification.
+ *
+ * Wire format (all offsets absolute from TCP payload start):
+ *
+ *   [0]      outer_tag = 0x02
+ *   [1..12]  outer_len (12 ASCII decimal digits)
+ *   [13]     TAG_PROCESSOR_NAME = 0x01
+ *   [14]     type indicator = 0x01 (text)
+ *   [15..26] processorName length (12 ASCII decimal digits)
+ *   [25..26] last two digits of length:
+ *              '1','6' → RAWSignProcessor      (16 B): name at [27..42]
+ *              '2','1' → PBCRAWVerifyProcessor (21 B): name at [27..47]
+ *
+ * Protocol identification uses only the first 32 bytes (buf[0..31]).
+ * Request/response detection requires bytes beyond 32 and is read via
+ * bpf_probe_read_user from conn_info->syscall_infer_addr:
+ *
+ *   RAWSignProcessor:
+ *     op tag at [43] (extra[0]), op len last digit at [56] (extra[13])
+ *   PBCRAWVerifyProcessor:
+ *     op tag at [48] (extra[5]), op len last digit at [61] (extra[18])
+ *
+ * Operation length last digit: '7' → "request", '8' → "response"
+ */
+static __inline enum message_type infer_net_sign_message(const char *buf,
+							  size_t count,
+							  struct conn_info_s
+							  *conn_info)
+{
+	if (!protocol_port_check_2(PROTO_NET_SIGN, conn_info))
+		return MSG_UNKNOWN;
+    // Need 62 bytes minimum to read byte[61] for PBCRAWVerifyProcessor
+	if (conn_info->tuple.l4_protocol != IPPROTO_TCP || count < 62)
+		return MSG_UNKNOWN;
+	if (is_infer_socket_valid(conn_info->socket_info_ptr)) {
+		if (conn_info->socket_info_ptr->l7_proto != PROTO_NET_SIGN)
+			return MSG_UNKNOWN;
+		/*
+		 * Socket already confirmed as NetSign. Continuation reads (mid-message
+		 * syscall splits) do not start at message offset 0, so the byte-pattern
+		 * checks below would fail. Return MSG_REQUEST unconditionally here; the
+		 * Rust-level parser derives the real message type from the TLV content.
+		 */
+		return MSG_REQUEST;
+	}
+
+	/*
+	 * Protocol identification within the first 32 bytes.
+	 */
+	// Byte 0: outer tag must be 0x02
+	if ((uint8_t)buf[0] != 0x02)
+		return MSG_UNKNOWN;
+	// Byte 1: first digit of outer_len must be ASCII decimal
+	if (buf[1] < '0' || buf[1] > '9')
+		return MSG_UNKNOWN;
+	// Byte 13: first inner TLV tag must be TAG_PROCESSOR_NAME (0x01)
+	if ((uint8_t)buf[13] != 0x01)
+		return MSG_UNKNOWN;
+	// Byte 14: inner TLV type indicator must be 0x01 (text)
+	if ((uint8_t)buf[14] != 0x01)
+		return MSG_UNKNOWN;
+	// processorName len field [15..26]: leading and near-last bytes must be '0'
+	if (buf[15] != '0' || buf[24] != '0')
+		return MSG_UNKNOWN;
+
+	// Bytes [25..26]: last two digits of processorName length.
+	// Also validate the processor name prefix (bytes [27..29]) within 32 bytes.
+	if (buf[25] == '1' && buf[26] == '6') {
+		// RAWSignProcessor (len=16): prefix "RAW" at [27..29]
+		if (buf[27] != 'R' || buf[28] != 'A' || buf[29] != 'W')
+			return MSG_UNKNOWN;
+	} else if (buf[25] == '2' && buf[26] == '1') {
+		// PBCRAWVerifyProcessor (len=21): prefix "PBC" at [27..29]
+		if (buf[27] != 'P' || buf[28] != 'B' || buf[29] != 'C')
+			return MSG_UNKNOWN;
+	} else {
+		return MSG_UNKNOWN;
+	}
+
+	/*
+	 * Request/response detection: read 19 bytes from offset 43 via
+	 * bpf_probe_read_user to cover the operation TLV for both processors.
+	 *
+	 *   extra[0]  = payload[43]: op tag for RAWSignProcessor
+	 *   extra[5]  = payload[48]: op tag for PBCRAWVerifyProcessor
+	 *   extra[13] = payload[56]: op len last digit for RAWSignProcessor
+	 *   extra[18] = payload[61]: op len last digit for PBCRAWVerifyProcessor
+	 */
+	char extra[19];
+	bpf_probe_read_user(extra, sizeof(extra),
+			    conn_info->syscall_infer_addr + 43);
+
+	if (buf[25] == '1' && buf[26] == '6') {
+		// RAWSignProcessor: op tag at extra[0], op len last digit at extra[13]
+		if ((uint8_t)extra[0] != 0x02)
+			return MSG_UNKNOWN;
+		if (extra[13] == '7')
+			return MSG_REQUEST;   // "request"  len=7
+		if (extra[13] == '8')
+			return MSG_RESPONSE;  // "response" len=8
+	} else {
+		// PBCRAWVerifyProcessor: op tag at extra[5], op len last digit at extra[18]
+		if ((uint8_t)extra[5] != 0x02)
+			return MSG_UNKNOWN;
+		if (extra[18] == '7')
+			return MSG_REQUEST;   // "request"  len=7
+		if (extra[18] == '8')
+			return MSG_RESPONSE;  // "response" len=8
+	}
+
+	return MSG_UNKNOWN;
 }
 
 #define CSTR_LEN(s) (sizeof(s) / sizeof(char) - 1)
@@ -1628,7 +2015,7 @@ static __inline enum message_type infer_mqtt_message(const char *buf,
 	if (count < 4)
 		return MSG_UNKNOWN;
 
-	if (!protocol_port_check_1(PROTO_MQTT, conn_info))
+	if (!protocol_port_check_2(PROTO_MQTT, conn_info))
 		return MSG_UNKNOWN;
 
 	if (is_infer_socket_valid(conn_info->socket_info_ptr)) {
@@ -3680,6 +4067,37 @@ static __inline enum message_type infer_rocketmq_message(const char *buf,
 	return MSG_REQUEST;
 }
 
+// ref: https://www.ibm.com/docs/en/ibm-mq/
+static __inline enum message_type infer_web_sphere_mq_message(const char *buf,
+							 size_t count,
+							 struct conn_info_s *conn_info)
+{
+	// Transmission Segment Header length 36
+	if (count < 36) {
+		return MSG_UNKNOWN;
+	}
+
+	if (!protocol_port_check_2(PROTO_WEBSPHEREMQ, conn_info)) {
+		return MSG_UNKNOWN;
+	}
+
+	if (is_infer_socket_valid(conn_info->socket_info_ptr)) {
+		if (conn_info->socket_info_ptr->l7_proto != PROTO_WEBSPHEREMQ) {
+			return MSG_UNKNOWN;
+		}
+	}
+
+	if (buf[0] != 'T' || buf[1] != 'S' || buf[2] != 'H' || buf[3] != 'M') {
+		return MSG_UNKNOWN;
+	}
+
+	// SegmType: 0x9x response
+	if ((buf[17] & 0x90) == 0x90) {
+		return MSG_RESPONSE;
+	}
+	return MSG_REQUEST;
+}
+
 static __inline bool drop_msg_by_comm(void)
 {
 	char comm[TASK_COMM_LEN];
@@ -3749,6 +4167,69 @@ static __inline void check_and_set_data_reassembly(struct conn_info_s
 	}
 }
 
+/* Will be called by proto_infer_3 eBPF program. */
+static __inline struct protocol_message_t
+infer_protocol_3(const char *infer_buf, size_t count,
+		 struct conn_info_s *conn_info)
+{
+	struct protocol_message_t inferred_message;
+	inferred_message.protocol = PROTO_UNKNOWN;
+	inferred_message.type = MSG_UNKNOWN;
+	__u32 syscall_infer_len = conn_info->syscall_infer_len;
+	char *syscall_infer_addr = conn_info->syscall_infer_addr;
+
+#if defined(LINUX_VER_KFUNC) || defined(LINUX_VER_5_2_PLUS)
+	__u8 skip_proto = conn_info->skip_proto;
+	if (skip_proto != PROTO_ZMTP && (inferred_message.type =
+#else
+	if ((inferred_message.type =
+#endif
+		    infer_zmtp_message(infer_buf, count,
+				       syscall_infer_addr,
+				       syscall_infer_len,
+				       conn_info)) != MSG_UNKNOWN) {
+		inferred_message.protocol = PROTO_ZMTP;
+#if defined(LINUX_VER_KFUNC) || defined(LINUX_VER_5_2_PLUS)
+	} else if (skip_proto != PROTO_MONGO && (inferred_message.type =
+#else
+	} else if ((inferred_message.type =
+#endif
+		    infer_mongo_message(infer_buf, count,
+					conn_info)) != MSG_UNKNOWN) {
+		inferred_message.protocol = PROTO_MONGO;
+#if defined(LINUX_VER_KFUNC) || defined(LINUX_VER_5_2_PLUS)
+	} else if (skip_proto != PROTO_ROCKETMQ && (inferred_message.type =
+#else
+	} else if ((inferred_message.type =
+#endif
+		    infer_rocketmq_message(infer_buf, count,
+					conn_info)) != MSG_UNKNOWN) {
+		inferred_message.protocol = PROTO_ROCKETMQ;
+#if defined(LINUX_VER_KFUNC) || defined(LINUX_VER_5_2_PLUS)
+	} else if (skip_proto != PROTO_WEBSPHEREMQ && (inferred_message.type =
+#else
+	} else if ((inferred_message.type =
+#endif
+		    infer_web_sphere_mq_message(infer_buf, count,
+					conn_info)) != MSG_UNKNOWN) {
+		inferred_message.protocol = PROTO_WEBSPHEREMQ;
+}
+
+	if (conn_info->enable_reasm) {
+		if (inferred_message.type == MSG_UNKNOWN) {
+			inferred_message.type = MSG_REQUEST;
+			if (conn_info->socket_info_ptr) {
+				inferred_message.protocol =
+				    conn_info->socket_info_ptr->l7_proto;
+				conn_info->socket_info_ptr->finish_reasm = true;
+			}
+			conn_info->is_reasm_seg = true;
+		}
+	}
+
+	return inferred_message;
+}
+
 /* Will be called by proto_infer_2 eBPF program. */
 static __inline struct protocol_message_t
 infer_protocol_2(const char *infer_buf, size_t count,
@@ -3778,6 +4259,14 @@ infer_protocol_2(const char *infer_buf, size_t count,
 #endif
 	     infer_dubbo_message(infer_buf, count, conn_info)) != MSG_UNKNOWN) {
 		inferred_message.protocol = PROTO_DUBBO;
+#if defined(LINUX_VER_KFUNC) || defined(LINUX_VER_5_2_PLUS)
+	} else if (skip_proto != PROTO_MQTT && (inferred_message.type =
+#else
+	} else if ((inferred_message.type =
+#endif
+		    infer_mqtt_message(infer_buf, count,
+				       conn_info)) != MSG_UNKNOWN) {
+		inferred_message.protocol = PROTO_MQTT;
 #if defined(LINUX_VER_KFUNC) || defined(LINUX_VER_5_2_PLUS)
 	} else if (skip_proto != PROTO_AMQP && (inferred_message.type =
 #else
@@ -3843,9 +4332,36 @@ infer_protocol_2(const char *infer_buf, size_t count,
 	} else if ((inferred_message.type =
 #endif
 		    infer_oracle_tns_message(infer_buf,
-					     count,
-					     conn_info)) != MSG_UNKNOWN) {
+						count,
+						conn_info)) != MSG_UNKNOWN) {
 		inferred_message.protocol = PROTO_ORACLE;
+#if defined(LINUX_VER_KFUNC) || defined(LINUX_VER_5_2_PLUS)
+	} else if (skip_proto != PROTO_DAMENG && (inferred_message.type =
+#else
+	} else if ((inferred_message.type =
+#endif
+		    infer_dameng_message(infer_buf,
+					 count,
+					 conn_info)) != MSG_UNKNOWN) {
+		inferred_message.protocol = PROTO_DAMENG;
+#if defined(LINUX_VER_KFUNC) || defined(LINUX_VER_5_2_PLUS)
+	} else if (skip_proto != PROTO_ISO8583 && (inferred_message.type =
+#else
+	} else if ((inferred_message.type =
+#endif
+		    infer_iso8583_message(infer_buf, count,
+				       syscall_infer_addr,
+				       syscall_infer_len,
+				       conn_info)) != MSG_UNKNOWN) {
+		inferred_message.protocol = PROTO_ISO8583;
+#if defined(LINUX_VER_KFUNC) || defined(LINUX_VER_5_2_PLUS)
+	} else if (skip_proto != PROTO_NET_SIGN && (inferred_message.type =
+#else
+	} else if ((inferred_message.type =
+#endif
+		    infer_net_sign_message(infer_buf,
+					   count, conn_info)) != MSG_UNKNOWN) {
+		inferred_message.protocol = PROTO_NET_SIGN;
 #if defined(LINUX_VER_KFUNC) || defined(LINUX_VER_5_2_PLUS)
 	} else if (skip_proto != PROTO_MEMCACHED && (inferred_message.type =
 #else
@@ -3862,45 +4378,13 @@ infer_protocol_2(const char *infer_buf, size_t count,
 		    infer_openwire_message(infer_buf, count,
 					   conn_info)) != MSG_UNKNOWN) {
 		inferred_message.protocol = PROTO_OPENWIRE;
-#if defined(LINUX_VER_KFUNC) || defined(LINUX_VER_5_2_PLUS)
-	} else if (skip_proto != PROTO_ZMTP && (inferred_message.type =
-#else
-	} else if ((inferred_message.type =
-#endif
-		    infer_zmtp_message(infer_buf, count,
-				       syscall_infer_addr,
-				       syscall_infer_len,
-				       conn_info)) != MSG_UNKNOWN) {
-		inferred_message.protocol = PROTO_ZMTP;
-#if defined(LINUX_VER_KFUNC) || defined(LINUX_VER_5_2_PLUS)
-	} else if (skip_proto != PROTO_MONGO && (inferred_message.type =
-#else
-	} else if ((inferred_message.type =
-#endif
-		    infer_mongo_message(infer_buf, count,
-					conn_info)) != MSG_UNKNOWN) {
-		inferred_message.protocol = PROTO_MONGO;
-#if defined(LINUX_VER_KFUNC) || defined(LINUX_VER_5_2_PLUS)
-	} else if (skip_proto != PROTO_ROCKETMQ && (inferred_message.type =
-#else
-	} else if ((inferred_message.type =
-#endif
-		    infer_rocketmq_message(infer_buf, count,
-					conn_info)) != MSG_UNKNOWN) {
-		inferred_message.protocol = PROTO_ROCKETMQ;
 	}
 
-	if (conn_info->enable_reasm) {
-		if (inferred_message.type == MSG_UNKNOWN) {
-			inferred_message.type = MSG_REQUEST;
-			if (conn_info->socket_info_ptr) {
-				inferred_message.protocol =
-				    conn_info->socket_info_ptr->l7_proto;
-				conn_info->socket_info_ptr->finish_reasm = true;
-			}
-			conn_info->is_reasm_seg = true;
-		}
-	}
+#if defined(LINUX_VER_KFUNC) || defined(LINUX_VER_5_2_PLUS)
+	if (inferred_message.protocol != MSG_UNKNOWN)
+		return inferred_message;
+	return infer_protocol_3(infer_buf, count, conn_info);
+#endif
 
 	return inferred_message;
 }
@@ -3910,18 +4394,17 @@ infer_protocol_1(struct ctx_info_s *ctx,
 		 const struct data_args_t *args,
 		 size_t count,
 		 struct conn_info_s *conn_info,
-		 __u8 sk_state, const struct process_data_extra *extra)
+		 __u8 sk_state,
+		 const struct process_data_extra *extra,
+		 int *err_code)
 {
 	struct protocol_message_t inferred_message;
 	inferred_message.protocol = PROTO_UNKNOWN;
 	inferred_message.type = MSG_UNKNOWN;
+	*err_code = 0;
 
 	if (conn_info->sk == NULL)
-		return inferred_message;
-
-	if (conn_info->tuple.dport == 0 || conn_info->tuple.num == 0) {
-		return inferred_message;
-	}
+		goto infer_aborted;
 
 	/*
 	 * The socket that is indeed determined to be a protocol does not
@@ -3929,7 +4412,7 @@ infer_protocol_1(struct ctx_info_s *ctx,
 	 */
 	if (!is_socket_info_valid(conn_info->socket_info_ptr)) {
 		if (drop_msg_by_comm())
-			return inferred_message;
+			goto infer_aborted;
 	}
 
 	const char *buf = args->buf;
@@ -4001,7 +4484,8 @@ infer_protocol_1(struct ctx_info_s *ctx,
 	 * If the data source comes from kernel system calls, it is discarded
 	 * directly because some kernel probes do not handle TLS data.
 	 */
-	if (protocol_port_check_1(PROTO_TLS, conn_info) &&
+	if (conn_info->sk_type != SOCK_UNIX &&
+	    protocol_port_check_1(PROTO_TLS, conn_info) &&
 	    extra->source == DATA_SOURCE_SYSCALL) {
 		/*
 		 * TLS first performs handshake protocol inference and discards the data
@@ -4012,8 +4496,18 @@ infer_protocol_1(struct ctx_info_s *ctx,
 				       conn_info)) != MSG_UNKNOWN) {
 			inferred_message.protocol = PROTO_TLS;
 			return inferred_message;
-		} else {
-			return inferred_message;
+		}
+
+		/*
+		 * If the connection is a TLS connection and uprobe is not used, the
+		 * encrypted data can be discarded to prevent it from being involved
+		 * in subsequent protocol inference, thereby avoiding performance
+		 * degradation.
+		 */ 
+		if (is_socket_info_valid(conn_info->socket_info_ptr)) {
+			if (conn_info->socket_info_ptr->is_tls &&
+			    !skip_http2_kprobe())
+				goto infer_aborted;
 		}
 	}
 
@@ -4043,7 +4537,7 @@ infer_protocol_1(struct ctx_info_s *ctx,
 		struct proto_infer_cache_t *p;
 		p = proto_infer_cache_map__lookup(&cache_key);
 		if (p == NULL)
-			return inferred_message;
+			goto infer_aborted;
 		// https://stackoverflow.com/questions/70750259/bpf-verification-error-when-trying-to-extract-sni-from-tls-packet
 		__u8 this_proto = p->protocols[(__u16) pid];
 		switch (this_proto) {
@@ -4201,9 +4695,34 @@ infer_protocol_1(struct ctx_info_s *ctx,
 		case PROTO_ORACLE:
 			if ((inferred_message.type =
 			     infer_oracle_tns_message(infer_buf, count,
-						      conn_info)) !=
-			    MSG_UNKNOWN) {
+						conn_info)) != MSG_UNKNOWN) {
 				inferred_message.protocol = PROTO_ORACLE;
+				return inferred_message;
+			}
+			break;
+		case PROTO_DAMENG:
+			if ((inferred_message.type =
+			     infer_dameng_message(infer_buf, count,
+						conn_info)) != MSG_UNKNOWN) {
+				inferred_message.protocol = PROTO_DAMENG;
+				return inferred_message;
+			}
+			break;
+		case PROTO_ISO8583:
+			if ((inferred_message.type =
+			    infer_iso8583_message(infer_buf, count,
+						syscall_infer_addr,
+						syscall_infer_len,
+						conn_info)) != MSG_UNKNOWN) {
+				inferred_message.protocol = PROTO_ISO8583;
+				return inferred_message;
+			}
+			break;
+		case PROTO_NET_SIGN:
+			if ((inferred_message.type =
+			    infer_net_sign_message(infer_buf, count,
+						   conn_info)) != MSG_UNKNOWN) {
+				inferred_message.protocol = PROTO_NET_SIGN;
 				return inferred_message;
 			}
 			break;
@@ -4248,6 +4767,14 @@ infer_protocol_1(struct ctx_info_s *ctx,
 			     infer_rocketmq_message(infer_buf, count,
 						 conn_info)) != MSG_UNKNOWN) {
 				inferred_message.protocol = PROTO_ROCKETMQ;
+				return inferred_message;
+			}
+			break;
+		case PROTO_WEBSPHEREMQ:
+			if ((inferred_message.type =
+			     infer_web_sphere_mq_message(infer_buf, count,
+						 conn_info)) != MSG_UNKNOWN) {
+				inferred_message.protocol = PROTO_WEBSPHEREMQ;
 				return inferred_message;
 			}
 			break;
@@ -4297,14 +4824,6 @@ infer_protocol_1(struct ctx_info_s *ctx,
 		    infer_redis_message(infer_buf, count,
 					conn_info)) != MSG_UNKNOWN) {
 		inferred_message.protocol = PROTO_REDIS;
-#if defined(LINUX_VER_KFUNC) || defined(LINUX_VER_5_2_PLUS)
-	} else if (skip_proto != PROTO_MQTT && (inferred_message.type =
-#else
-	} else if ((inferred_message.type =
-#endif
-		    infer_mqtt_message(infer_buf, count,
-				       conn_info)) != MSG_UNKNOWN) {
-		inferred_message.protocol = PROTO_MQTT;
 #if defined(LINUX_VER_KFUNC) || defined(LINUX_VER_5_2_PLUS)
 	} else if (skip_proto != PROTO_DNS && (inferred_message.type =
 #else
@@ -4362,7 +4881,8 @@ infer_protocol_1(struct ctx_info_s *ctx,
 #else
 	} else if ((inferred_message.type =
 #endif
-		    infer_http2_message(infer_buf, count, syscall_infer_addr,
+		    infer_http2_message(infer_buf, count,
+					syscall_infer_addr,
 					syscall_infer_len,
 					conn_info)) != MSG_UNKNOWN) {
 		inferred_message.protocol = PROTO_HTTP2;
@@ -4373,6 +4893,10 @@ infer_protocol_1(struct ctx_info_s *ctx,
 	return infer_protocol_2(infer_buf, count, conn_info);
 #endif
 
+	return inferred_message;
+
+infer_aborted:
+	*err_code = -1;
 	return inferred_message;
 }
 

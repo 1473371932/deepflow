@@ -19,6 +19,7 @@ package agentmetadata
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	mapset "github.com/deckarep/golang-set"
@@ -1175,7 +1176,7 @@ func (r *PlatformRawData) checkVifIsVip(vif *models.VInterface) bool {
 }
 
 func (r *PlatformRawData) checkIsVip(ip string, vif *models.VInterface, platformVips []string) bool {
-	if Contains(platformVips, ip) == true {
+	if slices.Contains(platformVips, ip) == true {
 		return true
 	}
 
@@ -1376,12 +1377,12 @@ func (r *PlatformRawData) equal(o *PlatformRawData) bool {
 		}
 	}
 
-	if !SliceEqual[string](r.subnetPrefix, o.subnetPrefix) {
+	if !slices.Equal(r.subnetPrefix, o.subnetPrefix) {
 		log.Info(r.Log("platform subnet changed"))
 		return false
 	}
 
-	if !SliceEqual[string](r.subnetMask, o.subnetMask) {
+	if !slices.Equal(r.subnetMask, o.subnetMask) {
 		log.Info(r.Log("platform subnet changed"))
 		return false
 	}

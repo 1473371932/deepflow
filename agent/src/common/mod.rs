@@ -29,6 +29,7 @@ pub mod meta_packet;
 pub mod platform_data;
 pub mod policy;
 pub mod port_range;
+#[cfg(feature = "libtrace")]
 pub mod proc_event;
 pub(crate) mod tag;
 pub mod tagged_flow;
@@ -100,6 +101,8 @@ pub trait FlowAclListener: Send + Sync {
         peers: &Vec<Arc<PeerConnection>>,
         cidrs: &Vec<Arc<Cidr>>,
         acls: &Vec<Arc<Acl>>,
+        enabled_invalid_log: bool,
+        has_invalid_log: &mut bool,
     ) -> Result<(), String>;
     fn containers_change(&mut self, _: &Vec<Arc<Container>>) {}
     fn id(&self) -> usize;

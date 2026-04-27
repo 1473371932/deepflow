@@ -28,12 +28,12 @@ import (
 
 type ChChostCloudTags struct {
 	SubscriberComponent[
-		*message.VMAdd,
-		message.VMAdd,
-		*message.VMFieldsUpdate,
-		message.VMFieldsUpdate,
-		*message.VMDelete,
-		message.VMDelete,
+		*message.AddedVMs,
+		message.AddedVMs,
+		*message.UpdatedVM,
+		message.UpdatedVM,
+		*message.DeletedVMs,
+		message.DeletedVMs,
 		metadbmodel.VM,
 		metadbmodel.ChChostCloudTags,
 		IDKey,
@@ -43,12 +43,12 @@ type ChChostCloudTags struct {
 func NewChChostCloudTags() *ChChostCloudTags {
 	mng := &ChChostCloudTags{
 		newSubscriberComponent[
-			*message.VMAdd,
-			message.VMAdd,
-			*message.VMFieldsUpdate,
-			message.VMFieldsUpdate,
-			*message.VMDelete,
-			message.VMDelete,
+			*message.AddedVMs,
+			message.AddedVMs,
+			*message.UpdatedVM,
+			message.UpdatedVM,
+			*message.DeletedVMs,
+			message.DeletedVMs,
 			metadbmodel.VM,
 			metadbmodel.ChChostCloudTags,
 			IDKey,
@@ -61,44 +61,26 @@ func NewChChostCloudTags() *ChChostCloudTags {
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChChostCloudTags) onResourceUpdated(sourceID int, fieldsUpdate *message.VMFieldsUpdate, db *metadb.DB) {
-	updateInfo := make(map[string]interface{})
-	if fieldsUpdate.CloudTags.IsDifferent() {
-		bytes, err := json.Marshal(fieldsUpdate.CloudTags.GetNew())
-		if err != nil {
-			log.Error(err, db.LogPrefixORGID)
-			return
-		}
-		updateInfo["cloud_tags"] = string(bytes)
-	}
-	targetKey := IDKey{ID: sourceID}
-	if len(updateInfo) > 0 {
-		var chItem metadbmodel.ChChostCloudTags
-		db.Where("id = ?", sourceID).Find(&chItem)
-		if chItem.ID == 0 {
-			c.SubscriberComponent.dbOperator.add(
-				[]IDKey{targetKey},
-				[]metadbmodel.ChChostCloudTags{{ChIDBase: metadbmodel.ChIDBase{ID: sourceID}, CloudTags: updateInfo["cloud_tags"].(string)}},
-				db,
-			)
-			return
-		}
-	}
-	c.updateOrSync(db, targetKey, updateInfo)
+func (c *ChChostCloudTags) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedVM) {
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
 func (c *ChChostCloudTags) sourceToTarget(md *message.Metadata, source *metadbmodel.VM) (keys []IDKey, targets []metadbmodel.ChChostCloudTags) {
-	if len(source.CloudTags) == 0 {
+	cloudTagMap := MergeCloudTags(source.LearnedCloudTags, source.CustomCloudTags)
+	if len(cloudTagMap) == 0 {
 		return
 	}
-	bytes, err := json.Marshal(source.CloudTags)
+	bytes, err := json.Marshal(cloudTagMap)
 	if err != nil {
-		log.Error(err, logger.NewORGPrefix(md.ORGID))
+		log.Error(err, logger.NewORGPrefix(md.GetORGID()))
 		return
 	}
 	return []IDKey{{ID: source.ID}}, []metadbmodel.ChChostCloudTags{{
-		ChIDBase: metadbmodel.ChIDBase{ID: source.ID}, CloudTags: string(bytes), TeamID: md.TeamID, DomainID: md.DomainID}}
+		ChIDBase:  metadbmodel.ChIDBase{ID: source.ID},
+		CloudTags: string(bytes),
+		TeamID:    md.GetTeamID(),
+		DomainID:  md.GetDomainID(),
+	}}
 }
 
 // softDeletedTargetsUpdated implements SubscriberDataGenerator

@@ -21,18 +21,27 @@ pub mod shared_obj;
 pub mod wasm;
 
 use prost::Message;
-use public::{bytes::read_u32_be, counter::Countable, l7_protocol::L7Protocol};
+use public::{
+    bytes::read_u32_be,
+    counter::Countable,
+    l7_protocol::{L7Protocol, LogMessageType},
+};
 use serde::Serialize;
 
 use crate::{
-    common::flow::PacketDirection,
-    common::l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
+    common::{
+        flow::PacketDirection,
+        l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
+        l7_protocol_log::LogCache,
+    },
+    config::handler::LogParserConfig,
     flow_generator::{
         protocol_logs::{
             pb_adapter::{
-                ExtendedInfo, KeyVal, L7ProtocolSendLog, L7Request, L7Response, TraceInfo,
+                ExtendedInfo, KeyVal, L7ProtocolSendLog, L7Request, L7Response, MetricKeyVal,
+                TraceInfo,
             },
-            swap_if, L7ResponseStatus, LogMessageType,
+            swap_if, L7ResponseStatus,
         },
         AppProtoHead, Error,
     },
@@ -55,11 +64,13 @@ pub struct CustomInfoResp {
     pub code: Option<i32>,
     pub exception: String,
     pub result: String,
+    pub req_type: String,
+    pub endpoint: String,
 }
 
 #[derive(Debug, Default, Serialize, Clone)]
 pub struct CustomInfoTrace {
-    pub trace_id: Option<String>,
+    pub trace_ids: Vec<String>,
     pub span_id: Option<String>,
     pub parent_span_id: Option<String>,
     pub x_request_id_0: Option<String>,
@@ -99,7 +110,19 @@ pub struct CustomInfo {
     #[serde(skip)]
     pub attributes: Vec<KeyVal>,
 
+    #[serde(skip)]
+    pub metrics: Vec<MetricKeyVal>,
+
     pub biz_type: u8,
+    pub biz_code: Option<String>,
+    pub biz_scenario: Option<String>,
+    pub biz_response_code: Option<String>,
+
+    #[serde(skip)]
+    pub is_on_blacklist: bool,
+
+    pub is_async: Option<bool>,
+    pub is_reversed: Option<bool>,
 }
 
 impl CustomInfo {
@@ -151,7 +174,7 @@ impl CustomInfo {
 
         if has trace:
 
-            trace_id, span_id, parent_span_id
+            trace_ids, span_id, parent_span_id
             (
 
                 key len: 2 bytes
@@ -174,6 +197,8 @@ impl CustomInfo {
             ) x len(kv)
 
         biz type: 1 byte
+        // is async: 1 byte
+        // is reversed: 1 byte
     */
     fn from_legacy_protocol(buf: &[u8], dir: PacketDirection) -> Result<Self, Error> {
         let mut off = 0;
@@ -334,7 +359,7 @@ impl CustomInfo {
             1 => {
                 if read_wasm_str(buf, &mut off)
                     .and_then(|s| {
-                        info.trace.trace_id = Some(s);
+                        merge_trace_ids(&mut info.trace.trace_ids, &vec![s]);
                         read_wasm_str(buf, &mut off)
                     })
                     .and_then(|s| {
@@ -430,6 +455,11 @@ impl CustomInfo {
                 })
                 .collect(),
             biz_type: pb_info.biz_type.unwrap_or_default() as u8,
+            biz_code: pb_info.biz_code,
+            biz_scenario: pb_info.biz_scenario,
+            biz_response_code: pb_info.biz_response_code,
+            is_async: pb_info.is_async,
+            is_reversed: pb_info.is_reversed,
             ..Default::default()
         };
         match pb_info.info {
@@ -459,18 +489,26 @@ impl CustomInfo {
                     code: r.code,
                     result: r.result.unwrap_or_default(),
                     exception: r.exception.unwrap_or_default(),
+                    req_type: r.r#type.unwrap_or_default(),
+                    endpoint: r.endpoint.unwrap_or_default(),
                 };
             }
             _ => (),
         }
         if let Some(t) = pb_info.trace {
             info.trace = CustomInfoTrace {
-                trace_id: t.trace_id,
+                trace_ids: t.trace_ids,
                 span_id: t.span_id,
                 parent_span_id: t.parent_span_id,
                 http_proxy_client: t.http_proxy_client,
                 ..Default::default()
             };
+            // add trace_id to trace_ids
+            if let Some(trace_id) = t.trace_id {
+                if !info.trace.trace_ids.contains(&trace_id) {
+                    info.trace.trace_ids.push(trace_id.to_string());
+                }
+            }
             match dir {
                 PacketDirection::ClientToServer => {
                     info.trace.x_request_id_0 = t.x_request_id;
@@ -481,6 +519,15 @@ impl CustomInfo {
             }
         }
         Ok(info)
+    }
+
+    pub fn set_is_on_blacklist(&mut self, config: &LogParserConfig) {
+        if let Some(t) = config.l7_log_blacklist_trie.get(&L7Protocol::Custom) {
+            self.is_on_blacklist = t.request_type.is_on_blacklist(&self.req.req_type)
+                || t.request_resource.is_on_blacklist(&self.req.resource)
+                || t.endpoint.is_on_blacklist(&self.req.endpoint)
+                || t.request_domain.is_on_blacklist(&self.req.domain);
+        }
     }
 }
 
@@ -499,6 +546,14 @@ impl TryFrom<(&[u8], PacketDirection)> for CustomInfo {
             Self::from_protobuf(&buf[2..], dir)
         } else {
             Self::from_legacy_protocol(buf, dir)
+        }
+    }
+}
+
+fn merge_trace_ids(a: &mut Vec<String>, b: &Vec<String>) {
+    for item in b {
+        if !a.contains(item) {
+            a.push(item.clone());
         }
     }
 }
@@ -537,6 +592,8 @@ impl L7ProtocolInfoInterface for CustomInfo {
 
             swap_if!(self.resp, exception, is_empty, w.resp);
             swap_if!(self.resp, result, is_empty, w.resp);
+            swap_if!(self.resp, req_type, is_empty, w.resp);
+            swap_if!(self.resp, endpoint, is_empty, w.resp);
 
             if self.resp_len.is_none() {
                 self.resp_len = w.resp_len;
@@ -548,13 +605,17 @@ impl L7ProtocolInfoInterface for CustomInfo {
             self.captured_response_byte += w.captured_response_byte;
 
             // trace merge
-            swap_if!(self.trace, trace_id, is_none, w.trace);
+            merge_trace_ids(&mut self.trace.trace_ids, &w.trace.trace_ids);
             swap_if!(self.trace, span_id, is_none, w.trace);
             swap_if!(self.trace, parent_span_id, is_none, w.trace);
             swap_if!(self.trace, x_request_id_0, is_none, w.trace);
             swap_if!(self.trace, x_request_id_1, is_none, w.trace);
             swap_if!(self.trace, http_proxy_client, is_none, w.trace);
+
             self.attributes.append(&mut w.attributes);
+
+            swap_if!(self, biz_code, is_none, w);
+            swap_if!(self, biz_scenario, is_none, w);
         }
         Ok(())
     }
@@ -565,6 +626,12 @@ impl L7ProtocolInfoInterface for CustomInfo {
             msg_type: self.msg_type,
             rrt: self.rrt,
         })
+    }
+
+    fn needs_session_aggregation(&self) -> bool {
+        // Returns true if `is_async` is None (not set) or Some(false).
+        // Returns false only if `is_async` is explicitly set to Some(true).
+        !self.is_async.unwrap_or(false)
     }
 
     fn is_tls(&self) -> bool {
@@ -580,11 +647,15 @@ impl L7ProtocolInfoInterface for CustomInfo {
     }
 
     fn get_endpoint(&self) -> Option<String> {
-        None
+        return Some(self.req.endpoint.clone());
     }
 
     fn get_biz_type(&self) -> u8 {
         self.biz_type
+    }
+
+    fn is_reversed(&self) -> bool {
+        self.is_reversed.unwrap_or_default()
     }
 }
 
@@ -597,10 +668,18 @@ impl From<CustomInfo> for L7ProtocolSendLog {
             captured_response_byte: w.captured_response_byte,
 
             req: L7Request {
-                req_type: w.req.req_type,
+                req_type: if w.req.req_type.is_empty() {
+                    w.resp.req_type
+                } else {
+                    w.req.req_type
+                },
                 domain: w.req.domain,
                 resource: w.req.resource,
-                endpoint: w.req.endpoint,
+                endpoint: if w.req.endpoint.is_empty() {
+                    w.resp.endpoint
+                } else {
+                    w.req.endpoint
+                },
             },
             resp: L7Response {
                 status: w.resp.status,
@@ -608,12 +687,12 @@ impl From<CustomInfo> for L7ProtocolSendLog {
                 exception: w.resp.exception,
                 result: w.resp.result,
             },
-            trace_info: if w.trace.trace_id.is_some()
+            trace_info: if !w.trace.trace_ids.is_empty()
                 || w.trace.span_id.is_some()
                 || w.trace.parent_span_id.is_some()
             {
                 Some(TraceInfo {
-                    trace_id: w.trace.trace_id,
+                    trace_ids: w.trace.trace_ids,
                     span_id: w.trace.span_id,
                     parent_span_id: w.trace.parent_span_id,
                 })
@@ -624,10 +703,31 @@ impl From<CustomInfo> for L7ProtocolSendLog {
                 request_id: w.request_id,
                 attributes: Some(w.attributes),
                 protocol_str: Some(w.proto_str),
+                client_ip: w.trace.http_proxy_client,
                 x_request_id_0: w.trace.x_request_id_0,
                 x_request_id_1: w.trace.x_request_id_1,
                 ..Default::default()
             }),
+            biz_response_code: w.biz_response_code.unwrap_or_default(),
+            version: if w.req.version.is_empty() {
+                None
+            } else {
+                Some(w.req.version)
+            },
+            biz_code: w.biz_code.unwrap_or_default(),
+            biz_scenario: w.biz_scenario.unwrap_or_default(),
+            ..Default::default()
+        }
+    }
+}
+
+impl From<&CustomInfo> for LogCache {
+    fn from(info: &CustomInfo) -> Self {
+        LogCache {
+            msg_type: info.msg_type,
+            resp_status: info.resp.status,
+            on_blacklist: info.is_on_blacklist,
+            endpoint: info.get_endpoint(),
             ..Default::default()
         }
     }

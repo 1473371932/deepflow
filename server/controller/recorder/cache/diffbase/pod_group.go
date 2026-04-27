@@ -33,17 +33,18 @@ func (b *DataSet) AddPodGroup(dbItem *metadbmodel.PodGroup, seq int) {
 		},
 		Name:            dbItem.Name,
 		Label:           dbItem.Label,
+		NetworkMode:     dbItem.NetworkMode,
 		PodNum:          dbItem.PodNum,
 		Type:            dbItem.Type,
-		Metadata:        dbItem.Metadata,
+		Metadata:        string(dbItem.Metadata),
 		MetadataHash:    dbItem.MetadataHash,
-		Spec:            dbItem.Spec,
+		Spec:            string(dbItem.Spec),
 		SpecHash:        dbItem.SpecHash,
 		RegionLcuuid:    dbItem.Region,
 		AZLcuuid:        dbItem.AZ,
 		SubDomainLcuuid: dbItem.SubDomain,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_GROUP_EN, b.PodGroups[dbItem.Lcuuid]), b.metadata.LogPrefixes)
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_GROUP_EN, b.PodGroups[dbItem.Lcuuid].ToLoggable()), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeletePodGroup(lcuuid string) {
@@ -57,6 +58,7 @@ type PodGroup struct {
 	Label           string `json:"label"`
 	PodNum          int    `json:"pod_num"`
 	Type            int    `json:"type"`
+	NetworkMode     int    `json:"network_mode"`
 	Metadata        string `json:"metadata"`
 	MetadataHash    string `json:"metadata_hash"`
 	Spec            string `json:"spec"`
@@ -66,9 +68,18 @@ type PodGroup struct {
 	SubDomainLcuuid string `json:"sub_domain_lcuuid"`
 }
 
+// ToLoggable converts PodGroup to a loggable format, excluding fields Spec and Metadata
+func (p PodGroup) ToLoggable() interface{} {
+	copied := p
+	copied.Metadata = "**HIDDEN**"
+	copied.Spec = "**HIDDEN**"
+	return copied
+}
+
 func (p *PodGroup) Update(cloudItem *cloudmodel.PodGroup, toolDataSet *tool.DataSet) {
 	p.Name = cloudItem.Name
 	p.Label = cloudItem.Label
+	p.NetworkMode = cloudItem.NetworkMode
 	p.PodNum = cloudItem.PodNum
 	p.Type = cloudItem.Type
 
@@ -90,5 +101,5 @@ func (p *PodGroup) Update(cloudItem *cloudmodel.PodGroup, toolDataSet *tool.Data
 
 	p.RegionLcuuid = cloudItem.RegionLcuuid
 	p.AZLcuuid = cloudItem.AZLcuuid
-	log.Info(updateDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_GROUP_EN, p))
+	log.Info(updateDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_GROUP_EN, p.ToLoggable()))
 }

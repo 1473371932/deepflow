@@ -16,6 +16,10 @@
 
 package tagrecorder
 
+type KeyConverter interface {
+	Map() map[string]interface{}
+}
+
 type DeviceKey struct {
 	DeviceID   int `json:"deviceid"`
 	DeviceType int `json:"devicetype"`
@@ -57,28 +61,6 @@ func (k IDKeyKey) Map() map[string]interface{} {
 	}
 }
 
-type OSAPPTagKey struct {
-	PID int    `json:"pid"`
-	Key string `json:"key"`
-}
-
-func (k OSAPPTagKey) Map() map[string]interface{} {
-	return map[string]interface{}{
-		"pid":   k.PID,
-		"`key`": k.Key,
-	}
-}
-
-type OSAPPTagsKey struct {
-	PID int `json:"pid"`
-}
-
-func (k OSAPPTagsKey) Map() map[string]interface{} {
-	return map[string]interface{}{
-		"pid": k.PID,
-	}
-}
-
 type IPResourceKey struct {
 	IP       string
 	SubnetID int
@@ -107,6 +89,13 @@ type PortDeviceKey struct {
 type VtapPortKey struct {
 	VtapID  int
 	TapPort int64
+}
+
+func (k VtapPortKey) Map() map[string]interface{} {
+	return map[string]interface{}{
+		"vtap_id":  k.VtapID,
+		"tap_port": k.TapPort,
+	}
 }
 
 type IPRelationKey struct {

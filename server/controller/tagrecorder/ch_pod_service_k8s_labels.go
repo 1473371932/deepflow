@@ -25,12 +25,12 @@ import (
 
 type ChPodServiceK8sLabels struct {
 	SubscriberComponent[
-		*message.PodServiceAdd,
-		message.PodServiceAdd,
-		*message.PodServiceFieldsUpdate,
-		message.PodServiceFieldsUpdate,
-		*message.PodServiceDelete,
-		message.PodServiceDelete,
+		*message.AddedPodServices,
+		message.AddedPodServices,
+		*message.UpdatedPodService,
+		message.UpdatedPodService,
+		*message.DeletedPodServices,
+		message.DeletedPodServices,
 		metadbmodel.PodService,
 		metadbmodel.ChPodServiceK8sLabels,
 		IDKey,
@@ -40,12 +40,12 @@ type ChPodServiceK8sLabels struct {
 func NewChPodServiceK8sLabels() *ChPodServiceK8sLabels {
 	mng := &ChPodServiceK8sLabels{
 		newSubscriberComponent[
-			*message.PodServiceAdd,
-			message.PodServiceAdd,
-			*message.PodServiceFieldsUpdate,
-			message.PodServiceFieldsUpdate,
-			*message.PodServiceDelete,
-			message.PodServiceDelete,
+			*message.AddedPodServices,
+			message.AddedPodServices,
+			*message.UpdatedPodService,
+			message.UpdatedPodService,
+			*message.DeletedPodServices,
+			message.DeletedPodServices,
 			metadbmodel.PodService,
 			metadbmodel.ChPodServiceK8sLabels,
 			IDKey,
@@ -58,30 +58,7 @@ func NewChPodServiceK8sLabels() *ChPodServiceK8sLabels {
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChPodServiceK8sLabels) onResourceUpdated(sourceID int, fieldsUpdate *message.PodServiceFieldsUpdate, db *metadb.DB) {
-	updateInfo := make(map[string]interface{})
-	if fieldsUpdate.Label.IsDifferent() {
-		labels, _ := common.StrToJsonAndMap(fieldsUpdate.Label.GetNew())
-		if labels != "" {
-			updateInfo["labels"] = labels
-		}
-	}
-	targetKey := IDKey{ID: sourceID}
-	if len(updateInfo) > 0 {
-		var chItem metadbmodel.ChPodServiceK8sLabels
-		db.Where("id = ?", sourceID).First(&chItem)
-		if chItem.ID == 0 {
-			c.SubscriberComponent.dbOperator.add(
-				[]IDKey{targetKey},
-				[]metadbmodel.ChPodServiceK8sLabels{{
-					ChIDBase: metadbmodel.ChIDBase{ID: sourceID},
-					Labels:   updateInfo["labels"].(string),
-				}},
-				db,
-			)
-		}
-	}
-	c.updateOrSync(db, targetKey, updateInfo)
+func (c *ChPodServiceK8sLabels) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedPodService) {
 }
 
 // sourceToTarget implements SubscriberDataGenerator
@@ -89,13 +66,15 @@ func (c *ChPodServiceK8sLabels) sourceToTarget(md *message.Metadata, source *met
 	if source.Label == "" {
 		return
 	}
-	labels, _ := common.StrToJsonAndMap(source.Label)
+	labels, _ := StrToJsonAndMap(source.Label)
 	return []IDKey{{ID: source.ID}}, []metadbmodel.ChPodServiceK8sLabels{{
 		ChIDBase:    metadbmodel.ChIDBase{ID: source.ID},
 		Labels:      labels,
-		TeamID:      md.TeamID,
-		DomainID:    md.DomainID,
-		SubDomainID: md.SubDomainID,
+		L3EPCID:     source.VPCID,
+		PodNsID:     source.PodNamespaceID,
+		TeamID:      md.GetTeamID(),
+		DomainID:    md.GetDomainID(),
+		SubDomainID: md.GetSubDomainID(),
 	}}
 }
 

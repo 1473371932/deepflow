@@ -7,6 +7,7 @@
 <p align="center">
     <a href="https://zenodo.org/badge/latestdoi/448599559"><img src="https://zenodo.org/badge/448599559.svg" alt="DOI"></a>
     <img alt="GitHub Release" src="https://img.shields.io/github/v/release/deepflowio/deepflow"> </a>
+    <img alt="GitCode" src="https://gitcode.com/DeepFlow/deepflow/star/badge.svg"> </a>
     <img alt="docker pulls" src="https://img.shields.io/docker/pulls/deepflowce/deepflow-agent?color=green?label=docker pulls"> </a>
     <img alt="License" src="https://img.shields.io/github/license/deepflowio/deepflow?color=purple"> </a>
 </p>
@@ -44,7 +45,7 @@ DeepFlowコミュニティ版は、エンタープライズ版のコアコンポ
 
 [ドキュメント](https://deepflow.io/docs/ce-install/all-in-one/?from=github)に従って、DeepFlow Communityをデプロイしてください。
 
-また、完全な[DeepFlow Community Demo](https://ce-demo.deepflow.yunshan.net/?from=github)も構築していますので、ぜひ体験してみてください。ログインアカウント/パスワード：deepflow/deepflow。
+また、完全な[DeepFlow Community Demo](https://ce-demo.deepflow.yunshan.net/?from=github)も構築していますので、ぜひ体験してみてください。ログインアカウント/パスワード：deepflow / deepflow-2026
 
 ## DeepFlow Enterpriseを体験する
 

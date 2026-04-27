@@ -25,12 +25,12 @@ import (
 
 type ChPodK8sLabel struct {
 	SubscriberComponent[
-		*message.PodAdd,
-		message.PodAdd,
-		*message.PodFieldsUpdate,
-		message.PodFieldsUpdate,
-		*message.PodDelete,
-		message.PodDelete,
+		*message.AddedPods,
+		message.AddedPods,
+		*message.UpdatedPod,
+		message.UpdatedPod,
+		*message.DeletedPods,
+		message.DeletedPods,
 		metadbmodel.Pod,
 		metadbmodel.ChPodK8sLabel,
 		IDKeyKey,
@@ -40,12 +40,12 @@ type ChPodK8sLabel struct {
 func NewChPodK8sLabel() *ChPodK8sLabel {
 	mng := &ChPodK8sLabel{
 		newSubscriberComponent[
-			*message.PodAdd,
-			message.PodAdd,
-			*message.PodFieldsUpdate,
-			message.PodFieldsUpdate,
-			*message.PodDelete,
-			message.PodDelete,
+			*message.AddedPods,
+			message.AddedPods,
+			*message.UpdatedPod,
+			message.UpdatedPod,
+			*message.DeletedPods,
+			message.DeletedPods,
 			metadbmodel.Pod,
 			metadbmodel.ChPodK8sLabel,
 			IDKeyKey,
@@ -58,45 +58,18 @@ func NewChPodK8sLabel() *ChPodK8sLabel {
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChPodK8sLabel) onResourceUpdated(sourceID int, fieldsUpdate *message.PodFieldsUpdate, db *metadb.DB) {
-	keysToAdd := make([]IDKeyKey, 0)
-	targetsToAdd := make([]metadbmodel.ChPodK8sLabel, 0)
+func (c *ChPodK8sLabel) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedPod) {
+	db := md.GetDB()
+	fieldsUpdate := updateMessage.GetFields().(*message.UpdatedPodFields)
+	newSource := updateMessage.GetNewMetadbItem().(*metadbmodel.Pod)
+	sourceID := newSource.ID
 	keysToDelete := make([]IDKeyKey, 0)
 	targetsToDelete := make([]metadbmodel.ChPodK8sLabel, 0)
 
 	if fieldsUpdate.Label.IsDifferent() {
-		_, new := common.StrToJsonAndMap(fieldsUpdate.Label.GetNew())
-		_, old := common.StrToJsonAndMap(fieldsUpdate.Label.GetOld())
+		_, new := StrToJsonAndMap(fieldsUpdate.Label.GetNew())
+		_, old := StrToJsonAndMap(fieldsUpdate.Label.GetOld())
 
-		for k, v := range new {
-			targetKey := NewIDKeyKey(sourceID, k)
-			oldV, ok := old[k]
-			if !ok {
-				keysToAdd = append(keysToAdd, targetKey)
-				targetsToAdd = append(targetsToAdd, metadbmodel.ChPodK8sLabel{
-					ChIDBase: metadbmodel.ChIDBase{ID: sourceID},
-					Key:      k,
-					Value:    v,
-				})
-				continue
-			}
-			updateInfo := make(map[string]interface{})
-			if oldV != v {
-				var chItem metadbmodel.ChPodK8sLabel
-				db.Where("id = ? and `key` = ?", sourceID, k).First(&chItem)
-				if chItem.ID == 0 {
-					keysToAdd = append(keysToAdd, targetKey)
-					targetsToAdd = append(targetsToAdd, metadbmodel.ChPodK8sLabel{
-						ChIDBase: metadbmodel.ChIDBase{ID: sourceID},
-						Key:      k,
-						Value:    v,
-					})
-					continue
-				}
-				updateInfo["value"] = v
-			}
-			c.updateOrSync(db, targetKey, updateInfo)
-		}
 		for k := range old {
 			if _, ok := new[k]; !ok {
 				keysToDelete = append(keysToDelete, NewIDKeyKey(sourceID, k))
@@ -107,9 +80,7 @@ func (c *ChPodK8sLabel) onResourceUpdated(sourceID int, fieldsUpdate *message.Po
 			}
 		}
 	}
-	if len(keysToAdd) > 0 {
-		c.SubscriberComponent.dbOperator.add(keysToAdd, targetsToAdd, db)
-	}
+
 	if len(keysToDelete) > 0 {
 		c.SubscriberComponent.dbOperator.delete(keysToDelete, targetsToDelete, db)
 	}
@@ -117,16 +88,16 @@ func (c *ChPodK8sLabel) onResourceUpdated(sourceID int, fieldsUpdate *message.Po
 
 // onResourceUpdated implements SubscriberDataGenerator
 func (c *ChPodK8sLabel) sourceToTarget(md *message.Metadata, source *metadbmodel.Pod) (keys []IDKeyKey, targets []metadbmodel.ChPodK8sLabel) {
-	_, labelMap := common.StrToJsonAndMap(source.Label)
+	_, labelMap := StrToJsonAndMap(source.Label)
 	for k, v := range labelMap {
 		keys = append(keys, NewIDKeyKey(source.ID, k))
 		targets = append(targets, metadbmodel.ChPodK8sLabel{
 			ChIDBase:    metadbmodel.ChIDBase{ID: source.ID},
 			Key:         k,
 			Value:       v,
-			TeamID:      md.TeamID,
-			DomainID:    md.DomainID,
-			SubDomainID: md.SubDomainID,
+			TeamID:      md.GetTeamID(),
+			DomainID:    md.GetDomainID(),
+			SubDomainID: md.GetSubDomainID(),
 		})
 	}
 	return

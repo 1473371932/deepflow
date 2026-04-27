@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -217,13 +218,13 @@ func generateToolDataSet(additionalRsc model.AdditionalResource, orgDB *metadb.D
 				fmt.Sprintf("subnet (name: %s) domain (uuid: %s) not found", subnet.Name, subnet.DomainUUID),
 			)
 		}
-		if subnet.AZUUID != "" && !common.Contains(toolDS.azUUIDs, subnet.AZUUID) {
+		if subnet.AZUUID != "" && !slices.Contains(toolDS.azUUIDs, subnet.AZUUID) {
 			return nil, response.ServiceError(
 				httpcommon.RESOURCE_NOT_FOUND,
 				fmt.Sprintf("subnet (name: %s) az (uuid: %s) not found", subnet.Name, subnet.AZUUID),
 			)
 		}
-		if !common.Contains(toolDS.vpcUUIDs, subnet.VPCUUID) {
+		if !slices.Contains(toolDS.vpcUUIDs, subnet.VPCUUID) {
 			return nil, response.ServiceError(
 				httpcommon.RESOURCE_NOT_FOUND,
 				fmt.Sprintf("subnet (name: %s) vpc (uuid: %s) not found", subnet.Name, subnet.VPCUUID),
@@ -264,7 +265,7 @@ func generateToolDataSet(additionalRsc model.AdditionalResource, orgDB *metadb.D
 				fmt.Sprintf("host (name: %s) domain (uuid: %s) not found", host.Name, host.DomainUUID),
 			)
 		}
-		if !common.Contains(toolDS.azUUIDs, host.AZUUID) {
+		if !slices.Contains(toolDS.azUUIDs, host.AZUUID) {
 			return nil, response.ServiceError(
 				httpcommon.RESOURCE_NOT_FOUND,
 				fmt.Sprintf("host (name: %s) az (uuid: %s) not found", host.Name, host.AZUUID),
@@ -308,13 +309,13 @@ func generateToolDataSet(additionalRsc model.AdditionalResource, orgDB *metadb.D
 				fmt.Sprintf("chost (name: %s) domain (uuid: %s) not found", chost.Name, chost.DomainUUID),
 			)
 		}
-		if !common.Contains(toolDS.azUUIDs, chost.AZUUID) {
+		if !slices.Contains(toolDS.azUUIDs, chost.AZUUID) {
 			return nil, response.ServiceError(
 				httpcommon.RESOURCE_NOT_FOUND,
 				fmt.Sprintf("chost (name: %s) az (uuid: %s) not found", chost.Name, chost.AZUUID),
 			)
 		}
-		if !common.Contains(toolDS.vpcUUIDs, chost.VPCUUID) {
+		if !slices.Contains(toolDS.vpcUUIDs, chost.VPCUUID) {
 			return nil, response.ServiceError(
 				httpcommon.RESOURCE_NOT_FOUND,
 				fmt.Sprintf("chost (name: %s) vpc (uuid: %s) not found", chost.Name, chost.VPCUUID),
@@ -351,7 +352,7 @@ func generateToolDataSet(additionalRsc model.AdditionalResource, orgDB *metadb.D
 				fmt.Sprintf("lb (name: %s) domain (uuid: %s) region(: %s) not found", lb.Name, lb.DomainUUID, lb.RegionUUID),
 			)
 		}
-		if !common.Contains(toolDS.vpcUUIDs, lb.VPCUUID) {
+		if !slices.Contains(toolDS.vpcUUIDs, lb.VPCUUID) {
 			return nil, response.ServiceError(
 				httpcommon.RESOURCE_NOT_FOUND,
 				fmt.Sprintf("chost (name: %s) vpc (uuid: %s) not found", lb.Name, lb.VPCUUID),
@@ -411,7 +412,7 @@ func generateToolDataSet(additionalRsc model.AdditionalResource, orgDB *metadb.D
 					httpcommon.INVALID_POST_DATA,
 					fmt.Sprintf("cloud tag (resource name: %s) subdomain (uuid: %s) not found", cloudTag.ResourceName, cloudTag.DomainUUID))
 			}
-			podNS.CloudTags, err = convertTagsToMap(cloudTag.Tags)
+			podNS.LearnedCloudTags, err = convertTagsToMap(cloudTag.Tags)
 			if err != nil {
 				return nil, err
 			}
@@ -434,7 +435,7 @@ func generateToolDataSet(additionalRsc model.AdditionalResource, orgDB *metadb.D
 					httpcommon.INVALID_POST_DATA,
 					fmt.Sprintf("cloud tag (resource name: %s) domain (uuid: %s) not found", cloudTag.ResourceName, cloudTag.DomainUUID))
 			}
-			chost.CloudTags, err = convertTagsToMap(cloudTag.Tags)
+			chost.LearnedCloudTags, err = convertTagsToMap(cloudTag.Tags)
 			if err != nil {
 				return nil, err
 			}
@@ -452,7 +453,7 @@ func generateToolDataSet(additionalRsc model.AdditionalResource, orgDB *metadb.D
 					httpcommon.INVALID_POST_DATA,
 					fmt.Sprintf("cloud tag (resource name: %s) domain (uuid: %s) not found", cloudTag.ResourceName, cloudTag.DomainUUID))
 			}
-			podNS.CloudTags, err = convertTagsToMap(cloudTag.Tags)
+			podNS.LearnedCloudTags, err = convertTagsToMap(cloudTag.Tags)
 			if err != nil {
 				return nil, err
 			}
@@ -486,14 +487,14 @@ func generateToolDataSet(additionalRsc model.AdditionalResource, orgDB *metadb.D
 				fmt.Sprintf("domain (uuid: %s) cannot be associated region", peerConn.DomainUUID),
 			)
 		}
-		if !common.Contains[string](regionUUIDs, peerConn.LocalRegionUUID) {
+		if !slices.Contains(regionUUIDs, peerConn.LocalRegionUUID) {
 			return nil, response.ServiceError(
 				httpcommon.INVALID_POST_DATA,
 				fmt.Sprintf("domain (uuid: %s) cannot be associated with local region (uuid: %s), support regions: %#v",
 					peerConn.DomainUUID, peerConn.LocalRegionUUID, regionUUIDs),
 			)
 		}
-		if !common.Contains[string](regionUUIDs, peerConn.RemoteRegionUUID) {
+		if !slices.Contains(regionUUIDs, peerConn.RemoteRegionUUID) {
 			return nil, response.ServiceError(
 				httpcommon.INVALID_POST_DATA,
 				fmt.Sprintf("domain (uuid: %s) cannot be associated with remote region (uuid: %s), support regions: %#v",
@@ -737,13 +738,13 @@ func generateCloudModelData(orgID int, domainUUIDToToolDataSet map[string]*addti
 			if cloudMD.CHostCloudTags == nil {
 				cloudMD.CHostCloudTags = make(cloudmodel.UUIDToCloudTags)
 			}
-			cloudMD.CHostCloudTags[chost.Lcuuid] = chost.CloudTags
+			cloudMD.CHostCloudTags[chost.Lcuuid] = chost.LearnedCloudTags
 		}
 		for _, podNamespace := range toolDS.cloudTagPodNamespaces {
 			if cloudMD.PodNamespaceCloudTags == nil {
 				cloudMD.PodNamespaceCloudTags = make(cloudmodel.UUIDToCloudTags)
 			}
-			cloudMD.PodNamespaceCloudTags[podNamespace.Lcuuid] = podNamespace.CloudTags
+			cloudMD.PodNamespaceCloudTags[podNamespace.Lcuuid] = podNamespace.LearnedCloudTags
 		}
 		for _, podNamespace := range toolDS.subdomainPodNamespaces {
 			if cloudMD.SubDomainResources == nil {
@@ -754,7 +755,7 @@ func generateCloudModelData(orgID int, domainUUIDToToolDataSet map[string]*addti
 					PodNamespaceCloudTags: make(cloudmodel.UUIDToCloudTags),
 				}
 			}
-			cloudMD.SubDomainResources[podNamespace.SubDomain].PodNamespaceCloudTags[podNamespace.Lcuuid] = podNamespace.CloudTags
+			cloudMD.SubDomainResources[podNamespace.SubDomain].PodNamespaceCloudTags[podNamespace.Lcuuid] = podNamespace.LearnedCloudTags
 		}
 
 		for _, lb := range toolDS.additionalLBs {
@@ -897,7 +898,7 @@ func getRegionDataFromDB(orgDB *metadb.DB, domainUUIDs []string) (map[string]str
 
 func getAZDataFromDB(orgDB *metadb.DB, domainUUIDs []string) (map[string][]string, error) {
 	var azs []metadbmodel.AZ
-	err := orgDB.Where("domain IN (?)", domainUUIDs).Find(&azs).Error
+	err := orgDB.Where(map[string]interface{}{"domain": domainUUIDs}).Find(&azs).Error
 	if err != nil {
 		return nil, response.ServiceError(
 			httpcommon.SERVER_ERROR,
@@ -913,7 +914,7 @@ func getAZDataFromDB(orgDB *metadb.DB, domainUUIDs []string) (map[string][]strin
 
 func getVPCDataFromDB(orgDB *metadb.DB, domainUUIDs []string) (map[string][]string, error) {
 	var vpcs []metadbmodel.VPC
-	err := orgDB.Where("domain IN (?)", domainUUIDs).Find(&vpcs).Error
+	err := orgDB.Where(map[string]interface{}{"domain": domainUUIDs}).Find(&vpcs).Error
 	if err != nil {
 		return nil, response.ServiceError(
 			httpcommon.SERVER_ERROR,
@@ -929,7 +930,7 @@ func getVPCDataFromDB(orgDB *metadb.DB, domainUUIDs []string) (map[string][]stri
 
 func getSubnetDataFromDB(orgDB *metadb.DB, domainUUIDs []string) (map[string]map[string]int, map[string]map[string]map[string]string, error) {
 	var subnets []metadbmodel.Network
-	err := orgDB.Where("domain IN (?)", domainUUIDs).Find(&subnets).Error
+	err := orgDB.Where(map[string]interface{}{"domain": domainUUIDs}).Find(&subnets).Error
 	if err != nil {
 		return nil, nil, response.ServiceError(
 			httpcommon.SERVER_ERROR,
@@ -972,7 +973,7 @@ func getSubnetDataFromDB(orgDB *metadb.DB, domainUUIDs []string) (map[string]map
 
 func getDataInfoFromDB(orgDB *metadb.DB, domainUUIDs []string) (map[string]map[string]string, error) {
 	var hosts []metadbmodel.Host
-	err := orgDB.Where("domain IN (?)", domainUUIDs).Find(&hosts).Error
+	err := orgDB.Where(map[string]interface{}{"domain": domainUUIDs}).Find(&hosts).Error
 	if err != nil {
 		return nil, response.ServiceError(
 			httpcommon.SERVER_ERROR,
@@ -1026,7 +1027,7 @@ func isIPInCIDR(cidr, ip string) bool {
 
 func getCHostsFromDB(orgDB *metadb.DB, domainUUIDs []string) (map[string]map[string]metadbmodel.VM, error) {
 	var chosts []metadbmodel.VM
-	err := orgDB.Where("domain IN (?)", domainUUIDs).Find(&chosts).Error
+	err := orgDB.Where(map[string]interface{}{"domain": domainUUIDs}).Find(&chosts).Error
 	if err != nil {
 		return nil, response.ServiceError(
 			httpcommon.SERVER_ERROR,
@@ -1045,7 +1046,7 @@ func getCHostsFromDB(orgDB *metadb.DB, domainUUIDs []string) (map[string]map[str
 
 func getPodNamespaceFromDB(orgDB *metadb.DB, domainUUIDs []string) (map[string]map[string]metadbmodel.PodNamespace, error) {
 	var podNamespaces []metadbmodel.PodNamespace
-	err := orgDB.Where("domain IN (?)", domainUUIDs).Find(&podNamespaces).Error
+	err := orgDB.Where(map[string]interface{}{"domain": domainUUIDs}).Find(&podNamespaces).Error
 	if err != nil {
 		return nil, response.ServiceError(
 			httpcommon.INVALID_POST_DATA,
@@ -1064,7 +1065,7 @@ func getPodNamespaceFromDB(orgDB *metadb.DB, domainUUIDs []string) (map[string]m
 
 func getPodNamespaceInSubdomainFromDB(orgDB *metadb.DB, domainUUIDs []string) (map[string]map[string]metadbmodel.PodNamespace, error) {
 	var podNamespaces []metadbmodel.PodNamespace
-	err := orgDB.Where("domain IN (?) and sub_domain != ''", domainUUIDs).Find(&podNamespaces).Error
+	err := orgDB.Where(map[string]interface{}{"domain": domainUUIDs}).Where("sub_domain != ''").Find(&podNamespaces).Error
 	if err != nil {
 		return nil, response.ServiceError(
 			httpcommon.INVALID_POST_DATA,
@@ -1131,7 +1132,7 @@ func GetDomainAdditionalResourceExample() (string, error) {
 
 func getPeerConnectionDomainToRegionUUIDs(orgDB *metadb.DB, domainUUIDs []string) (map[string][]string, error) {
 	var azs []metadbmodel.AZ
-	err := orgDB.Where("domain IN (?)", domainUUIDs).Find(&azs).Error
+	err := orgDB.Where(map[string]interface{}{"domain": domainUUIDs}).Find(&azs).Error
 	if err != nil {
 		return nil, response.ServiceError(
 			httpcommon.INVALID_POST_DATA,
@@ -1149,7 +1150,7 @@ func getPeerConnectionDomainToRegionUUIDs(orgDB *metadb.DB, domainUUIDs []string
 
 func getVPCUUIDToRegionUUID(orgDB *metadb.DB, domainUUIDs []string) (map[string]map[string]string, error) {
 	var vpcs []metadbmodel.VPC
-	err := orgDB.Where("domain IN (?)", domainUUIDs).Find(&vpcs).Error
+	err := orgDB.Where(map[string]interface{}{"domain": domainUUIDs}).Find(&vpcs).Error
 	if err != nil {
 		return nil, response.ServiceError(
 			httpcommon.INVALID_POST_DATA,

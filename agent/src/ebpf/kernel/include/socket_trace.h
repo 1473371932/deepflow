@@ -34,6 +34,8 @@
 #define INFER_CONTINUE	1
 #define INFER_TERMINATE	2
 
+#define SOCK_UNIX	11 // Used to identify UNIX domain sockets. 
+
 #define MAX_PUSH_DELAY_TIME_NS 100000000ULL // 100ms
 
 typedef long unsigned int __kernel_size_t;
@@ -85,6 +87,7 @@ struct mmsghdr {
 #define SOCK_CHECK_TYPE_ERROR           0
 #define SOCK_CHECK_TYPE_UDP             1
 #define SOCK_CHECK_TYPE_TCP_ES          2
+#define SOCK_CHECK_TYPE_UNIX		3
 
 #include "socket_trace_common.h"
 
@@ -256,8 +259,17 @@ struct data_args_t {
 	const char *buf;
 	// For sendmsg()/recvmsg()/writev()/readv().
 	const struct iovec *iov;
-	void *sk;
 	size_t iovlen;
+	/*
+	 * When calling `sendmmsg()`, if multiple `struct mmsghdr` instances
+	 * are passed, these structures are stored contiguously in memory as an array.
+	 * Each `mmsghdr` contains information for an individual message to be sent.
+	 * To access the second structure, its address corresponds to the array
+	 * element’s address (i.e., `&msgvec[1]`).
+	 */ 
+	const struct iovec *extra_iov;
+	size_t extra_iovlen;
+	void *sk;
 	union {
 		// For sendmmsg()
 		unsigned int *msg_len;

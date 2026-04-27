@@ -27,12 +27,12 @@ import (
 
 type ChPodCluster struct {
 	SubscriberComponent[
-		*message.PodClusterAdd,
-		message.PodClusterAdd,
-		*message.PodClusterFieldsUpdate,
-		message.PodClusterFieldsUpdate,
-		*message.PodClusterDelete,
-		message.PodClusterDelete,
+		*message.AddedPodClusters,
+		message.AddedPodClusters,
+		*message.UpdatedPodCluster,
+		message.UpdatedPodCluster,
+		*message.DeletedPodClusters,
+		message.DeletedPodClusters,
 		metadbmodel.PodCluster,
 		metadbmodel.ChPodCluster,
 		IDKey,
@@ -43,12 +43,12 @@ type ChPodCluster struct {
 func NewChPodCluster(resourceTypeToIconID map[IconKey]int) *ChPodCluster {
 	mng := &ChPodCluster{
 		newSubscriberComponent[
-			*message.PodClusterAdd,
-			message.PodClusterAdd,
-			*message.PodClusterFieldsUpdate,
-			message.PodClusterFieldsUpdate,
-			*message.PodClusterDelete,
-			message.PodClusterDelete,
+			*message.AddedPodClusters,
+			message.AddedPodClusters,
+			*message.UpdatedPodCluster,
+			message.UpdatedPodCluster,
+			*message.DeletedPodClusters,
+			message.DeletedPodClusters,
 			metadbmodel.PodCluster,
 			metadbmodel.ChPodCluster,
 			IDKey,
@@ -58,6 +58,7 @@ func NewChPodCluster(resourceTypeToIconID map[IconKey]int) *ChPodCluster {
 		resourceTypeToIconID,
 	}
 	mng.subscriberDG = mng
+	mng.softDelete = true
 	return mng
 }
 
@@ -76,21 +77,15 @@ func (c *ChPodCluster) sourceToTarget(md *message.Metadata, source *metadbmodel.
 		ChIDBase:    metadbmodel.ChIDBase{ID: source.ID},
 		Name:        sourceName,
 		IconID:      iconID,
-		TeamID:      md.TeamID,
-		DomainID:    md.DomainID,
-		SubDomainID: md.SubDomainID,
+		TeamID:      md.GetTeamID(),
+		DomainID:    md.GetDomainID(),
+		SubDomainID: md.GetSubDomainID(),
 	})
 	return
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChPodCluster) onResourceUpdated(sourceID int, fieldsUpdate *message.PodClusterFieldsUpdate, db *metadb.DB) {
-	updateInfo := make(map[string]interface{})
-
-	if fieldsUpdate.Name.IsDifferent() {
-		updateInfo["name"] = fieldsUpdate.Name.GetNew()
-	}
-	c.updateOrSync(db, IDKey{ID: sourceID}, updateInfo)
+func (c *ChPodCluster) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedPodCluster) {
 }
 
 // softDeletedTargetsUpdated implements SubscriberDataGenerator

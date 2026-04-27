@@ -25,12 +25,12 @@ import (
 
 type ChPodNSCloudTag struct {
 	SubscriberComponent[
-		*message.PodNamespaceAdd,
-		message.PodNamespaceAdd,
-		*message.PodNamespaceFieldsUpdate,
-		message.PodNamespaceFieldsUpdate,
-		*message.PodNamespaceDelete,
-		message.PodNamespaceDelete,
+		*message.AddedPodNamespaces,
+		message.AddedPodNamespaces,
+		*message.UpdatedPodNamespace,
+		message.UpdatedPodNamespace,
+		*message.DeletedPodNamespaces,
+		message.DeletedPodNamespaces,
 		metadbmodel.PodNamespace,
 		metadbmodel.ChPodNSCloudTag,
 		IDKeyKey,
@@ -40,12 +40,12 @@ type ChPodNSCloudTag struct {
 func NewChPodNSCloudTag() *ChPodNSCloudTag {
 	mng := &ChPodNSCloudTag{
 		newSubscriberComponent[
-			*message.PodNamespaceAdd,
-			message.PodNamespaceAdd,
-			*message.PodNamespaceFieldsUpdate,
-			message.PodNamespaceFieldsUpdate,
-			*message.PodNamespaceDelete,
-			message.PodNamespaceDelete,
+			*message.AddedPodNamespaces,
+			message.AddedPodNamespaces,
+			*message.UpdatedPodNamespace,
+			message.UpdatedPodNamespace,
+			*message.DeletedPodNamespaces,
+			message.DeletedPodNamespaces,
 			metadbmodel.PodNamespace,
 			metadbmodel.ChPodNSCloudTag,
 			IDKeyKey,
@@ -58,57 +58,58 @@ func NewChPodNSCloudTag() *ChPodNSCloudTag {
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChPodNSCloudTag) onResourceUpdated(sourceID int, fieldsUpdate *message.PodNamespaceFieldsUpdate, db *metadb.DB) {
-	keysToAdd := make([]IDKeyKey, 0)
-	targetsToAdd := make([]metadbmodel.ChPodNSCloudTag, 0)
+func (c *ChPodNSCloudTag) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedPodNamespace) {
+	db := md.GetDB()
+	fieldsUpdate := updateMessage.GetFields().(*message.UpdatedPodNamespaceFields)
+	newSource := updateMessage.GetNewMetadbItem().(*metadbmodel.PodNamespace)
+	sourceID := newSource.ID
+	new := map[string]string{}
+	old := map[string]string{}
 	keysToDelete := make([]IDKeyKey, 0)
 	targetsToDelete := make([]metadbmodel.ChPodNSCloudTag, 0)
 
-	if fieldsUpdate.CloudTags.IsDifferent() {
-		new := fieldsUpdate.CloudTags.GetNew()
-		old := fieldsUpdate.CloudTags.GetOld()
-		for k, v := range new {
-			targetKey := NewIDKeyKey(sourceID, k)
-			oldV, ok := old[k]
-			if !ok {
-				keysToAdd = append(keysToAdd, targetKey)
-				targetsToAdd = append(targetsToAdd, metadbmodel.ChPodNSCloudTag{
-					ChIDBase: metadbmodel.ChIDBase{ID: sourceID},
-					Key:      k,
-					Value:    v,
-				})
-				continue
-			}
-			updateInfo := make(map[string]interface{})
-			if oldV != v {
-				var chItem metadbmodel.ChPodNSCloudTag
-				db.Where("id = ? and `key` = ?", sourceID, k).First(&chItem)
-				if chItem.ID == 0 {
-					keysToAdd = append(keysToAdd, targetKey)
-					targetsToAdd = append(targetsToAdd, metadbmodel.ChPodNSCloudTag{
-						ChIDBase: metadbmodel.ChIDBase{ID: sourceID},
-						Key:      k,
-						Value:    v,
-					})
-					continue
-				}
-				updateInfo["value"] = v
-			}
-			c.updateOrSync(db, targetKey, updateInfo)
+	if !fieldsUpdate.LearnedCloudTags.IsDifferent() && !fieldsUpdate.CustomCloudTags.IsDifferent() {
+		return
+	}
+
+	if fieldsUpdate.LearnedCloudTags.IsDifferent() {
+		for k, v := range fieldsUpdate.LearnedCloudTags.GetNew() {
+			new[k] = v
 		}
-		for k := range old {
-			if _, ok := new[k]; !ok {
-				keysToDelete = append(keysToDelete, NewIDKeyKey(sourceID, k))
-				targetsToDelete = append(targetsToDelete, metadbmodel.ChPodNSCloudTag{
-					ChIDBase: metadbmodel.ChIDBase{ID: sourceID},
-					Key:      k,
-				})
-			}
+		for k, v := range fieldsUpdate.LearnedCloudTags.GetOld() {
+			old[k] = v
+		}
+	} else {
+		for k, v := range newSource.LearnedCloudTags {
+			new[k] = v
+			old[k] = v
 		}
 	}
-	if len(keysToAdd) > 0 {
-		c.SubscriberComponent.dbOperator.add(keysToAdd, targetsToAdd, db)
+	// custom cloud tag has a higher priority
+	if fieldsUpdate.CustomCloudTags.IsDifferent() {
+		for k, v := range fieldsUpdate.CustomCloudTags.GetNew() {
+			new[k] = v
+		}
+		for k, v := range fieldsUpdate.CustomCloudTags.GetOld() {
+			old[k] = v
+		}
+	} else {
+		for k, v := range newSource.CustomCloudTags {
+			new[k] = v
+			old[k] = v
+		}
 	}
+
+	for k := range old {
+		if _, ok := new[k]; !ok {
+			keysToDelete = append(keysToDelete, NewIDKeyKey(sourceID, k))
+			targetsToDelete = append(targetsToDelete, metadbmodel.ChPodNSCloudTag{
+				ChIDBase: metadbmodel.ChIDBase{ID: sourceID},
+				Key:      k,
+			})
+		}
+	}
+
 	if len(keysToDelete) > 0 {
 		c.SubscriberComponent.dbOperator.delete(keysToDelete, targetsToDelete, db)
 	}
@@ -116,15 +117,16 @@ func (c *ChPodNSCloudTag) onResourceUpdated(sourceID int, fieldsUpdate *message.
 
 // onResourceUpdated implements SubscriberDataGenerator
 func (c *ChPodNSCloudTag) sourceToTarget(md *message.Metadata, source *metadbmodel.PodNamespace) (keys []IDKeyKey, targets []metadbmodel.ChPodNSCloudTag) {
-	for k, v := range source.CloudTags {
+	cloudTagMap := MergeCloudTags(source.LearnedCloudTags, source.CustomCloudTags)
+	for k, v := range cloudTagMap {
 		keys = append(keys, NewIDKeyKey(source.ID, k))
 		targets = append(targets, metadbmodel.ChPodNSCloudTag{
 			ChIDBase:    metadbmodel.ChIDBase{ID: source.ID},
 			Key:         k,
 			Value:       v,
-			TeamID:      md.TeamID,
-			DomainID:    md.DomainID,
-			SubDomainID: md.SubDomainID,
+			TeamID:      md.GetTeamID(),
+			DomainID:    md.GetDomainID(),
+			SubDomainID: md.GetSubDomainID(),
 		})
 	}
 	return

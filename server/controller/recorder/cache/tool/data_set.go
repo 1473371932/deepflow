@@ -19,6 +19,7 @@ package tool
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	mapset "github.com/deckarep/golang-set/v2"
@@ -112,6 +113,7 @@ type DataSet struct {
 
 	configMapLcuuidToID      map[string]int
 	configMapIDToPodGroupIDs map[int]mapset.Set[int]
+	configMapIDToName        map[int]string
 
 	connectionLcuuidToPodGroupID  map[string]int
 	connectionLcuuidToConfigMapID map[string]int
@@ -123,18 +125,12 @@ type DataSet struct {
 	podIDToLcuuid map[int]string
 
 	vtapIDToType           map[int]int
+	vtapIDToName           map[int]string
 	vtapIDToLaunchServerID map[int]int
 
 	processIdentifierToGID       map[ProcessIdentifier]uint32
 	processGIDToTotalCount       map[uint32]uint
 	processGIDToSoftDeletedCount map[uint32]uint
-}
-
-type ProcessIdentifier struct {
-	Name        string
-	PodGroupID  int
-	VTapID      uint32
-	CommandLine string
 }
 
 func NewDataSet(md *rcommon.Metadata) *DataSet {
@@ -213,6 +209,7 @@ func NewDataSet(md *rcommon.Metadata) *DataSet {
 
 		configMapLcuuidToID:      make(map[string]int),
 		configMapIDToPodGroupIDs: make(map[int]mapset.Set[int]),
+		configMapIDToName:        make(map[int]string),
 
 		connectionLcuuidToPodGroupID:  make(map[string]int),
 		connectionLcuuidToConfigMapID: make(map[string]int),
@@ -224,6 +221,7 @@ func NewDataSet(md *rcommon.Metadata) *DataSet {
 		podIDToLcuuid: make(map[int]string),
 
 		vtapIDToType:           make(map[int]int),
+		vtapIDToName:           make(map[int]string),
 		vtapIDToLaunchServerID: make(map[int]int),
 
 		processIdentifierToGID:       make(map[ProcessIdentifier]uint32),
@@ -958,21 +956,29 @@ func (t *DataSet) DeletePodGroup(lcuuid string) {
 
 func (t *DataSet) AddConfigMap(item *metadbmodel.ConfigMap) {
 	t.configMapLcuuidToID[item.Lcuuid] = item.ID
+	t.configMapIDToName[item.ID] = item.Name
 	t.GetLogFunc()(addToToolMap(ctrlrcommon.RESOURCE_TYPE_CONFIG_MAP_EN, item.Lcuuid), t.metadata.LogPrefixes)
 }
 
 func (t *DataSet) DeleteConfigMap(lcuuid string) {
 	delete(t.configMapLcuuidToID, lcuuid)
+	id, exists := t.GetConfigMapIDByLcuuid(lcuuid)
+	if exists {
+		delete(t.configMapIDToName, id)
+	}
 	log.Info(deleteFromToolMap(ctrlrcommon.RESOURCE_TYPE_CONFIG_MAP_EN, lcuuid), t.metadata.LogPrefixes)
 }
 
 func (t *DataSet) AddPodGroupConfigMapConnection(item *metadbmodel.PodGroupConfigMapConnection) {
 	t.connectionLcuuidToPodGroupID[item.Lcuuid] = item.PodGroupID
 	t.connectionLcuuidToConfigMapID[item.Lcuuid] = item.ConfigMapID
+	// log.Infof("TODO %v", t.configMapIDToPodGroupIDs)
+	// log.Infof("TODO %+v", item)
 	if _, exists := t.configMapIDToPodGroupIDs[item.ConfigMapID]; !exists {
 		t.configMapIDToPodGroupIDs[item.ConfigMapID] = mapset.NewSet[int]()
 	}
 	t.configMapIDToPodGroupIDs[item.ConfigMapID].Add(item.PodGroupID)
+	// log.Infof("TODO %v", t.configMapIDToPodGroupIDs)
 	t.GetLogFunc()(addToToolMap(ctrlrcommon.RESOURCE_TYPE_POD_GROUP_CONFIG_MAP_CONNECTION_EN, item.Lcuuid), t.metadata.LogPrefixes)
 }
 
@@ -985,6 +991,7 @@ func (t *DataSet) DeletePodGroupConfigMapConnection(lcuuid string) {
 			delete(t.configMapIDToPodGroupIDs, configMapID)
 		}
 	}
+	// log.Infof("TODO %v", t.configMapIDToPodGroupIDs)
 	delete(t.connectionLcuuidToPodGroupID, lcuuid)
 	delete(t.connectionLcuuidToConfigMapID, lcuuid)
 	log.Info(deleteFromToolMap(ctrlrcommon.RESOURCE_TYPE_POD_GROUP_CONFIG_MAP_CONNECTION_EN, lcuuid), t.metadata.LogPrefixes)
@@ -1102,12 +1109,15 @@ func (t *DataSet) DeleteProcess(dbItem *metadbmodel.Process) {
 }
 
 func (t *DataSet) GetProcessIdentifierByDBProcess(p *metadbmodel.Process) ProcessIdentifier {
-	return t.GetProcessIdentifier(p.Name, p.PodGroupID, p.VTapID, p.CommandLine)
+	return t.GetProcessIdentifier(p.Name, p.ProcessName, p.PodGroupID, p.VTapID, p.CommandLine)
 }
 
-func (t *DataSet) GetProcessIdentifier(name string, podGroupID int, vtapID uint32, commandLine string) ProcessIdentifier {
+func (t *DataSet) GetProcessIdentifier(name, processName string, podGroupID int, vtapID uint32, commandLine string) ProcessIdentifier {
 	var identifier ProcessIdentifier
 	if podGroupID == 0 {
+		if slices.Contains([]string{"java", "python", "python3", "node"}, processName) {
+			commandLine = extractExecFileFromCmd(commandLine)
+		}
 		identifier = ProcessIdentifier{
 			Name:        name,
 			VTapID:      vtapID,
@@ -1131,14 +1141,35 @@ func (t *DataSet) IsProcessGIDSoftDeleted(gid uint32) bool {
 	return t.processGIDToSoftDeletedCount[gid] == t.processGIDToTotalCount[gid]
 }
 
-func (t *DataSet) RefreshVTaps(v []*metadbmodel.VTap) {
+func (t *DataSet) RefreshVTaps(vtaps []*metadbmodel.VTap) {
 	t.vtapIDToType = make(map[int]int)
+	t.vtapIDToName = make(map[int]string)
 	t.vtapIDToLaunchServerID = make(map[int]int)
-	for _, item := range v {
+	for _, item := range vtaps {
 		t.vtapIDToType[item.ID] = item.Type
+		t.vtapIDToName[item.ID] = item.Name
 		t.vtapIDToLaunchServerID[item.ID] = item.LaunchServerID
 	}
-	log.Infof("refreshed %s count: %d", ctrlrcommon.RESOURCE_TYPE_VTAP_EN, len(v))
+	log.Infof("refreshed %s count: %d", ctrlrcommon.RESOURCE_TYPE_VTAP_EN, len(vtaps))
+}
+
+func (t *DataSet) GetVTapNameByID(id int) (string, bool) {
+	name, exists := t.vtapIDToName[id]
+	if exists {
+		return name, true
+	}
+	log.Warning(cacheNameByIDNotFound(ctrlrcommon.RESOURCE_TYPE_VTAP_EN, id), t.metadata.LogPrefixes)
+	var vtap metadbmodel.VTap
+	result := t.metadata.DB.Where("id = ?", id).Find(&vtap)
+	if result.RowsAffected == 1 {
+		t.vtapIDToType[vtap.ID] = vtap.Type
+		t.vtapIDToName[vtap.ID] = vtap.Name
+		t.vtapIDToLaunchServerID[vtap.ID] = vtap.LaunchServerID
+		return vtap.Name, true
+	} else {
+		log.Error(dbResourceByIDNotFound(ctrlrcommon.RESOURCE_TYPE_VTAP_EN, id), t.metadata.LogPrefixes)
+		return name, false
+	}
 }
 
 func (t *DataSet) GetRegionIDByLcuuid(lcuuid string) (int, bool) {
@@ -1417,6 +1448,9 @@ func (t *DataSet) GetMacByVInterfaceLcuuid(vifLcuuid string) (string, bool) {
 }
 
 func (t *DataSet) GetNetworkLcuuidByID(id int) (string, bool) {
+	if id == 0 {
+		return "", true
+	}
 	if id == t.publicNetworkID {
 		return rcommon.PUBLIC_NETWORK_LCUUID, true
 	}
@@ -1727,7 +1761,7 @@ func (t *DataSet) GetDeviceNameByDeviceID(deviceType, deviceID int) (string, err
 	} else if deviceType == ctrlrcommon.VIF_DEVICE_TYPE_POD {
 		return t.GetPodNameByID(deviceID)
 	} else {
-		return "", fmt.Errorf("device type %d not supported", deviceType, t.metadata.LogPrefixes)
+		return "", fmt.Errorf("device type %d not supported", deviceType)
 	}
 }
 
@@ -1939,6 +1973,10 @@ func (t *DataSet) GetPodNodeLcuuidByID(id int) (string, bool) {
 }
 
 func (t *DataSet) GetPodNamespaceIDByLcuuid(lcuuid string) (int, bool) {
+	if lcuuid == ctrlrcommon.DEFAULT_POD_NAMESPACE {
+		return 0, true
+	}
+
 	id, exists := t.podNamespaceLcuuidToID[lcuuid]
 	if exists {
 		return id, true
@@ -2617,21 +2655,44 @@ func (t *DataSet) GetConfigMapIDByLcuuid(lcuuid string) (int, bool) {
 }
 
 func (t *DataSet) GetPodGroupIDsByConfigMapID(configMapID int) []int {
+	// log.Infof("TODO %v", t.configMapIDToPodGroupIDs)
 	podGroupIDs, exists := t.configMapIDToPodGroupIDs[configMapID]
 	if exists {
 		return podGroupIDs.ToSlice()
 	}
 	log.Warningf("cache %s ids (%s id: %d) not found", ctrlrcommon.RESOURCE_TYPE_POD_GROUP_EN, ctrlrcommon.RESOURCE_TYPE_CONFIG_MAP_EN, configMapID, t.metadata.LogPrefixes)
-	var dbItem metadbmodel.PodGroupConfigMapConnection
-	result := t.metadata.DB.Where("config_map_id = ?", configMapID).Find(&dbItem)
-	if result.RowsAffected == 1 {
-		t.AddPodGroupConfigMapConnection(&dbItem)
+	var dbItems []metadbmodel.PodGroupConfigMapConnection
+	result := t.metadata.DB.Where("config_map_id = ?", configMapID).Find(&dbItems)
+	if result.RowsAffected != 0 {
+		for _, item := range dbItems {
+			t.AddPodGroupConfigMapConnection(&item)
+		}
 		podGroupIDs, exists = t.configMapIDToPodGroupIDs[configMapID]
-		return podGroupIDs.ToSlice()
+		if exists {
+			return podGroupIDs.ToSlice()
+		}
+		return []int{}
 	} else {
 		// TODO
 		log.Warningf("db %s not found (%s id: %d)", ctrlrcommon.RESOURCE_TYPE_POD_GROUP_CONFIG_MAP_CONNECTION_EN, ctrlrcommon.RESOURCE_TYPE_CONFIG_MAP_EN, configMapID, t.metadata.LogPrefixes)
 		return []int{}
+	}
+}
+
+func (t *DataSet) GetNameByConfigMapID(configMapID int) (string, bool) {
+	name, exists := t.configMapIDToName[configMapID]
+	if exists {
+		return name, true
+	}
+	log.Warningf("cache %s name (%s id: %d) not found", ctrlrcommon.RESOURCE_TYPE_CONFIG_MAP_EN, ctrlrcommon.RESOURCE_TYPE_CONFIG_MAP_EN, configMapID, t.metadata.LogPrefixes)
+	var dbItem metadbmodel.ConfigMap
+	result := t.metadata.DB.Where("id = ?", configMapID).Find(&dbItem)
+	if result.RowsAffected == 1 {
+		t.AddConfigMap(&dbItem)
+		return dbItem.Name, true
+	} else {
+		log.Error(dbResourceByIDNotFound(ctrlrcommon.RESOURCE_TYPE_CONFIG_MAP_EN, configMapID), t.metadata.LogPrefixes)
+		return "", false
 	}
 }
 

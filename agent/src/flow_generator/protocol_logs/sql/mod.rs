@@ -40,12 +40,14 @@ pub use redis::{RedisInfo, RedisLog};
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "enterprise")] {
+        mod dameng;
         mod oracle;
+        pub use dameng::{DamengInfo, DamengLog};
         pub use oracle::{OracleInfo, OracleLog};
     }
 }
 
-pub type ObfuscateCache = Rc<RefCell<LruCache<u64, Vec<u8>>>>;
+pub type ObfuscateCache = Rc<RefCell<LruCache<u64, String>>>;
 
 pub const OBFUSCATE_CACHE_SIZE: usize = 8192;
 pub const QUESTION_MARK: u8 = b'?';

@@ -27,12 +27,12 @@ import (
 
 type ChAZ struct {
 	SubscriberComponent[
-		*message.AZAdd,
-		message.AZAdd,
-		*message.AZFieldsUpdate,
-		message.AZFieldsUpdate,
-		*message.AZDelete,
-		message.AZDelete,
+		*message.AddedAZs,
+		message.AddedAZs,
+		*message.UpdatedAZ,
+		message.UpdatedAZ,
+		*message.DeletedAZs,
+		message.DeletedAZs,
 		metadbmodel.AZ,
 		metadbmodel.ChAZ,
 		IDKey,
@@ -44,12 +44,12 @@ type ChAZ struct {
 func NewChAZ(domainLcuuidToIconID map[string]int, resourceTypeToIconID map[IconKey]int) *ChAZ {
 	mng := &ChAZ{
 		newSubscriberComponent[
-			*message.AZAdd,
-			message.AZAdd,
-			*message.AZFieldsUpdate,
-			message.AZFieldsUpdate,
-			*message.AZDelete,
-			message.AZDelete,
+			*message.AddedAZs,
+			message.AddedAZs,
+			*message.UpdatedAZ,
+			message.UpdatedAZ,
+			*message.DeletedAZs,
+			message.DeletedAZs,
 			metadbmodel.AZ,
 			metadbmodel.ChAZ,
 			IDKey,
@@ -60,16 +60,12 @@ func NewChAZ(domainLcuuidToIconID map[string]int, resourceTypeToIconID map[IconK
 		resourceTypeToIconID,
 	}
 	mng.subscriberDG = mng
+	mng.softDelete = true
 	return mng
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (a *ChAZ) onResourceUpdated(sourceID int, fieldsUpdate *message.AZFieldsUpdate, db *metadb.DB) {
-	updateInfo := make(map[string]interface{})
-	if fieldsUpdate.Name.IsDifferent() {
-		updateInfo["name"] = fieldsUpdate.Name.GetNew()
-	}
-	a.updateOrSync(db, IDKey{ID: sourceID}, updateInfo)
+func (a *ChAZ) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedAZ) {
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
@@ -97,8 +93,8 @@ func (a *ChAZ) sourceToTarget(md *message.Metadata, az *metadbmodel.AZ) (keys []
 		ChIDBase: metadbmodel.ChIDBase{ID: az.ID},
 		Name:     name,
 		IconID:   iconID,
-		TeamID:   md.TeamID,
-		DomainID: md.DomainID,
+		TeamID:   md.GetTeamID(),
+		DomainID: md.GetDomainID(),
 	})
 	return
 }

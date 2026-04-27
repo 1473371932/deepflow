@@ -29,44 +29,34 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db/idmng"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
 
+type ProcessMessageFactory struct{}
+
+func (f *ProcessMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedProcesses{}
+}
+
+func (f *ProcessMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedProcess{}
+}
+
+func (f *ProcessMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedProcesses{}
+}
+
+func (f *ProcessMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedProcessFields{}
+}
+
 type Process struct {
-	UpdaterBase[
-		cloudmodel.Process,
-		*diffbase.Process,
-		*metadbmodel.Process,
-		metadbmodel.Process,
-		*message.ProcessAdd,
-		message.ProcessAdd,
-		message.ProcessAddAddition,
-		*message.ProcessUpdate,
-		message.ProcessUpdate,
-		*message.ProcessFieldsUpdate,
-		message.ProcessFieldsUpdate,
-		*message.ProcessDelete,
-		message.ProcessDelete,
-		message.ProcessDeleteAddition]
+	UpdaterBase[cloudmodel.Process, *diffbase.Process, *metadbmodel.Process, metadbmodel.Process]
 }
 
 func NewProcess(wholeCache *cache.Cache, cloudData []cloudmodel.Process) *Process {
 	updater := &Process{
-		newUpdaterBase[
-			cloudmodel.Process,
-			*diffbase.Process,
-			*metadbmodel.Process,
-			metadbmodel.Process,
-			*message.ProcessAdd,
-			message.ProcessAdd,
-			message.ProcessAddAddition,
-			*message.ProcessUpdate,
-			message.ProcessUpdate,
-			*message.ProcessFieldsUpdate,
-			message.ProcessFieldsUpdate,
-			*message.ProcessDelete,
-			message.ProcessDelete,
-			message.ProcessDeleteAddition,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_PROCESS_EN,
 			wholeCache,
 			db.NewProcess().SetMetadata(wholeCache.GetMetadata()),
@@ -74,15 +64,15 @@ func NewProcess(wholeCache *cache.Cache, cloudData []cloudmodel.Process) *Proces
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
+	updater.setDataGenerator(updater)
+
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &ProcessMessageFactory{})
+	}
+
 	updater.hookers[hookerBeforeDBAddPage] = updater
 	updater.hookers[hookerAfterDBDeletePage] = updater
 	return updater
-}
-
-func (p *Process) getDiffBaseByCloudItem(cloudItem *cloudmodel.Process) (diffBase *diffbase.Process, exits bool) {
-	diffBase, exits = p.diffBaseData[cloudItem.Lcuuid]
-	return
 }
 
 func (p *Process) generateDBItemToAdd(cloudItem *cloudmodel.Process) (*metadbmodel.Process, bool) {
@@ -132,10 +122,11 @@ func (p *Process) generateDBItemToAdd(cloudItem *cloudmodel.Process) (*metadbmod
 		PID:         cloudItem.PID,
 		ProcessName: cloudItem.ProcessName,
 		CommandLine: cloudItem.CommandLine,
+		StartTime:   cloudItem.StartTime,
 		UserName:    cloudItem.UserName,
 		ContainerID: cloudItem.ContainerID,
 		OSAPPTags:   cloudItem.OSAPPTags,
-		Domain:      p.metadata.Domain.Lcuuid,
+		Domain:      p.metadata.GetDomainLcuuid(),
 		SubDomain:   cloudItem.SubDomainLcuuid,
 		NetnsID:     cloudItem.NetnsID,
 		DeviceType:  deviceType,
@@ -151,12 +142,11 @@ func (p *Process) generateDBItemToAdd(cloudItem *cloudmodel.Process) (*metadbmod
 	)
 	dbItem.GID = gid
 	dbItem.Lcuuid = cloudItem.Lcuuid
-
 	return dbItem, true
 }
 
-func (p *Process) generateUpdateInfo(diffBase *diffbase.Process, cloudItem *cloudmodel.Process) (*message.ProcessFieldsUpdate, map[string]interface{}, bool) {
-	structInfo := new(message.ProcessFieldsUpdate)
+func (p *Process) generateUpdateInfo(diffBase *diffbase.Process, cloudItem *cloudmodel.Process) (types.UpdatedFields, map[string]interface{}, bool) {
+	structInfo := new(message.UpdatedProcessFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
 		mapInfo["name"] = cloudItem.Name
@@ -190,7 +180,7 @@ func (p *Process) generateUpdateInfo(diffBase *diffbase.Process, cloudItem *clou
 			}
 		}
 		gid, ok := p.cache.ToolDataSet.GetProcessGIDByIdentifier(
-			p.cache.ToolDataSet.GetProcessIdentifier(diffBase.Name, podGroupID, cloudItem.VTapID, cloudItem.CommandLine),
+			p.cache.ToolDataSet.GetProcessIdentifier(diffBase.Name, cloudItem.ProcessName, podGroupID, cloudItem.VTapID, cloudItem.CommandLine),
 		)
 		if !ok {
 			log.Errorf("process %s gid not found", diffBase.Lcuuid, p.metadata.LogPrefixes)
@@ -198,10 +188,11 @@ func (p *Process) generateUpdateInfo(diffBase *diffbase.Process, cloudItem *clou
 		}
 		structInfo.GID.Set(gid, gid)
 	}
+
 	return structInfo, mapInfo, len(mapInfo) > 0
 }
 
-func (p *Process) beforeAddPage(dbData []*metadbmodel.Process) ([]*metadbmodel.Process, *message.ProcessAddAddition, bool) {
+func (p *Process) beforeAddPage(dbData []*metadbmodel.Process) ([]*metadbmodel.Process, interface{}, bool) {
 	identifierToNewGID := make(map[tool.ProcessIdentifier]uint32)
 	for _, item := range dbData {
 		if item.GID != 0 {
@@ -222,10 +213,14 @@ func (p *Process) beforeAddPage(dbData []*metadbmodel.Process) ([]*metadbmodel.P
 			log.Errorf("%s request gids failed", gidResourceType, p.metadata.LogPrefixes)
 			return dbData, nil, false
 		}
-		log.Infof("%s use gids: %v", gidResourceType, ids, p.metadata.LogPrefixes)
+		log.Infof("%s use gids: %v, expected count: %d, true count: %d", gidResourceType, ids, len(identifierToNewGID), len(ids), p.metadata.LogPrefixes)
 
 		start := 0
 		for k := range identifierToNewGID {
+			if start >= len(ids) {
+				log.Errorf("process identifier %s out of range, max is %d", k, len(ids)-1, p.metadata.LogPrefixes)
+				break
+			}
 			identifierToNewGID[k] = uint32(ids[start])
 			createdGIDs = append(createdGIDs, identifierToNewGID[k])
 			start++
@@ -241,7 +236,7 @@ func (p *Process) beforeAddPage(dbData []*metadbmodel.Process) ([]*metadbmodel.P
 	return dbData, &message.ProcessAddAddition{}, true
 }
 
-func (p *Process) afterDeletePage(dbData []*metadbmodel.Process) (*message.ProcessDeleteAddition, bool) {
+func (p *Process) afterDeletePage(dbData []*metadbmodel.Process) (interface{}, bool) {
 	deletedGIDs := mapset.NewSet[uint32]()
 	for _, item := range dbData {
 		if gid, ok := p.cache.ToolDataSet.GetProcessGIDByIdentifier(p.cache.ToolDataSet.GetProcessIdentifierByDBProcess(item)); ok {

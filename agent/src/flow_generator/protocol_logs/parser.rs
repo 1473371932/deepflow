@@ -29,19 +29,17 @@ use arc_swap::access::Access;
 use log::{debug, info};
 use serde::Serialize;
 
-use super::{AppProtoHead, AppProtoLogsBaseInfo, BoxAppProtoLogsData, LogMessageType};
+use super::{AppProtoHead, AppProtoLogsBaseInfo, BoxAppProtoLogsData};
 
 use crate::{
     common::{
+        ebpf::EbpfType,
         flow::{L7Protocol, PacketDirection, SignalSource},
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
         meta_packet::ProtocolData,
         MetaPacket, TaggedFlow, Timestamp,
     },
-    config::{
-        config::SessionTimeout,
-        handler::{LogParserAccess, LogParserConfig},
-    },
+    config::handler::{LogParserAccess, LogParserConfig},
     flow_generator::{
         error::Result, protocol_logs::L7ResponseStatus, FLOW_METRICS_PEER_DST,
         FLOW_METRICS_PEER_SRC,
@@ -49,10 +47,9 @@ use crate::{
     rpc::get_timestamp,
     utils::stats::{Counter, CounterType, CounterValue, RefCountable},
 };
-#[cfg(any(target_os = "linux", target_os = "android"))]
-use public::utils::string::get_string_from_chars;
 use public::{
     chrono_map::ChronoMap,
+    l7_protocol::LogMessageType,
     queue::{self, DebugSender, Receiver},
     throttle::Throttle,
     utils::net::MacAddr,
@@ -141,10 +138,11 @@ impl MetaAppProto {
             biz_type: l7_info.get_biz_type(),
         };
 
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(all(unix, feature = "libtrace"))]
         if meta_packet.signal_source == SignalSource::EBPF {
             let is_src = meta_packet.lookup_key.l2_end_0;
-            let process_name = get_string_from_chars(&meta_packet.process_kname);
+            let process_name =
+                public::utils::string::get_string_from_chars(&meta_packet.process_kname);
             match (is_src, meta_packet.lookup_key.direction) {
                 (true, PacketDirection::ClientToServer)
                 | (false, PacketDirection::ServerToClient) => {
@@ -171,24 +169,33 @@ impl MetaAppProto {
         }
 
         let seq = if let ProtocolData::TcpHeader(tcp_data) = &meta_packet.protocol_data {
-            tcp_data.seq
+            if meta_packet.ebpf_type != EbpfType::UnixSocket {
+                tcp_data.seq + l7_info.tcp_seq_offset()
+            } else {
+                tcp_data.seq
+            }
         } else {
             0
         };
+
         if meta_packet.lookup_key.direction == PacketDirection::ClientToServer {
-            base_info.req_tcp_seq = seq + l7_info.tcp_seq_offset();
+            base_info.req_tcp_seq = seq;
 
             // ebpf info
             base_info.syscall_trace_id_request = meta_packet.syscall_trace_id;
             base_info.syscall_trace_id_thread_0 = meta_packet.thread_id;
             base_info.syscall_cap_seq_0 = meta_packet.cap_end_seq as u32;
         } else {
-            base_info.resp_tcp_seq = seq + l7_info.tcp_seq_offset();
+            base_info.resp_tcp_seq = seq;
 
             // ebpf info
             base_info.syscall_trace_id_response = meta_packet.syscall_trace_id;
             base_info.syscall_trace_id_thread_1 = meta_packet.thread_id;
             base_info.syscall_cap_seq_1 = meta_packet.cap_start_seq as u32;
+        }
+
+        if l7_info.is_reversed() {
+            base_info.reverse()
         }
 
         Some(Self {
@@ -227,7 +234,7 @@ impl MetaAppProto {
         //     | 64b flow_id | 24b 0 | 8b proto | 32b cap_seq |
         let mut key = (flow_id as u128) << 64;
 
-        if proto == L7Protocol::Grpc {
+        if proto == L7Protocol::Grpc || proto == L7Protocol::Triple {
             proto = L7Protocol::Http2;
         }
         key |= (proto as u128) << 32;
@@ -399,21 +406,6 @@ impl SessionQueue {
         }
     }
 
-    fn get_timeout(config: &LogParserConfig, app_proto: &MetaAppProto) -> Timestamp {
-        match config
-            .l7_log_session_aggr_timeout
-            .get(&app_proto.base_info.head.proto)
-        {
-            Some(timeout) => *timeout,
-            None => match app_proto.base_info.head.proto {
-                L7Protocol::DNS => SessionTimeout::DNS_DEFAULT,
-                L7Protocol::TLS => SessionTimeout::TLS_DEFAULT,
-                _ => SessionTimeout::DEFAULT,
-            },
-        }
-        .into()
-    }
-
     fn aggregate_session_and_send(&mut self, config: &LogParserConfig, item: AppProto) {
         if let AppProto::SocketClosed(s) = item {
             if let Some(p) = self.entries.remove(&s) {
@@ -438,7 +430,9 @@ impl SessionQueue {
         }
         self.counter.receive.fetch_add(1, Ordering::Relaxed);
 
-        if matches!(item.base_info.head.msg_type, LogMessageType::Session) {
+        if !item.l7_info.needs_session_aggregation()
+            || matches!(item.base_info.head.msg_type, LogMessageType::Session)
+        {
             if item.base_info.start_time.is_zero() {
                 item.base_info.start_time = item.base_info.end_time;
             }
@@ -449,7 +443,8 @@ impl SessionQueue {
             return;
         }
 
-        let timeout_time = item.base_info.start_time + Self::get_timeout(config, &item);
+        let timeout_time =
+            item.base_info.start_time + config.get_l7_timeout(item.base_info.head.proto);
         if timeout_time <= self.window_start {
             self.counter
                 .send_before_window
@@ -587,10 +582,12 @@ impl SessionQueue {
                 item.l7_info.get_request_resource_length() as u64,
                 Ordering::Relaxed,
             );
+
             self.throttle_sender
                 .send(item.clone(), Some(L7ResponseStatus::Timeout));
             None
         });
+        self.throttle_sender.throttle.flush();
         // update timestamp
         self.window_start = time;
     }

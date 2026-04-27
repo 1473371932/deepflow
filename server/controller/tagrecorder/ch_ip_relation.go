@@ -41,6 +41,7 @@ func NewChIPRelation() *ChIPRelation {
 }
 
 func (i *ChIPRelation) generateNewData(db *metadb.DB) (map[IPRelationKey]metadbmodel.ChIPRelation, bool) {
+	log.Infof("generate data for %s", i.resourceTypeName, db.LogPrefixORGID)
 	toolDS, ok := i.newToolDataSet(db)
 	if !ok {
 		return nil, false
@@ -134,7 +135,7 @@ func (i *ChIPRelation) newToolDataSet(db *metadb.DB) (*toolDataSet, bool) {
 	}
 
 	var vifs []*metadbmodel.VInterface
-	if err := db.Where(
+	if err := db.Select("id", "deviceid", "devicetype").Where(
 		"devicetype IN ?",
 		[]int{
 			common.VIF_DEVICE_TYPE_VM,

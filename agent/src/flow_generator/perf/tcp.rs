@@ -68,6 +68,7 @@ enum PacketSeqType {
     Discontinuous,
     Continuous,
     BothContinuous,
+    OutOfOrder,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -319,6 +320,7 @@ impl SessionPeer {
         }
 
         let (mut lt, mut gte, index) = self.search(&seg);
+        let has_gte = gte.is_some();
         if Self::is_retrans_segment(&lt, &gte, &seg) {
             PacketSeqType::Retrans
         } else if Self::is_error_segment(&lt, &gte, &seg) {
@@ -329,16 +331,25 @@ impl SessionPeer {
                     self.insert_seq_segment(index, seg);
                     if self.seq_list_len as usize >= SEQ_LIST_MAX_LEN {
                         self.merge_seq_list(SEQ_LIST_MAX_LEN - 2);
-                        PacketSeqType::Merge
+                    }
+
+                    if has_gte {
+                        PacketSeqType::OutOfOrder
                     } else {
                         PacketSeqType::Discontinuous
                     }
                 }
                 ContinuousFlags::BOTH_CONTINUOUS => {
                     self.merge_seq_list(index - 1);
-                    PacketSeqType::BothContinuous
+                    PacketSeqType::OutOfOrder
                 }
-                _ => PacketSeqType::Continuous,
+                _ => {
+                    if has_gte {
+                        PacketSeqType::OutOfOrder
+                    } else {
+                        PacketSeqType::Continuous
+                    }
+                }
             }
         }
     }
@@ -428,6 +439,13 @@ pub(crate) struct PerfData {
     retrans_syn: u32,
     retrans_synack: u32,
 
+    // Out of order count
+    ooo_0: u32,
+    ooo_1: u32,
+
+    // Fin count
+    fin_count: u32,
+
     updated: bool,
 }
 
@@ -489,6 +507,20 @@ impl PerfData {
         self.updated = true;
     }
 
+    fn calc_ooo(&mut self, fpd: bool) {
+        if fpd {
+            self.ooo_0 += 1;
+        } else {
+            self.ooo_1 += 1;
+        }
+        self.updated = true;
+    }
+
+    fn calc_fin(&mut self) {
+        self.fin_count += 1;
+        self.updated = true;
+    }
+
     fn calc_zero_win(&mut self, fpd: bool) {
         if fpd {
             self.zero_win_count_0 += 1;
@@ -544,9 +576,12 @@ impl PerfData {
         stats.total_retrans_count = self.retrans_sum;
         stats.counts_peers[0].zero_win_count = self.zero_win_count_0;
         stats.counts_peers[1].zero_win_count = self.zero_win_count_1;
+        stats.counts_peers[0].ooo_count = self.ooo_0;
+        stats.counts_peers[1].ooo_count = self.ooo_1;
 
         stats.syn_count = self.syn;
         stats.synack_count = self.synack;
+        stats.fin_count = self.fin_count;
         stats.retrans_syn_count = self.retrans_syn;
         stats.retrans_synack_count = self.retrans_synack;
 
@@ -620,14 +655,18 @@ impl TcpPerf {
         self.handshaking = false;
     }
 
-    // fpd for first packet direction
-    fn is_invalid_retrans_packet(&mut self, p: &MetaPacket, fpd: bool) -> (bool, bool) {
+    // packet_direction: true=c2s, false=s2c
+    fn is_invalid_retrans_packet(
+        &mut self,
+        p: &MetaPacket,
+        packet_direction: bool,
+    ) -> (bool, bool) {
         let tcp_data = if let ProtocolData::TcpHeader(tcp_data) = &p.protocol_data {
             tcp_data
         } else {
             unreachable!();
         };
-        let (same_dir, oppo_dir) = if fpd {
+        let (same_dir, oppo_dir) = if packet_direction {
             (&mut self.ctrl_info.0, &mut self.ctrl_info.1)
         } else {
             (&mut self.ctrl_info.1, &mut self.ctrl_info.0)
@@ -639,7 +678,7 @@ impl TcpPerf {
                 same_dir.first_handshake_timestamp = p.lookup_key.timestamp.into();
                 self.handshaking = true;
             } else if same_dir.syn_transmitted {
-                self.perf_data.calc_retrans_syn(fpd);
+                self.perf_data.calc_retrans_syn(packet_direction);
                 self.perf_data.calc_retran_syn();
             }
             same_dir.syn_transmitted = true;
@@ -658,15 +697,17 @@ impl TcpPerf {
                     oppo_dir.rtt_full_precondition = true;
                 }
             } else {
-                self.perf_data.calc_retrans_syn(fpd);
+                self.perf_data.calc_retrans_syn(packet_direction);
                 self.perf_data.calc_retrans_synack();
             }
             return (false, false);
         }
 
         if p.is_ack() {
-            // The first ACK packet sent by the server after handshake does not calculate rtt.
-            self.handshaking = fpd;
+            // The three-way handshake state terminates when the first ACK packet sent from the server to the client is observed.
+            if self.handshaking {
+                self.handshaking = packet_direction;
+            }
 
             // It is impossible to distinguish retransmission between ACK and ACK
             // keepalive. To avoid misunderstanding, retransmission of pure ACK
@@ -683,7 +724,7 @@ impl TcpPerf {
         match same_dir.assert_seq_number(tcp_data, p.payload_len) {
             PacketSeqType::Retrans => {
                 // established retrans
-                self.perf_data.calc_retrans(fpd);
+                self.perf_data.calc_retrans(packet_direction);
                 (false, true)
             }
             PacketSeqType::Error => {
@@ -692,13 +733,17 @@ impl TcpPerf {
                     .fetch_add(1, Ordering::Relaxed);
                 (true, false)
             }
+            PacketSeqType::OutOfOrder => {
+                self.perf_data.calc_ooo(packet_direction);
+                (false, false)
+            }
             _ => (false, false),
         }
     }
 
     fn is_abnormal_tcp_flags(flags: TcpFlags) -> bool {
         if flags.contains(TcpFlags::SYN) {
-            if flags.intersects(TcpFlags::FIN | TcpFlags::RST) {
+            if flags.intersects(TcpFlags::RST) {
                 return true;
             }
         } else {
@@ -708,7 +753,7 @@ impl TcpPerf {
         }
 
         if !flags.contains(TcpFlags::ACK) {
-            if flags.intersects(TcpFlags::PSH | TcpFlags::FIN | TcpFlags::URG) {
+            if flags.intersects(TcpFlags::PSH | TcpFlags::URG) {
                 return true;
             }
         }
@@ -718,7 +763,7 @@ impl TcpPerf {
 
     fn is_unconcerned_tcp_flags(flags: TcpFlags) -> bool {
         // flow perf do not take care
-        if flags.intersects(TcpFlags::FIN | TcpFlags::RST) {
+        if flags.intersects(TcpFlags::RST) {
             return true;
         }
 
@@ -753,10 +798,10 @@ impl TcpPerf {
                 // - B: SYN
                 // - C: SYN_ACK
                 // - D: SYN_ACK
-                // - E: ACK
+                // - E: ACK      // End the handshake
                 // - F: ACK
                 // rtt0: TimeStats{Count: 2, Sum: (C-A)+(D-A), Max: D-A}
-                // rtt1: TimeStats{Count: 2, Sum: (E-C)+(F-C), Max: F-C}
+                // rtt1: TimeStats{Count: 1, Sum: E-C, Max: E-C}
                 if (Self::is_handshake_ack_packet(same_dir, oppo_dir, p) || p.is_syn_ack())
                     && !oppo_dir.first_handshake_timestamp.is_zero()
                 {
@@ -807,12 +852,11 @@ impl TcpPerf {
 
             true
         } else {
-            if !p.is_ack() {
-                same_dir.rtt_calculable = false;
-                oppo_dir.rtt_calculable = false;
-                same_dir.rtt_full_calculable = false;
-            }
-            p.is_ack()
+            same_dir.rtt_calculable = false;
+            oppo_dir.rtt_calculable = false;
+            same_dir.rtt_full_calculable = false;
+
+            false
         };
 
         if Self::is_handshake_ack_packet(same_dir, oppo_dir, p) {
@@ -957,6 +1001,10 @@ impl TcpPerf {
                 self.perf_data.calc_retrans_synack();
             }
             self.perf_data.calc_synack();
+        }
+
+        if p.is_fin() {
+            self.perf_data.calc_fin();
         }
 
         is_retrans
@@ -1336,7 +1384,7 @@ mod tests {
 
     use super::*;
 
-    use crate::utils::test::Capture;
+    use crate::utils::test_utils::Capture;
 
     const FILE_DIR: &'static str = "resources/test/flow_generator";
 
@@ -1584,7 +1632,7 @@ mod tests {
                 },
                 21
             ),
-            PacketSeqType::Error
+            PacketSeqType::Retrans
         );
         assert_eq!(
             peer.assert_seq_number(
@@ -1594,7 +1642,7 @@ mod tests {
                 },
                 5
             ),
-            PacketSeqType::Error
+            PacketSeqType::Retrans
         );
         assert_eq!(
             peer.assert_seq_number(
@@ -1614,7 +1662,7 @@ mod tests {
                 },
                 4
             ),
-            PacketSeqType::Discontinuous
+            PacketSeqType::OutOfOrder
         );
         assert_eq!(
             peer.assert_seq_number(
@@ -1624,7 +1672,7 @@ mod tests {
                 },
                 1
             ),
-            PacketSeqType::BothContinuous
+            PacketSeqType::OutOfOrder
         );
         assert_eq!(
             peer.assert_seq_number(
@@ -1634,7 +1682,7 @@ mod tests {
                 },
                 2
             ),
-            PacketSeqType::Continuous
+            PacketSeqType::OutOfOrder
         );
         assert_eq!(
             peer.assert_seq_number(
@@ -1644,7 +1692,7 @@ mod tests {
                 },
                 1
             ),
-            PacketSeqType::Continuous
+            PacketSeqType::OutOfOrder
         );
         assert_eq!(
             peer.assert_seq_number(
@@ -1664,7 +1712,7 @@ mod tests {
                 },
                 28
             ),
-            PacketSeqType::Error
+            PacketSeqType::Retrans
         );
         assert_eq!(
             peer.assert_seq_number(
@@ -1674,7 +1722,7 @@ mod tests {
                 },
                 5
             ),
-            PacketSeqType::Error
+            PacketSeqType::Retrans
         );
         assert_eq!(
             peer.assert_seq_number(
@@ -1684,7 +1732,7 @@ mod tests {
                 },
                 5
             ),
-            PacketSeqType::Continuous
+            PacketSeqType::OutOfOrder
         );
         assert_eq!(
             peer.assert_seq_number(
@@ -1694,7 +1742,7 @@ mod tests {
                 },
                 3
             ),
-            PacketSeqType::Discontinuous
+            PacketSeqType::OutOfOrder
         );
 
         assert_eq!(
@@ -1875,7 +1923,7 @@ mod tests {
                 ..Default::default()
             },
             rtt_full: Timestamp::from_secs(11),
-            zero_win_count_0: 2,
+            zero_win_count_0: 4,
             zero_win_count_1: 5,
             syn: 1,
             synack: 1,
@@ -1944,13 +1992,36 @@ mod tests {
         .into();
         perf.parse(&packet, true).unwrap();
 
+        let packet = MiniMetaPacket {
+            data_offset: 20,
+            flags: TcpFlags::SYN,
+            seq: 111,
+            ack: 0,
+            timestamp: 3334,
+            ..Default::default()
+        }
+        .into();
+        perf.parse(&packet, true).unwrap();
+
         // SYN/ACK
         let packet = MiniMetaPacket {
             data_offset: 20,
             flags: TcpFlags::SYN_ACK,
             seq: 1111,
             ack: 112,
-            timestamp: 3334,
+            timestamp: 3335,
+            ..Default::default()
+        }
+        .into();
+        perf.parse(&packet, false).unwrap();
+
+        // SYN/ACK
+        let packet = MiniMetaPacket {
+            data_offset: 20,
+            flags: TcpFlags::SYN_ACK,
+            seq: 1111,
+            ack: 112,
+            timestamp: 3336,
             ..Default::default()
         }
         .into();
@@ -1980,32 +2051,44 @@ mod tests {
         .into();
         perf.parse(&packet, true).unwrap();
 
+        // ACK s2c
+        let packet = MiniMetaPacket {
+            data_offset: 20,
+            flags: TcpFlags::ACK,
+            seq: 1112,
+            ack: 113,
+            timestamp: 3354,
+            ..Default::default()
+        }
+        .into();
+        perf.parse(&packet, true).unwrap();
+
         println!("perf: {:?}", &perf.perf_data);
         assert_eq!(
-            perf.perf_data.rtt_0.count, 2,
+            perf.perf_data.rtt_0.count, 1,
             "rtt_0: {:?}",
             perf.perf_data.rtt_0
         );
         assert_eq!(
             perf.perf_data.rtt_0.max.as_secs(),
-            20,
+            9,
             "rtt_0: {:?}",
             perf.perf_data.rtt_0
         );
         assert_eq!(
-            perf.perf_data.rtt_1.count, 1,
+            perf.perf_data.rtt_1.count, 2,
             "rtt_1: {:?}",
             perf.perf_data.rtt_1
         );
         assert_eq!(
             perf.perf_data.rtt_1.max.as_secs(),
-            1,
+            3,
             "rtt_1: {:?}",
             perf.perf_data.rtt_1
         );
         assert_eq!(
             perf.perf_data.rtt_full.as_secs(),
-            21,
+            11,
             "rtt_full: {:?}",
             perf.perf_data.rtt_full
         );
@@ -2098,7 +2181,7 @@ mod tests {
         let mut output = String::new();
 
         let mut perf = TcpPerf::new(Arc::new(FlowPerfCounter::default()));
-        let capture = Capture::load_pcap(file);
+        let capture = Capture::load_pcap(&file);
         let packets = capture.collect::<Vec<_>>();
         assert!(
             packets.len() >= 2,
@@ -2122,7 +2205,12 @@ mod tests {
                 packet,
                 first_packet.lookup_key.src_ip == packet.lookup_key.src_ip,
             );
-            output.push_str(&format!("{}th perf data:\n{:#?}\n", i, perf.perf_data));
+            output.push_str(&format!(
+                "{}th perf data from {:?}:\n{:#?}\n",
+                i + 1,
+                file.as_ref(),
+                perf.perf_data
+            ));
             if check_seq_list {
                 output.push_str(&format!(
                     "\t\tclient seq_list: {:?}\n",

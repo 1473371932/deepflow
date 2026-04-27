@@ -23,7 +23,6 @@ import (
 	"time"
 
 	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
-	"github.com/deepflowio/deepflow/server/controller/recorder/common"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 	"github.com/deepflowio/deepflow/server/libs/eventapi"
 	"github.com/deepflowio/deepflow/server/libs/queue"
@@ -73,12 +72,14 @@ func (e ManagerComponent) fillEvent(
 	event.TimeMilli = time.Now().UnixMilli()
 	event.Type = eventType
 	event.IfNeedTagged = true
+	// 以下情况需要 server 自己打标签，其他情况由 ingester 打标签
 	if slices.Contains([]string{
 		eventapi.RESOURCE_EVENT_TYPE_CREATE,
-		eventapi.RESOURCE_EVENT_TYPE_ADD_IP,
-		eventapi.RESOURCE_EVENT_TYPE_ADD_CONFIG_MAP,
-		eventapi.RESOURCE_EVENT_TYPE_UPDATE_CONFIG_MAP,
-		eventapi.RESOURCE_EVENT_TYPE_DELETE_CONFIG_MAP,
+		eventapi.RESOURCE_EVENT_TYPE_ATTACH_IP,
+		eventapi.RESOURCE_EVENT_TYPE_MODIFY,
+		eventapi.RESOURCE_EVENT_TYPE_ATTACH_CONFIG_MAP,
+		eventapi.RESOURCE_EVENT_TYPE_MODIFY_CONFIG_MAP,
+		eventapi.RESOURCE_EVENT_TYPE_DETACH_CONFIG_MAP,
 	}, eventType) {
 		event.IfNeedTagged = false
 	}
@@ -88,18 +89,14 @@ func (e ManagerComponent) fillEvent(
 }
 
 func (e *ManagerComponent) enqueue(md *message.Metadata, resourceLcuuid string, event *eventapi.ResourceEvent) {
-	rt := e.resourceType
-	if rt == "" {
-		rt = common.DEVICE_TYPE_INT_TO_STR[int(event.InstanceType)]
-	}
-	log.Infof("put %s event (lcuuid: %s): %+v into shared queue", rt, resourceLcuuid, event, md.LogPrefixes)
+	log.Infof("put %s event (lcuuid: %s): %+v into shared queue", e.resourceType, resourceLcuuid, toLoggableEvent(event), md.LogPrefixes)
 	err := e.Queue.Put(event)
 	if err != nil {
-		log.Error(putEventIntoQueueFailed(rt, err), md.LogPrefixes)
+		log.Error(putEventIntoQueueFailed(e.resourceType, err), md.LogPrefixes)
 	}
 }
 
-func (e *ManagerComponent) enqueueInstanceIfInsertIntoMySQLFailed(
+func (e *ManagerComponent) enqueueInstanceIfInsertIntoMetadbFailed(
 	md *message.Metadata,
 	resourceLcuuid, domainLcuuid, eventType, instanceName string, instanceType, instanceID int, options ...eventapi.TagFieldOption,
 ) {
@@ -109,7 +106,7 @@ func (e *ManagerComponent) enqueueInstanceIfInsertIntoMySQLFailed(
 		eventapi.TagInstanceID(uint32(instanceID)),
 		eventapi.TagInstanceName(instanceName))
 
-	e.enqueueIfInsertIntoMySQLFailed(md, resourceLcuuid, domainLcuuid, eventType, options...)
+	e.enqueueIfInsertIntoMetadbFailed(md, resourceLcuuid, domainLcuuid, eventType, options...)
 }
 
 // Due to the fixed sequence of resource learning, some data required by resource change events can only be obtained after the completion of subsequent resource learning.
@@ -118,12 +115,12 @@ func (e *ManagerComponent) enqueueInstanceIfInsertIntoMySQLFailed(
 // - PodNode's/POD's create event, PodNode's/POD's add-ip event, fill in the L3Device information and HostID as required
 // - POD's recreate event, requires real-time IPs information
 // - ConfigMap's create event, ConfigMap's update event, ConfigMap's delete event, requires real-time PodGroup-ConfigMap connection information
-// If the event is not stored in MySQL, it will be directly enqueued.
-func (e *ManagerComponent) enqueueIfInsertIntoMySQLFailed(
+// If the event is not stored in Metadb, it will be directly enqueued.
+func (e *ManagerComponent) enqueueIfInsertIntoMetadbFailed(
 	md *message.Metadata,
 	resourceLcuuid, domainLcuuid, eventType string, options ...eventapi.TagFieldOption,
 ) {
-	// use struct to create ResourceEvent instance if it will be stored in MySQL
+	// use struct to create ResourceEvent instance if it will be stored in Metadb
 	event := &eventapi.ResourceEvent{}
 	e.fillEvent(md, event, eventType, options...)
 	content, err := json.Marshal(event)
@@ -131,11 +128,13 @@ func (e *ManagerComponent) enqueueIfInsertIntoMySQLFailed(
 		log.Errorf("json marshal event (detail: %#v) failed: %s", event, err.Error(), md.LogPrefixes)
 	} else {
 		dbItem := metadbmodel.ResourceEvent{
-			Domain:  domainLcuuid,
-			Content: string(content),
+			Domain:         domainLcuuid,
+			SubDomain:      md.GetSubDomainLcuuid(),
+			ResourceLcuuid: resourceLcuuid,
+			Content:        string(content),
 		}
 		if err = md.GetDB().Create(&dbItem).Error; err == nil {
-			log.Infof("create resource_event (detail: %#v) success", dbItem, md.LogPrefixes)
+			log.Infof("create resource_event (detail: %#v, %+v) success", dbItem.ToLoggable(), toLoggableEvent(event), md.LogPrefixes)
 			return
 		}
 		log.Errorf("add resource_event (detail: %#v) failed: %s", dbItem, err.Error(), md.LogPrefixes)
@@ -146,7 +145,6 @@ func (e *ManagerComponent) enqueueIfInsertIntoMySQLFailed(
 
 func (e *ManagerComponent) convertAndEnqueue(md *message.Metadata, resourceLcuuid string, ev *eventapi.ResourceEvent) {
 	event := e.convertToEventBeEnqueued(ev)
-	log.Infof("TODO: put event (lcuuid: %s): %#v into shared queue", resourceLcuuid, event, md.LogPrefixes)
 	e.enqueue(md, resourceLcuuid, event)
 }
 
@@ -163,4 +161,33 @@ func (e *ManagerComponent) convertToEventBeEnqueued(ev *eventapi.ResourceEvent) 
 	}
 
 	return event
+}
+
+// toLoggableEvent 隐藏配置事件中的 config 信息，避免泄露、打印过多日志
+func toLoggableEvent(e *eventapi.ResourceEvent) eventapi.ResourceEvent {
+	if e == nil {
+		return eventapi.ResourceEvent{}
+	}
+
+	loggableEvent := *e
+
+	if len(loggableEvent.AttributeNames) == 0 || len(loggableEvent.AttributeValues) == 0 {
+		return loggableEvent
+	}
+
+	configIndex := -1
+	for i, name := range loggableEvent.AttributeNames {
+		if name == eventapi.AttributeNameConfig {
+			configIndex = i
+			break
+		}
+	}
+
+	if configIndex >= 0 && configIndex < len(loggableEvent.AttributeValues) {
+		loggableEvent.AttributeValues = make([]string, len(e.AttributeValues))
+		copy(loggableEvent.AttributeValues, e.AttributeValues)
+		loggableEvent.AttributeValues[configIndex] = "**HIDDEN**"
+	}
+
+	return loggableEvent
 }

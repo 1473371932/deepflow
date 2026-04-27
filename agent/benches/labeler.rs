@@ -70,7 +70,7 @@ fn bench_labeler(c: &mut Criterion) {
 
             cidr_list.push(Arc::new(cidr));
         }
-        labeler.update_cidr_table(&cidr_list);
+        labeler.update_cidr_table(&cidr_list, false, &mut false);
         labeler.update_interface_table(&iface_list);
 
         let key: LookupKey = LookupKey {
@@ -118,7 +118,7 @@ fn bench_labeler(c: &mut Criterion) {
 
             cidr_list.push(Arc::new(cidr));
         }
-        labeler.update_cidr_table(&cidr_list);
+        labeler.update_cidr_table(&cidr_list, false, &mut false);
         labeler.update_interface_table(&iface_list);
 
         let key: LookupKey = LookupKey {
@@ -131,7 +131,7 @@ fn bench_labeler(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let start = Instant::now();
             for _ in 0..iters {
-                labeler.get_endpoint_data_by_epc(key.src_ip, key.dst_ip, 10, 0);
+                labeler.get_endpoint_data_by_epc(key.src_ip, key.dst_ip, 10, 0, true);
             }
             start.elapsed()
         })
@@ -163,7 +163,7 @@ fn bench_policy(c: &mut Criterion) {
             Arc::new(IpGroupData::new(10, 2, "192.168.2.1/32")),
             Arc::new(IpGroupData::new(20, 20, "192.168.2.5/31")),
         ]);
-        let _ = first.update_acl(&vec![Arc::new(acl)], true);
+        let _ = first.update_acl(&vec![Arc::new(acl)], true, false, &mut false);
 
         first
     }
@@ -262,7 +262,14 @@ fn bench_policy(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let start = Instant::now();
             for _ in 0..iters {
-                first.endpoint_fast_get(EndpointTableType::Ebpf, key.src_ip, key.dst_ip, 2, 0);
+                first.endpoint_fast_get(
+                    EndpointTableType::Ebpf,
+                    key.src_ip,
+                    key.dst_ip,
+                    2,
+                    0,
+                    true,
+                );
             }
             start.elapsed()
         })

@@ -39,7 +39,7 @@ func WhereFindPtr[T any](db *metadb.DB, query interface{}, args ...interface{}) 
 	return result, err
 }
 
-func formatLogDeleteABecauseBHasGone[MT constraint.MySQLModel](a, b string, items []*MT) string {
+func formatLogDeleteABecauseBHasGone[MT metadbmodel.AssetResourceConstraint](a, b string, items []*MT) string {
 	var str string
 	for _, item := range items {
 		str += fmt.Sprintf("%+v ", item)
@@ -47,16 +47,16 @@ func formatLogDeleteABecauseBHasGone[MT constraint.MySQLModel](a, b string, item
 	return fmt.Sprintf("%s: %+v because %s has gone", common.LogDelete(a), str, b)
 }
 
-func getIDs[MT constraint.MySQLModel](db *metadb.DB, domainLcuuid string) (ids []int) {
+func getIDs[MT metadbmodel.AssetResourceConstraint](db *metadb.DB, domainLcuuid string) (ids []int) {
 	var dbItems []*MT
-	db.Where("domain = ?", domainLcuuid).Select("id").Find(&dbItems)
+	db.Where(map[string]interface{}{"domain": domainLcuuid}).Select("id").Find(&dbItems)
 	for _, item := range dbItems {
 		ids = append(ids, (*item).GetID())
 	}
 	return
 }
 
-func pageDeleteExpiredAndPublish[MDPT msgConstraint.DeletePtr[MDT], MDT msgConstraint.Delete, MT constraint.MySQLSoftDeleteModel](
+func pageDeleteExpiredAndPublish[MDPT msgConstraint.DeletePtr[MDT], MDT msgConstraint.Delete, MT constraint.MetadbSoftDeleteModel](
 	db *metadb.DB, expiredAt time.Time, resourceType string, toolData *toolData, size int) {
 	var items []*MT
 	err := db.Unscoped().Where("deleted_at < ?", expiredAt).Find(&items).Error
@@ -75,17 +75,18 @@ func pageDeleteExpiredAndPublish[MDPT msgConstraint.DeletePtr[MDT], MDT msgConst
 		if end > total {
 			end = total
 		}
-		if err := db.Unscoped().Delete(items[i:end]).Error; err != nil {
+		batchItems := items[i:end]
+		if err := db.Unscoped().Delete(batchItems).Error; err != nil {
 			log.Errorf("metadb delete %s resource failed: %s", resourceType, err.Error(), db.LogPrefixORGID)
 		} else {
-			publishTagrecorder[MDPT, MDT, MT](db, items, resourceType, toolData)
+			publishTagrecorder[MDPT, MDT, MT](db, batchItems, resourceType, toolData)
 		}
 	}
 
 	log.Infof("clean %s completed: %d", resourceType, len(items), db.LogPrefixORGID)
 }
 
-func publishTagrecorder[MDPT msgConstraint.DeletePtr[MDT], MDT msgConstraint.Delete, MT constraint.MySQLSoftDeleteModel](db *metadb.DB, dbItems []*MT, resourceType string, toolData *toolData) {
+func publishTagrecorder[MDPT msgConstraint.DeletePtr[MDT], MDT msgConstraint.Delete, MT constraint.MetadbSoftDeleteModel](db *metadb.DB, dbItems []*MT, resourceType string, toolData *toolData) {
 	msgMetadataToDBItems := make(map[*message.Metadata][]*MT)
 	for _, item := range dbItems {
 		var msgMetadata *message.Metadata
@@ -107,7 +108,7 @@ func publishTagrecorder[MDPT msgConstraint.DeletePtr[MDT], MDT msgConstraint.Del
 	for _, sub := range tagrecorder.GetSubscriberManager().GetSubscribers(resourceType) { // TODO use pubsub
 		for msgMetadata, dbItems := range msgMetadataToDBItems {
 			msgData := MDPT(new(MDT))
-			msgData.SetMySQLItems(dbItems)
+			msgData.SetMetadbItems(dbItems)
 			if resourceType == ctrlCommon.RESOURCE_TYPE_PROCESS_EN {
 				msgData.SetAddition(getProcessMessageDeleteAddition(db, dbItems, resourceType, toolData)) // TODO optimize
 				log.Infof("process delete addition: %s", msgData.GetAddition(), db.LogPrefixORGID)
@@ -167,10 +168,11 @@ func (t *toolData) load(db *metadb.DB) error {
 		log.Errorf("failed to get domain: %s", err.Error(), db.LogPrefixORGID)
 		return err
 	}
-	domainLcuuidToID := make(map[string]int)
+	lcuuidToDomain := make(map[string]*metadbmodel.Domain)
 	for _, domain := range domains {
-		domainLcuuidToID[domain.Lcuuid] = domain.ID
-		t.domainLcuuidToMsgMetadata[domain.Lcuuid] = message.NewMetadata(db.ORGID, message.MetadataTeamID(domain.TeamID), message.MetadataDomainID(domain.ID))
+		lcuuidToDomain[domain.Lcuuid] = domain
+		t.domainLcuuidToMsgMetadata[domain.Lcuuid] = message.NewMetadata(
+			message.MetadataDB(db), message.MetadataDomain(*domain))
 	}
 	var subDomains []*metadbmodel.SubDomain
 	if err := db.Find(&subDomains).Error; err != nil {
@@ -179,7 +181,7 @@ func (t *toolData) load(db *metadb.DB) error {
 	}
 	for _, subDomain := range subDomains {
 		t.subDomainLcuuidToMsgMetadata[subDomain.Lcuuid] = message.NewMetadata(
-			db.ORGID, message.MetadataTeamID(subDomain.TeamID), message.MetadataDomainID(domainLcuuidToID[subDomain.Domain]), message.MetadataSubDomainID(subDomain.ID),
+			message.MetadataDB(db), message.MetadataSubDomain(*subDomain), message.MetadataDomain(*lcuuidToDomain[subDomain.Domain]),
 		)
 	}
 	return nil

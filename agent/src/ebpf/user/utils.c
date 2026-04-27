@@ -257,7 +257,7 @@ static void exec_clear_residual_probes(const char *events_file,
 		if ((lf = strchr(line, '\n')))
 			*lf = '\0';
 
-		pe = (struct probe_elem *)calloc(sizeof(*pe), 1);
+		pe = (struct probe_elem *)calloc(1, sizeof(*pe));
 		if (pe == NULL) {
 			ebpf_warning("calloc() failed.\n");
 			break;
@@ -321,7 +321,9 @@ static void exec_clear_residual_probes(const char *events_file,
 void clear_residual_probes(void)
 {
 	exec_clear_residual_probes(KPROBE_EVENTS_FILE, "kprobe");
-	exec_clear_residual_probes(UPROBE_EVENTS_FILE, "uprobe");
+	// Uprobe now exclusively uses perf_event_open() to create events,
+	// no longer relying on the tracefs.
+	// exec_clear_residual_probes(UPROBE_EVENTS_FILE, "uprobe");
 }
 
 /* Make sure max locked memory is set to unlimited. */
@@ -544,8 +546,8 @@ u64 get_process_starttime_and_comm(pid_t pid, char *name_base, int len)
 
 	fd = open(file, O_RDONLY);
 	if (fd <= 2) {
-		ebpf_warning("open %s failed with %s(%d)\n", file,
-			     strerror(errno), errno);
+		ebpf_debug("open %s failed with %s(%d)\n", file,
+			   strerror(errno), errno);
 		return 0;
 	}
 
@@ -556,7 +558,7 @@ u64 get_process_starttime_and_comm(pid_t pid, char *name_base, int len)
 	if (sscanf(buff, "%*s %ms %*s %*s %*s %*s %*s %*s %*s %*s %*s"
 		   " %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %llu ",
 		   &start, &etime_ticks) != 2) {
-		ebpf_warning("sscanf() failed. pid %d buff %s\n", pid, buff);
+		ebpf_debug("sscanf() failed. pid %d buff %s\n", pid, buff);
 		return 0;
 	}
 
@@ -612,13 +614,14 @@ int fetch_kernel_version(int *major, int *minor, int *rev, int *num)
 	int match_num = 0;
 	*num = 0;
 	// e.g.: 3.10.0-940.el7.centos.x86_64, 4.19.17-1.el7.x86_64
-	match_num = sscanf(sys_info.release, "%u.%u.%u-%u", major, minor, rev, num);
+	match_num =
+	    sscanf(sys_info.release, "%u.%u.%u-%u", major, minor, rev, num);
 	if (match_num == 4 || match_num == 3) {
 		return ETR_OK;
 	} else {
 		has_error = true;
 	}
-		
+
 	// Get the real version of Debian
 	// #1 SMP Debian 4.19.289-2 (2023-08-08)
 	// e.g.:
@@ -924,7 +927,7 @@ bool check_netns_enabled(void)
 
 	return true;
 }
-	
+
 // Function to retrieve the host PID from the first line of /proc/pid/sched
 // The expected format is "java (1234, #threads: 12)"
 // where 1234 is the host PID (before Linux 4.1)
@@ -1633,9 +1636,9 @@ u32 djb2_32bit(const char *str)
 	u32 hash = 5381;
 	int c;
 	while ((c = *str++)) {
-		hash = ((hash << 5) + hash) + c; // hash * 33 + c
+		hash = ((hash << 5) + hash) + c;	// hash * 33 + c
 	}
-	return hash; // 32-bit output
+	return hash;		// 32-bit output
 }
 
 #if !defined(AARCH64_MUSL) && !defined(JAVA_AGENT_ATTACH_TOOL)
@@ -1670,47 +1673,164 @@ int create_work_thread(const char *name, pthread_t * t, void *fn, void *arg)
 }
 #endif /* !defined(AARCH64_MUSL) && !defined(JAVA_AGENT_ATTACH_TOOL) */
 
-
 static inline int compare(const void *a, const void *b)
 {
-	return (*(uint16_t *)a - *(uint16_t *)b);	// Compare two uint16_t values
+	return (*(uint16_t *) a - *(uint16_t *) b);	// Compare two uint16_t values
 }
 
-void format_port_ranges(uint16_t *ports, size_t size, char *ret_str, int str_sz)
+void format_port_ranges(uint16_t * ports, size_t size, char *ret_str,
+			int str_sz)
 {
 	if (size == 0)
 		return;		// Return immediately if there are no ports
-	
+
 	// Sort the ports array using qsort
 	qsort(ports, size, sizeof(uint16_t), compare);
-	
+
 	int bytes_cnt = 0;	// To keep track of how many bytes we've written to ret_str
-	bytes_cnt += snprintf(ret_str + bytes_cnt, str_sz - bytes_cnt, "Ports: ");
-	
+	bytes_cnt +=
+	    snprintf(ret_str + bytes_cnt, str_sz - bytes_cnt, "Ports: ");
+
 	size_t i = 0;
 	while (i < size) {
 		size_t start = i;
-		
+
 		// Find the end position of a consecutive range
 		while (i + 1 < size && ports[i] + 1 == ports[i + 1]) {
 			i++;
 		}
-		
+
 		// If start == i, it means it's a single number; otherwise, it's a range
 		if (start == i) {
-			bytes_cnt += snprintf(ret_str + bytes_cnt, str_sz - bytes_cnt,
-						"%d", ports[start]);	// Print a single number
+			bytes_cnt += snprintf(ret_str + bytes_cnt, str_sz - bytes_cnt, "%d", ports[start]);	// Print a single number
 		} else {
-			bytes_cnt += snprintf(ret_str + bytes_cnt, str_sz - bytes_cnt,
-						"%d-%d", ports[start], ports[i]);	// Print the range
+			bytes_cnt += snprintf(ret_str + bytes_cnt, str_sz - bytes_cnt, "%d-%d", ports[start], ports[i]);	// Print the range
 		}
-		
+
 		// Print a comma if not the last range/number
 		if (i + 1 < size) {
-			bytes_cnt += snprintf(ret_str + bytes_cnt, str_sz - bytes_cnt, ", ");
+			bytes_cnt +=
+			    snprintf(ret_str + bytes_cnt, str_sz - bytes_cnt,
+				     ", ");
 		}
-		
+
 		i++;
 	}
 }
 
+uint32_t murmurhash(const void *key, size_t len, uint32_t seed)
+{
+	const uint8_t *data = (const uint8_t *)key;
+	const int nblocks = (int)(len / 4);
+	uint32_t h1 = seed;
+
+	const uint32_t c1 = 0xcc9e2d51;
+	const uint32_t c2 = 0x1b873593;
+
+	// Body
+	const uint32_t *blocks = (const uint32_t *)(data);
+	for (int i = 0; i < nblocks; i++) {
+		uint32_t k1 = blocks[i];
+
+		k1 *= c1;
+		k1 = (k1 << 15) | (k1 >> (32 - 15));
+		k1 *= c2;
+
+		h1 ^= k1;
+		h1 = (h1 << 13) | (h1 >> (32 - 13));
+		h1 = h1 * 5 + 0xe6546b64;
+	}
+
+	// Tail
+	const uint8_t *tail = (const uint8_t *)(data + nblocks * 4);
+	uint32_t k1 = 0;
+
+	switch (len & 3) {
+	case 3:
+		k1 ^= tail[2] << 16;
+		// fall through
+	case 2:
+		k1 ^= tail[1] << 8;
+		// fall through
+	case 1:
+		k1 ^= tail[0];
+		k1 *= c1;
+		k1 = (k1 << 15) | (k1 >> (32 - 15));
+		k1 *= c2;
+		h1 ^= k1;
+		break;
+	}
+
+	// Finalization
+	h1 ^= (uint32_t) len;
+
+	// fmix function from MurmurHash3 finalizer
+	h1 ^= h1 >> 16;
+	h1 *= 0x85ebca6b;
+	h1 ^= h1 >> 13;
+	h1 *= 0xc2b2ae35;
+	h1 ^= h1 >> 16;
+
+	return h1;
+}
+
+size_t u32_to_str_safe(uint32_t value, char *buf, size_t bufsize)
+{
+	char temp[10]; // Maximum digits for uint32_t: 4294967295 -> 10 digits
+	int i = 0;
+
+	if (bufsize == 0) return 0; // Buffer size must be at least 1
+
+	// Handle zero explicitly
+	if (value == 0) {
+		if (bufsize < 2) return 0; // Need space for '0' + '\0'
+		buf[0] = '0';
+		buf[1] = '\0';
+		return 1;
+	}
+
+	// Convert number to string in reverse order
+	while (value > 0) {
+		temp[i++] = '0' + (value % 10);
+		value /= 10;
+	}
+
+	// Check if buffer is large enough
+	if (bufsize <= (size_t)i) return 0;
+
+	// Reverse copy to output buffer
+	for (int j = 0; j < i; j++) {
+		buf[j] = temp[i - j - 1];
+	}
+
+	buf[i] = '\0';
+	return i;
+}
+
+int prepend_prefix_safe(char *buffer, size_t bufsize, const char *prefix)
+{
+	if (!buffer || !prefix || bufsize == 0) {
+		return -1; // invalid input
+	}
+
+	size_t len_prefix = strlen(prefix);
+	if (len_prefix == 0)
+		return 0; // empty prefix, nothing to do
+
+	size_t len_buffer = strlen(buffer);
+
+	// Check if buffer has enough space
+	if (len_prefix + len_buffer + 1 > bufsize) {
+		return -1; // not enough space
+	}
+
+	if (len_prefix > 0) {
+		// Move existing string to make room for prefix
+		memmove(buffer + len_prefix, buffer, len_buffer + 1); // +1 to move '\0'
+
+		// Copy prefix to the start
+		memcpy(buffer, prefix, len_prefix);
+	}
+
+	return 0;
+}

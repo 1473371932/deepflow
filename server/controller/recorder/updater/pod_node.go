@@ -24,7 +24,27 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
+
+// PodNodeMessageFactory defines the message factory for PodNode
+type PodNodeMessageFactory struct{}
+
+func (f *PodNodeMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedPodNodes{}
+}
+
+func (f *PodNodeMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedPodNode{}
+}
+
+func (f *PodNodeMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedPodNodes{}
+}
+
+func (f *PodNodeMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedPodNodeFields{}
+}
 
 type PodNode struct {
 	UpdaterBase[
@@ -32,36 +52,12 @@ type PodNode struct {
 		*diffbase.PodNode,
 		*metadbmodel.PodNode,
 		metadbmodel.PodNode,
-		*message.PodNodeAdd,
-		message.PodNodeAdd,
-		message.AddNoneAddition,
-		*message.PodNodeUpdate,
-		message.PodNodeUpdate,
-		*message.PodNodeFieldsUpdate,
-		message.PodNodeFieldsUpdate,
-		*message.PodNodeDelete,
-		message.PodNodeDelete,
-		message.DeleteNoneAddition]
+	]
 }
 
 func NewPodNode(wholeCache *cache.Cache, cloudData []cloudmodel.PodNode) *PodNode {
 	updater := &PodNode{
-		newUpdaterBase[
-			cloudmodel.PodNode,
-			*diffbase.PodNode,
-			*metadbmodel.PodNode,
-			metadbmodel.PodNode,
-			*message.PodNodeAdd,
-			message.PodNodeAdd,
-			message.AddNoneAddition,
-			*message.PodNodeUpdate,
-			message.PodNodeUpdate,
-			*message.PodNodeFieldsUpdate,
-			message.PodNodeFieldsUpdate,
-			*message.PodNodeDelete,
-			message.PodNodeDelete,
-			message.DeleteNoneAddition,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_POD_NODE_EN,
 			wholeCache,
 			db.NewPodNode().SetMetadata(wholeCache.GetMetadata()),
@@ -69,13 +65,13 @@ func NewPodNode(wholeCache *cache.Cache, cloudData []cloudmodel.PodNode) *PodNod
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
-	return updater
-}
+	updater.setDataGenerator(updater)
 
-func (n *PodNode) getDiffBaseByCloudItem(cloudItem *cloudmodel.PodNode) (diffBase *diffbase.PodNode, exists bool) {
-	diffBase, exists = n.diffBaseData[cloudItem.Lcuuid]
-	return
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &PodNodeMessageFactory{})
+	}
+
+	return updater
 }
 
 func (n *PodNode) generateDBItemToAdd(cloudItem *cloudmodel.PodNode) (*metadbmodel.PodNode, bool) {
@@ -106,7 +102,7 @@ func (n *PodNode) generateDBItemToAdd(cloudItem *cloudmodel.PodNode) (*metadbmod
 		Hostname:     cloudItem.Hostname,
 		PodClusterID: podClusterID,
 		SubDomain:    cloudItem.SubDomainLcuuid,
-		Domain:       n.metadata.Domain.Lcuuid,
+		Domain:       n.metadata.GetDomainLcuuid(),
 		Region:       cloudItem.RegionLcuuid,
 		AZ:           cloudItem.AZLcuuid,
 		VPCID:        vpcID,
@@ -115,8 +111,8 @@ func (n *PodNode) generateDBItemToAdd(cloudItem *cloudmodel.PodNode) (*metadbmod
 	return dbItem, true
 }
 
-func (n *PodNode) generateUpdateInfo(diffBase *diffbase.PodNode, cloudItem *cloudmodel.PodNode) (*message.PodNodeFieldsUpdate, map[string]interface{}, bool) {
-	structInfo := new(message.PodNodeFieldsUpdate)
+func (n *PodNode) generateUpdateInfo(diffBase *diffbase.PodNode, cloudItem *cloudmodel.PodNode) (types.UpdatedFields, map[string]interface{}, bool) {
+	structInfo := new(message.UpdatedPodNodeFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.Type != cloudItem.Type {
 		mapInfo["type"] = cloudItem.Type

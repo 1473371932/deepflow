@@ -179,32 +179,33 @@ func (a *Agent) Get(filter map[string]interface{}) (resp []model.Vtap, err error
 	}
 	for _, vtap := range agents {
 		vtapResp := model.Vtap{
-			ID:               vtap.ID,
-			Name:             vtap.Name,
-			Lcuuid:           vtap.Lcuuid,
-			Enable:           vtap.Enable,
-			Type:             vtap.Type,
-			CtrlIP:           vtap.CtrlIP,
-			CtrlMac:          vtap.CtrlMac,
-			ControllerIP:     vtap.ControllerIP,
-			AnalyzerIP:       vtap.AnalyzerIP,
-			CurControllerIP:  vtap.CurControllerIP,
-			CurAnalyzerIP:    vtap.CurAnalyzerIP,
-			BootTime:         vtap.BootTime,
-			CPUNum:           vtap.CPUNum,
-			MemorySize:       vtap.MemorySize,
-			Arch:             vtap.Arch,
-			ArchType:         common.GetArchType(vtap.Arch),
-			Os:               vtap.Os,
-			OsType:           common.GetOsType(vtap.Os),
-			KernelVersion:    vtap.KernelVersion,
-			ProcessName:      vtap.ProcessName,
-			CurrentK8sImage:  vtap.CurrentK8sImage,
-			LicenseType:      vtap.LicenseType,
-			ExpectedRevision: vtap.ExpectedRevision,
-			UpgradePackage:   vtap.UpgradePackage,
-			TapMode:          vtap.TapMode,
-			TeamID:           vtap.TeamID,
+			ID:                   vtap.ID,
+			Name:                 vtap.Name,
+			Lcuuid:               vtap.Lcuuid,
+			Enable:               vtap.Enable,
+			Type:                 vtap.Type,
+			CtrlIP:               vtap.CtrlIP,
+			CtrlMac:              vtap.CtrlMac,
+			ControllerIP:         vtap.ControllerIP,
+			AnalyzerIP:           vtap.AnalyzerIP,
+			CurControllerIP:      vtap.CurControllerIP,
+			CurAnalyzerIP:        vtap.CurAnalyzerIP,
+			BootTime:             vtap.BootTime,
+			CPUNum:               vtap.CPUNum,
+			MemorySize:           vtap.MemorySize,
+			Arch:                 vtap.Arch,
+			ArchType:             common.GetArchType(vtap.Arch),
+			Os:                   vtap.Os,
+			OsType:               common.GetOsType(vtap.Os),
+			KernelVersion:        vtap.KernelVersion,
+			ProcessName:          vtap.ProcessName,
+			CurrentK8sImage:      vtap.CurrentK8sImage,
+			LicenseType:          vtap.LicenseType,
+			ExpectedRevision:     vtap.ExpectedRevision,
+			ExceptionDescription: vtap.ExceptionDescription,
+			UpgradePackage:       vtap.UpgradePackage,
+			TapMode:              vtap.TapMode,
+			TeamID:               vtap.TeamID,
 		}
 		// state
 		if vtap.Enable == common.VTAP_ENABLE_FALSE {
@@ -959,7 +960,7 @@ func VTapRebalance(db *metadb.DB, args map[string]interface{}, cfg monitorconf.I
 // and virtual network type is VIF_DEVICE_TYPE_VM or VIF_DEVICE_TYPE_POD.
 func GetVTapPortsCount() (int, error) {
 	var vtaps []metadbmodel.VTap
-	if err := metadb.DefaultDB.Find(&vtaps).Error; err != nil {
+	if err := metadb.DefaultDB.Select("type", "launch_server").Find(&vtaps).Error; err != nil {
 		return 0, err
 	}
 	vtapHostIPs, vtapNodeIPs := mapset.NewSet(), mapset.NewSet()
@@ -977,7 +978,7 @@ func GetVTapPortsCount() (int, error) {
 	}
 
 	var vms []metadbmodel.VM
-	if err := metadb.DefaultDB.Find(&vms).Error; err != nil {
+	if err := metadb.DefaultDB.Select("id", "launch_server").Find(&vms).Error; err != nil {
 		return 0, err
 	}
 	vtapVMIDs := mapset.NewSet()
@@ -988,7 +989,7 @@ func GetVTapPortsCount() (int, error) {
 	}
 
 	var podNodes []metadbmodel.PodNode
-	if err := metadb.DefaultDB.Find(&podNodes).Error; err != nil {
+	if err := metadb.DefaultDB.Select("id", "ip").Find(&podNodes).Error; err != nil {
 		return 0, err
 	}
 	podNodeIDs := mapset.NewSet()
@@ -999,7 +1000,7 @@ func GetVTapPortsCount() (int, error) {
 	}
 
 	var pods []metadbmodel.Pod
-	if err := metadb.DefaultDB.Find(&pods).Error; err != nil {
+	if err := metadb.DefaultDB.Select("id", "pod_node_id").Find(&pods).Error; err != nil {
 		return 0, err
 	}
 	vtapPodIDs := mapset.NewSet()
@@ -1010,7 +1011,7 @@ func GetVTapPortsCount() (int, error) {
 	}
 
 	var lanIPs []metadbmodel.LANIP
-	if err := metadb.DefaultDB.Find(&lanIPs).Error; err != nil {
+	if err := metadb.DefaultDB.Select("ip", "vifid").Find(&lanIPs).Error; err != nil {
 		return 0, err
 	}
 	pubVTapVIFs := mapset.NewSet()
@@ -1022,7 +1023,7 @@ func GetVTapPortsCount() (int, error) {
 
 	vtapVifCount := 0
 	var vinterfaces []metadbmodel.VInterface
-	if err := metadb.DefaultDB.Where("devicetype = ? or devicetype = ?", common.VIF_DEVICE_TYPE_VM, common.VIF_DEVICE_TYPE_POD).
+	if err := metadb.DefaultDB.Select("id", "deviceid", "devicetype").Where("devicetype = ? or devicetype = ?", common.VIF_DEVICE_TYPE_VM, common.VIF_DEVICE_TYPE_POD).
 		Find(&vinterfaces).Error; err != nil {
 		return 0, err
 	}
@@ -1037,4 +1038,12 @@ func GetVTapPortsCount() (int, error) {
 	}
 
 	return vtapVifCount, nil
+}
+
+func GetVTapCPUNum() (int, error) {
+	cpuNum := 0
+	if err := metadb.DefaultDB.Table("vtap").Select("Sum(cpu_num)").Scan(&cpuNum).Error; err != nil {
+		return 0, err
+	}
+	return cpuNum, nil
 }

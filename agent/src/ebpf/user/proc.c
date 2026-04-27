@@ -89,12 +89,6 @@ static struct ring *proc_event_ring;
  */
 static volatile u64 java_syms_fetch_delay;	// In seconds.
 
-/*
- * When a process exits, save the symbol cache pids
- * to be deleted.
- */
-static struct symbol_cache_pids pids_cache;
-
 static struct bcc_symbol_option lazy_opt = {
 	.use_debug_file = false,
 	.check_debug_file_crc = false,
@@ -163,14 +157,7 @@ static bool inline enable_proc_info_cache(void)
 
 void free_proc_cache(struct symbolizer_proc_info *p)
 {
-	if (p->is_java) {
-		/* Delete target ns Java files */
-		int pid = (int)p->pid;
-		if (pid > 0) {
-			clean_local_java_symbols_files(pid);
-		}
-	}
-
+	int pid = (int)p->pid;
 	if (p->syms_cache) {
 		bcc_free_symcache((void *)p->syms_cache, p->pid);
 		free_symcache_count++;
@@ -179,6 +166,7 @@ void free_proc_cache(struct symbolizer_proc_info *p)
 	vec_free(p->thread_names);
 	p->thread_names = NULL;
 	p->syms_cache = 0;
+	mount_info_cache_remove(pid, p->mntns_id);
 	clib_mem_free((void *)p);
 }
 
@@ -196,88 +184,16 @@ static void free_symbolizer_cache_kvp(struct symbolizer_cache_kvp *kv)
 	}
 }
 
-static inline void symbol_cache_pids_lock(void)
-{
-	while (__atomic_test_and_set(pids_cache.lock, __ATOMIC_ACQUIRE))
-		CLIB_PAUSE();
-}
-
-static inline void symbol_cache_pids_unlock(void)
-{
-	__atomic_clear(pids_cache.lock, __ATOMIC_RELEASE);
-}
-
-static inline bool is_existed_in_exit_cache(struct symbolizer_cache_kvp *kv)
-{
-	/*
-	 * Make sure that there are no duplicate items of 'pid' in
-	 * 'cache del pids.pid caches', so as to avoid program crashes
-	 * caused by repeated release of occupied memory resources.
-	 */
-	struct symbolizer_cache_kvp *kv_tmp;
-	vec_foreach(kv_tmp, pids_cache.exit_pids_cache) {
-		if ((int)kv_tmp->k.pid == kv->k.pid) {
-			struct symbolizer_proc_info *list_p =
-			    (struct symbolizer_proc_info *)kv_tmp->v.
-			    proc_info_p;
-			struct symbolizer_proc_info *curr_p =
-			    (struct symbolizer_proc_info *)kv->v.proc_info_p;
-			ebpf_warning
-			    (" At list pid %lu kvp_pid %lu info_p 0x%lx (p->cache 0x%lx)"
-			     " curr: pid %lu kvp_pid %lu info_p 0x%lx (p->cache 0x%lx)\n",
-			     (u64) list_p->pid, kv_tmp->k.pid,
-			     kv_tmp->v.proc_info_p,
-			     kv_tmp->v.proc_info_p !=
-			     0 ? list_p->syms_cache : 0, (u64) curr_p->pid,
-			     kv->k.pid, kv->v.proc_info_p,
-			     kv->v.proc_info_p != 0 ? curr_p->syms_cache : 0);
-			return true;
-		}
-	}
-
-	return false;
-}
-
-static inline bool is_existed_in_exec_cache(struct symbolizer_cache_kvp *kv)
-{
-	/*
-	 * Make sure that there are no duplicate items of 'pid' in
-	 * 'cache del pids.pid caches', so as to avoid program crashes
-	 * caused by repeated release of occupied memory resources.
-	 */
-	struct symbolizer_cache_kvp *kv_tmp;
-	vec_foreach(kv_tmp, pids_cache.exec_pids_cache) {
-		if ((int)kv_tmp->k.pid == kv->k.pid) {
-			struct symbolizer_proc_info *list_p =
-			    (struct symbolizer_proc_info *)kv_tmp->v.
-			    proc_info_p;
-			struct symbolizer_proc_info *curr_p =
-			    (struct symbolizer_proc_info *)kv->v.proc_info_p;
-			if (curr_p != 0 && list_p != 0) {
-				ebpf_warning
-				    (" At list pid %lu kvp_pid %lu info_p 0x%lx (p->cache 0x%lx)"
-				     " curr: pid %lu kvp_pid %lu info_p 0x%lx (p->cache 0x%lx)\n",
-				     (u64) list_p->pid, kv_tmp->k.pid,
-				     kv_tmp->v.proc_info_p,
-				     kv_tmp->v.proc_info_p !=
-				     0 ? list_p->syms_cache : 0,
-				     (u64) curr_p->pid, kv->k.pid,
-				     kv->v.proc_info_p,
-				     kv->v.proc_info_p !=
-				     0 ? curr_p->syms_cache : 0);
-			}
-			return true;
-		}
-	}
-
-	return false;
-}
-
 static inline struct symbolizer_proc_info *add_proc_info_to_cache(struct
 								  symbolizer_cache_kvp
 								  *kv)
 {
 	pid_t pid = (pid_t) kv->k.pid;
+	if (kv->v.proc_info_p) {
+		free_symbolizer_cache_kvp(kv);
+		kv->k.pid = pid;
+		kv->v.proc_info_p = 0;
+	}
 	symbol_caches_hash_t *h = &syms_cache_hash;
 	struct symbolizer_proc_info *p = NULL;
 	p = clib_mem_alloc_aligned("sym_proc_info",
@@ -308,26 +224,84 @@ static inline struct symbolizer_proc_info *add_proc_info_to_cache(struct
 		return NULL;
 	} else {
 		__sync_fetch_and_add(&h->hash_elems_count, 1);
+		// Associate mount information when a new process starts.
+		mount_info_cache_add_if_absent(pid, p->mntns_id);
 	}
 
 	return p;
 }
 
-static inline int del_proc_info_from_cache(struct symbolizer_cache_kvp *kv)
+static inline int __del_proc_info_from_cache(struct symbolizer_cache_kvp *kv)
 {
-	free_symbolizer_cache_kvp(kv);
+	symbol_caches_hash_t *h = &syms_cache_hash;
+	if (symbol_caches_hash_search(h, (symbol_caches_hash_kv *) kv,
+				      (symbol_caches_hash_kv *) kv) == 0) {
+		struct symbolizer_proc_info *p;
+		p = (struct symbolizer_proc_info *)kv->v.proc_info_p;
+		if (p != NULL) {
+			AO_INC(&p->use);
+			p->is_exit = 1;
+			AO_DEC(&p->use);
+		}
+
+		if (symbol_caches_hash_add_del
+		    (h, (symbol_caches_hash_kv *) kv, 0 /* delete */ )) {
+			ebpf_warning("failed.(pid %d)\n", (pid_t) kv->k.pid);
+			return -1;
+		} else {
+			__sync_fetch_and_add(&h->hash_elems_count, -1);
+			if (p)
+				free_symbolizer_cache_kvp(kv);
+			return 0;
+		}
+	} else {
+		ebpf_debug
+		    ("The process with PID %d does not exist in the cache."
+		     " Failed to clean up process information.\n", kv->k.pid);
+	}
+
+	return -1;
+}
+
+static int del_proc_info_from_cache(struct symbolizer_cache_kvp *kv)
+{
+	/*
+	 * Note that the entry has already been removed from the hash cache before
+	 * calling del_proc_info_from_cache(). This step performs cleanup of the associated data.
+	 */
+	pid_t pid = (pid_t) kv->k.pid;
+	if (kv->v.proc_info_p) {
+		free_symbolizer_cache_kvp(kv);
+		kv->k.pid = pid;
+		kv->v.proc_info_p = 0;
+	}
+
+	/*
+	 * To prevent a scenario where Process A exits and Process B starts immediately
+	 * afterward using the same PID — and then Process B also exits — we perform an
+	 * extra safety check here.
+	 */
+	__del_proc_info_from_cache(kv);
 	return 0;
 }
 
-int get_cid_and_name_from_cache(pid_t pid, uint8_t *cid, int cid_size,
-				uint8_t *name, int name_size)
+int get_proc_info_from_cache(pid_t pid, uint8_t * cid, int cid_size,
+			     uint8_t * name, int name_size, int mnt_id,
+			     uint32_t mntns_id, uint32_t *self_mntns_id,
+			     kern_dev_t s_dev, char *mount_point,
+			     char *mount_source, char *root,
+			     int mount_size, fs_type_t *file_type)
 {
+	int ret = -1;
 	symbol_caches_hash_t *h = &syms_cache_hash;
 	struct symbolizer_cache_kvp kv;
 	kv.k.pid = (u64) pid;
 	kv.v.proc_info_p = 0;
+	*self_mntns_id = 0;
 	memset(cid, 0, cid_size);
 	memset(name, 0, name_size);
+	memset(mount_point, 0, mount_size);
+	memset(mount_source, 0, mount_size);
 	struct symbolizer_proc_info *p = NULL;
 	if (symbol_caches_hash_search(h, (symbol_caches_hash_kv *) & kv,
 				      (symbol_caches_hash_kv *) & kv) == 0) {
@@ -342,11 +316,17 @@ int get_cid_and_name_from_cache(pid_t pid, uint8_t *cid, int cid_size,
 			memcpy_s_inline((void *)name, name_size, p->comm,
 					sizeof(p->comm));
 		}
+		*self_mntns_id = p->mntns_id;
 		AO_DEC(&p->use);
-		return 0;
+		ret = 0;
 	}
 
-	return -1;
+	if (s_dev != DEV_INVALID) {
+		get_mount_info(pid, mnt_id, mntns_id, s_dev, mount_point,
+			       mount_source, root, mount_size, file_type);
+	}
+
+	return ret;
 }
 
 static inline int add_proc_ev_info_to_ring(enum proc_act_type type,
@@ -364,12 +344,44 @@ static inline int add_proc_ev_info_to_ring(enum proc_act_type type,
 				       NULL);
 	if (nr < 1) {
 		clib_mem_free(ev_info);
-		ebpf_info("Failed to add process %d to the queue, so it "
-			  "was added to the vector instead.\n", kv->k.pid);
 		return -1;
 	}
 
 	return 0;
+}
+
+static void add_proc_event_to_queue(pid_t pid, enum proc_act_type type)
+{
+	symbol_caches_hash_t *h = &syms_cache_hash;
+	struct symbolizer_cache_kvp kv = {};
+	kv.k.pid = (u64) pid;
+	kv.v.proc_info_p = 0;
+	if (type == PROC_EXEC) {
+		__sync_fetch_and_add(&proc_exec_event_count, 1);
+	} else {
+		__sync_fetch_and_add(&proc_exit_event_count, 1);
+	}
+
+	if (symbol_caches_hash_search(h, (symbol_caches_hash_kv *) & kv,
+				      (symbol_caches_hash_kv *) & kv) == 0) {
+		struct symbolizer_proc_info *p;
+		p = (struct symbolizer_proc_info *)kv.v.proc_info_p;
+		if (p != NULL) {
+			AO_INC(&p->use);
+			p->is_exit = 1;
+			AO_DEC(&p->use);
+		}
+
+		if (symbol_caches_hash_add_del
+		    (h, (symbol_caches_hash_kv *) & kv, 0 /* delete */ )) {
+			ebpf_warning("failed.(pid %d)\n", (pid_t) kv.k.pid);
+			return;
+		} else {
+			__sync_fetch_and_add(&h->hash_elems_count, -1);
+		}
+	}
+
+	add_proc_ev_info_to_ring(type, &kv);
 }
 
 /*
@@ -386,70 +398,13 @@ void update_proc_info_cache(pid_t pid, enum proc_act_type type)
 		return;
 	}
 
-	symbol_caches_hash_t *h = &syms_cache_hash;
-	struct symbolizer_cache_kvp kv = {};
-	kv.k.pid = (u64) pid;
-	kv.v.proc_info_p = 0;
-
-	if (type == PROC_EXEC) {
-		__sync_fetch_and_add(&proc_exec_event_count, 1);
-		if (add_proc_ev_info_to_ring(type, &kv) < 0) {
-			int ret = VEC_OK;
-			symbol_cache_pids_lock();
-			if (is_existed_in_exec_cache(&kv)) {
-				symbol_cache_pids_unlock();
-				return;
-			}
-
-			vec_add1(pids_cache.exec_pids_cache, kv, ret);
-			if (ret != VEC_OK) {
-				ebpf_warning("vec add failed.\n");
-			}
-			symbol_cache_pids_unlock();
-		}
-	} else
-		__sync_fetch_and_add(&proc_exit_event_count, 1);
-
-	if (symbol_caches_hash_search(h, (symbol_caches_hash_kv *) & kv,
-				      (symbol_caches_hash_kv *) & kv) == 0) {
-		int ret = VEC_OK;
-		struct symbolizer_proc_info *p;
-		p = (struct symbolizer_proc_info *)kv.v.proc_info_p;
-		if (p != NULL) {
-			AO_INC(&p->use);
-			p->is_exit = 1;
-			AO_DEC(&p->use);
-			CLIB_MEMORY_STORE_BARRIER();
-		}
-		if (add_proc_ev_info_to_ring(type, &kv) < 0) {
-			symbol_cache_pids_lock();
-			if (is_existed_in_exit_cache(&kv)) {
-				symbol_cache_pids_unlock();
-				return;
-			}
-
-			vec_add1(pids_cache.exit_pids_cache, kv, ret);
-			if (ret != VEC_OK) {
-				ebpf_warning("vec add failed.\n");
-			}
-			symbol_cache_pids_unlock();
-		}
-
-		if (symbol_caches_hash_add_del
-		    (h, (symbol_caches_hash_kv *) & kv, 0 /* delete */ )) {
-			ebpf_warning("failed.(pid %d)\n", (pid_t) kv.k.pid);
-			return;
-		} else {
-			__sync_fetch_and_add(&h->hash_elems_count, -1);
-		}
-	}
+	add_proc_event_to_queue(pid, type);
 }
 
 void exec_proc_info_cache_update(void)
 {
-	struct symbolizer_cache_kvp *kv;
 	if (proc_event_ring == NULL)
-		goto vector_handle;
+		return;
 	int nr;
 	void *rx_burst[MAX_EVENTS_BURST];
 	do {
@@ -467,40 +422,10 @@ void exec_proc_info_cache_update(void)
 			clib_mem_free(ev_info);
 		}
 	} while (nr > 0);
-
-vector_handle:
-	symbol_cache_pids_lock();
-	vec_foreach(kv, pids_cache.exit_pids_cache) {
-		del_proc_info_from_cache(kv);
-	}
-	vec_free(pids_cache.exit_pids_cache);
-
-	vec_foreach(kv, pids_cache.exec_pids_cache) {
-		add_proc_info_to_cache(kv);
-	}
-	vec_free(pids_cache.exec_pids_cache);
-
-	symbol_cache_pids_unlock();
 }
 
 static int init_symbol_cache(const char *name)
 {
-	/*
-	 * Thread-safe for pids_cache.pids
-	 */
-	pids_cache.lock =
-	    clib_mem_alloc_aligned("pids_alloc_lock",
-				   CLIB_CACHE_LINE_BYTES,
-				   CLIB_CACHE_LINE_BYTES, NULL);
-	if (pids_cache.lock == NULL) {
-		ebpf_error("pids_cache.lock alloc memory failed.\n");
-		return (-1);
-	}
-
-	pids_cache.lock[0] = 0;
-	pids_cache.exit_pids_cache = NULL;
-	pids_cache.exec_pids_cache = NULL;
-
 	symbol_caches_hash_t *h = &syms_cache_hash;
 	memset(h, 0, sizeof(*h));
 	u32 nbuckets = SYMBOLIZER_CACHES_HASH_BUCKETS_NUM;
@@ -546,7 +471,8 @@ static int config_symbolizer_proc_info(struct symbolizer_proc_info *p, int pid)
 	p->thread_names_lock = 0;
 	p->netns_id = get_netns_id_from_pid(pid);
 
-	fetch_container_id_from_proc(pid, p->container_id, sizeof(p->container_id));
+	fetch_container_id_from_proc(pid, p->container_id,
+				     sizeof(p->container_id));
 
 	p->stime = (u64) get_process_starttime_and_comm(pid,
 							p->comm,
@@ -567,6 +493,8 @@ static int config_symbolizer_proc_info(struct symbolizer_proc_info *p, int pid)
 		p->verified = false;
 	}
 
+	get_mount_ns_id(pid, &p->mntns_id);
+	mount_info_cache_add_if_absent(pid, p->mntns_id);
 	p->use = 1;
 
 	return ETR_OK;
@@ -787,10 +715,13 @@ void *get_symbol_cache(pid_t pid, bool new_cache)
 				 * for each java process's delay.
 				 * The same applies to non-Java processes, which also perform
 				 * random symbol table loading within one minute.
+				 * Do not add delay for agent itself.
 				 */
-				p->update_syms_table_time +=
-				    generate_random_integer
-				    (PROFILER_DEFER_RANDOM_MAX);
+				if (pid != getpid()) {
+					p->update_syms_table_time +=
+						generate_random_integer
+						(PROFILER_DEFER_RANDOM_MAX);
+				}
 			}
 
 			if (p->update_syms_table_time > 0
@@ -830,6 +761,9 @@ void *get_symbol_cache(pid_t pid, bool new_cache)
 
 int create_and_init_proc_info_caches(void)
 {
+	// Initialize the mount information cache.
+	mount_info_cache_init("mount-info-cache");
+
 	/*
 	 * Building a 'proc_event_ring' for handling process events.
 	 * Enabling a multi-producer, single-consumer (MPSC) model.
@@ -896,6 +830,89 @@ int create_and_init_proc_info_caches(void)
 
 	closedir(fddir);
 	return ETR_OK;
+}
+
+struct symbolizer_cache_kvp *clear_procs;
+struct mntns_pid_s {
+	pid_t pid;
+	u64 mntns_id;
+};
+struct mntns_pid_s *mntns_id_list;
+static inline void insert_mntns_vecs(struct mntns_pid_s *mp)
+{
+	struct mntns_pid_s *m;
+	vec_foreach(m, mntns_id_list) {
+		if (m->mntns_id == mp->mntns_id)
+			return;
+	}
+
+	int ret = VEC_OK;
+	vec_add1(mntns_id_list, *mp, ret);
+	if (ret != VEC_OK) {
+		ebpf_warning("vec add failed.\n");
+	}
+}
+
+static int check_proc_kvp_cb(symbol_caches_hash_kv * kvp, void *ctx)
+{
+	struct symbolizer_cache_kvp *kv = (struct symbolizer_cache_kvp *)kvp;
+	pid_t pid = 0;
+	bool del_proc = false;
+	struct symbolizer_proc_info *p = NULL;
+	if (kv->v.proc_info_p) {
+		p = (struct symbolizer_proc_info *)kv->v.proc_info_p;
+		AO_INC(&p->use);
+		pid = p->pid;
+		if ((p->stime == 0) ||
+		    (p->stime != 0 && p->stime != get_process_starttime(pid))) {
+			p->is_exit = 1;
+			del_proc = true;
+		}
+		AO_DEC(&p->use);
+	}
+
+	if (p) {
+		int ret = VEC_OK;
+		if (del_proc) {
+			vec_add1(clear_procs, *kv, ret);
+			if (ret != VEC_OK) {
+				ebpf_warning("vec add failed.\n");
+			}
+		}
+		struct mntns_pid_s mp;
+		mp.pid = p->pid;
+		mp.mntns_id = p->mntns_id;
+		insert_mntns_vecs(&mp);
+	}
+
+	(*(u64 *) ctx)++;
+	return BIHASH_WALK_CONTINUE;
+}
+
+void check_and_update_proc_info(bool output_log)
+{
+	u64 elems_count = 0, clear_count = 0;
+	struct symbolizer_cache_kvp *kv;
+	symbol_caches_hash_t *h = &syms_cache_hash;
+	symbol_caches_hash_foreach_key_value_pair(h,
+						  check_proc_kvp_cb,
+						  (void *)&elems_count);
+	vec_foreach(kv, clear_procs) {
+		if (__del_proc_info_from_cache(kv) == 0)
+			clear_count++;
+	}
+	vec_free(clear_procs);
+
+	struct mntns_pid_s *m;
+	vec_foreach(m, mntns_id_list) {
+		check_and_cleanup_mount_info(m->pid, m->mntns_id);
+	}
+	vec_free(mntns_id_list);
+
+	if (clear_count > 0 || output_log)
+		ebpf_info("Checked %d entries in the process cache and "
+			  "cleaned up %d invalid process records.\n",
+			  elems_count, clear_count);
 }
 
 static int __unused free_symbolizer_kvp_cb(symbol_caches_hash_kv * kv,
@@ -996,11 +1013,24 @@ void update_proc_info_cache(pid_t pid, enum proc_act_type type)
 	return;
 }
 
-int get_cid_and_name_from_cache(pid_t pid, uint8_t *cid, int cid_size,
-				uint8_t *name, int name_size)
+void check_and_update_proc_info(bool output_log)
 {
+}
+
+int get_proc_info_from_cache(pid_t pid, uint8_t * cid, int cid_size,
+			     uint8_t * name, int name_size, int mnt_id,
+			     uint32_t mntns_id, uint32_t *self_mntns_id,
+			     kern_dev_t s_dev, char *mount_point,
+			     char *mount_source, char *root, int mount_size,
+			     fs_type_t *file_type)
+{
+	*self_mntns_id = 0;
 	memset(cid, 0, cid_size);
 	memset(name, 0, name_size);
+	memset(mount_point, 0, mount_size);
+	memset(mount_source, 0, mount_size);
+	memset(root, 0, mount_size);
+	*file_type = FS_TYPE_UNKNOWN;
 	return -1;
 }
 
@@ -1070,7 +1100,10 @@ void add_event_to_proc_list(proc_event_list_t * list, struct bpf_tracer *tracer,
 	event->pid = pid;
 	event->stime = get_process_starttime(pid);
 	event->path = path;
-	event->expire_time = get_sys_uptime() + PROC_EVENT_HANDLE_DELAY;
+	event->expire_time = get_sys_uptime();
+	if (pid != getpid()) {
+	    event->expire_time += PROC_EVENT_HANDLE_DELAY;
+	}
 
 	pthread_mutex_lock(&list->m);
 	list_add_tail(&event->list, &list->head);
@@ -1262,8 +1295,14 @@ int add_probe_sym_to_tracer_probes(int pid, const char *path,
 		 * address to a physical address.
 		 * For shared library binary files (ET_DYN), no conversion is needed.
 		 * ref: https://refspecs.linuxbase.org/elf/gabi4+/ch5.pheader.html
+		 *
+		 * ET_DYN indicates a position-independent loadable file.
+		 * It can be either a shared library (.so) or a PIE (Position Independent Executable).
+		 * - PIE executables use random load addresses (ASLR) for better security (modern default).
+		 * - Shared libraries are also ET_DYN but usually lack the executable bit.
+		 *   To distinguish between them, check if the file has executable permissions.
 		 */
-		if (bcc_elf_get_type(probe_sym->binary_path) == ET_EXEC) {
+		if (bcc_elf_is_exe(probe_sym->binary_path)) {
 			struct load_addr_t addr = {
 				.target_addr = probe_sym->entry,
 				.binary_addr = 0x0,
@@ -1276,6 +1315,7 @@ int add_probe_sym_to_tracer_probes(int pid, const char *path,
 			if (!addr.binary_addr) {
 				goto invalid;
 			}
+
 			probe_sym->entry = addr.binary_addr;
 		}
 

@@ -36,6 +36,7 @@ import (
 	"github.com/deepflowio/deepflow/server/ingester/ingesterctl"
 	"github.com/deepflowio/deepflow/server/libs/debug"
 	"github.com/deepflowio/deepflow/server/libs/logger"
+	"github.com/deepflowio/deepflow/server/mcp"
 	"github.com/deepflowio/deepflow/server/querier/querier"
 
 	logging "github.com/op/go-logging"
@@ -106,7 +107,9 @@ func main() {
 
 	shared := common.NewControllerIngesterShared()
 
-	go controller.Start(ctx, *configPath, cfg.LogFile, shared)
+	go mcp.NewMCPServer(*configPath).Start()
+
+	go controller.Start(ctx, Revision, *configPath, cfg.LogFile, shared)
 
 	go querier.Start(*configPath, cfg.LogFile, shared)
 	closers := ingester.Start(*configPath, shared)

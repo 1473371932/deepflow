@@ -25,7 +25,27 @@ import (
 	rcommon "github.com/deepflowio/deepflow/server/controller/recorder/common"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
+
+// VRouterMessageFactory VRouter资源的消息工厂
+type VRouterMessageFactory struct{}
+
+func (f *VRouterMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedVRouters{}
+}
+
+func (f *VRouterMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedVRouter{}
+}
+
+func (f *VRouterMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedVRouters{}
+}
+
+func (f *VRouterMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedVRouterFields{}
+}
 
 type VRouter struct {
 	UpdaterBase[
@@ -33,36 +53,12 @@ type VRouter struct {
 		*diffbase.VRouter,
 		*metadbmodel.VRouter,
 		metadbmodel.VRouter,
-		*message.VRouterAdd,
-		message.VRouterAdd,
-		message.AddNoneAddition,
-		*message.VRouterUpdate,
-		message.VRouterUpdate,
-		*message.VRouterFieldsUpdate,
-		message.VRouterFieldsUpdate,
-		*message.VRouterDelete,
-		message.VRouterDelete,
-		message.DeleteNoneAddition]
+	]
 }
 
 func NewVRouter(wholeCache *cache.Cache, cloudData []cloudmodel.VRouter) *VRouter {
 	updater := &VRouter{
-		newUpdaterBase[
-			cloudmodel.VRouter,
-			*diffbase.VRouter,
-			*metadbmodel.VRouter,
-			metadbmodel.VRouter,
-			*message.VRouterAdd,
-			message.VRouterAdd,
-			message.AddNoneAddition,
-			*message.VRouterUpdate,
-			message.VRouterUpdate,
-			*message.VRouterFieldsUpdate,
-			message.VRouterFieldsUpdate,
-			*message.VRouterDelete,
-			message.VRouterDelete,
-			message.DeleteNoneAddition,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_VROUTER_EN,
 			wholeCache,
 			db.NewVRouter().SetMetadata(wholeCache.GetMetadata()),
@@ -70,13 +66,13 @@ func NewVRouter(wholeCache *cache.Cache, cloudData []cloudmodel.VRouter) *VRoute
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
-	return updater
-}
+	updater.setDataGenerator(updater)
 
-func (r *VRouter) getDiffBaseByCloudItem(cloudItem *cloudmodel.VRouter) (diffBase *diffbase.VRouter, exists bool) {
-	diffBase, exists = r.diffBaseData[cloudItem.Lcuuid]
-	return
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &VRouterMessageFactory{})
+	}
+
+	return updater
 }
 
 func (r *VRouter) generateDBItemToAdd(cloudItem *cloudmodel.VRouter) (*metadbmodel.VRouter, bool) {
@@ -93,7 +89,7 @@ func (r *VRouter) generateDBItemToAdd(cloudItem *cloudmodel.VRouter) (*metadbmod
 		Label:          cloudItem.Label,
 		State:          rcommon.VROUTER_STATE_RUNNING,
 		GWLaunchServer: cloudItem.GWLaunchServer,
-		Domain:         r.metadata.Domain.Lcuuid,
+		Domain:         r.metadata.GetDomainLcuuid(),
 		Region:         cloudItem.RegionLcuuid,
 		VPCID:          vpcID,
 	}
@@ -101,8 +97,8 @@ func (r *VRouter) generateDBItemToAdd(cloudItem *cloudmodel.VRouter) (*metadbmod
 	return dbItem, true
 }
 
-func (r *VRouter) generateUpdateInfo(diffBase *diffbase.VRouter, cloudItem *cloudmodel.VRouter) (*message.VRouterFieldsUpdate, map[string]interface{}, bool) {
-	structInfo := new(message.VRouterFieldsUpdate)
+func (r *VRouter) generateUpdateInfo(diffBase *diffbase.VRouter, cloudItem *cloudmodel.VRouter) (types.UpdatedFields, map[string]interface{}, bool) {
+	structInfo := new(message.UpdatedVRouterFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.VPCLcuuid != cloudItem.VPCLcuuid {
 		vpcID, exists := r.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.VPCLcuuid)

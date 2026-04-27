@@ -21,7 +21,7 @@ use std::sync::{
 };
 
 use ahash::AHashMap;
-use log::{debug, info, warn};
+use log::{debug, info};
 use pnet::datalink;
 use public::enums::IpProtocol;
 
@@ -366,7 +366,7 @@ impl Policy {
         // TODO：可能也需要走fast提升性能
         let endpoints = self
             .labeler
-            .get_endpoint_data_by_epc(src, dst, l3_epc_id_src, 0);
+            .get_endpoint_data_by_epc(src, dst, l3_epc_id_src, 0, false);
         self.send_ebpf(
             src,
             dst,
@@ -408,6 +408,7 @@ impl Policy {
             key.dst_ip,
             l3_epc_id_0,
             l3_epc_id_1,
+            key.l2_end_0,
         ) {
             let entry = self.lookup_gpid_entry(key, &endpoints);
             self.send_ebpf(
@@ -422,9 +423,13 @@ impl Policy {
             return (endpoints, entry);
         }
 
-        let endpoints =
-            self.labeler
-                .get_endpoint_data_by_epc(key.src_ip, key.dst_ip, l3_epc_id_0, l3_epc_id_1);
+        let endpoints = self.labeler.get_endpoint_data_by_epc(
+            key.src_ip,
+            key.dst_ip,
+            l3_epc_id_0,
+            l3_epc_id_1,
+            key.l2_end_0,
+        );
         let endpoints = self.table.endpoint_fast_add(
             table_type,
             key.src_ip,
@@ -472,17 +477,30 @@ impl Policy {
         self.labeler.update_peer_table(peers);
     }
 
-    pub fn update_cidr(&mut self, cidrs: &Vec<Arc<Cidr>>) {
+    pub fn update_cidr(
+        &mut self,
+        cidrs: &Vec<Arc<Cidr>>,
+        enabled_invalid_log: bool,
+        has_invalid_log: &mut bool,
+    ) {
         self.table.update_cidr(cidrs);
-        self.labeler.update_cidr_table(cidrs);
+        self.labeler
+            .update_cidr_table(cidrs, enabled_invalid_log, has_invalid_log);
     }
 
     pub fn update_container(&mut self, cidrs: &Vec<Arc<Container>>) {
         self.labeler.update_container(cidrs);
     }
 
-    pub fn update_acl(&mut self, acls: &Vec<Arc<Acl>>, check: bool) -> PResult<()> {
-        self.table.update_acl(acls, check)?;
+    pub fn update_acl(
+        &mut self,
+        acls: &Vec<Arc<Acl>>,
+        check: bool,
+        enabled_invalid_log: bool,
+        has_invalid_log: &mut bool,
+    ) -> PResult<()> {
+        self.table
+            .update_acl(acls, check, enabled_invalid_log, has_invalid_log)?;
 
         self.acls = acls.clone();
 
@@ -549,7 +567,7 @@ impl Policy {
         for gpid_entry in gpid_entries.iter() {
             let protocol = u8::from(gpid_entry.protocol) as usize;
             if protocol >= table.len() {
-                warn!("Invalid protocol {:?} in {:?}", protocol, &gpid_entry);
+                debug!("Invalid protocol {:?} in {:?}", protocol, &gpid_entry);
                 continue;
             }
 
@@ -674,6 +692,8 @@ impl FlowAclListener for PolicySetter {
         peers: &Vec<Arc<PeerConnection>>,
         cidrs: &Vec<Arc<Cidr>>,
         acls: &Vec<Arc<Acl>>,
+        enabled_invalid_log: bool,
+        has_invalid_log: &mut bool,
     ) -> Result<(), String> {
         self.update_local_epc(
             local_epc,
@@ -682,8 +702,8 @@ impl FlowAclListener for PolicySetter {
         self.update_interfaces(agent_type, platform_data);
         self.update_ip_group(ip_groups);
         self.update_peer_connections(peers);
-        self.update_cidr(cidrs);
-        if let Err(e) = self.update_acl(acls, true) {
+        self.update_cidr(cidrs, enabled_invalid_log, has_invalid_log);
+        if let Err(e) = self.update_acl(acls, true, enabled_invalid_log, has_invalid_log) {
             return Err(format!("{}", e));
         }
 
@@ -723,16 +743,29 @@ impl PolicySetter {
         self.policy().update_peer_connections(peers);
     }
 
-    pub fn update_cidr(&mut self, cidrs: &Vec<Arc<Cidr>>) {
-        self.policy().update_cidr(cidrs);
+    pub fn update_cidr(
+        &mut self,
+        cidrs: &Vec<Arc<Cidr>>,
+        enabled_invalid_log: bool,
+        has_invalid_log: &mut bool,
+    ) {
+        self.policy()
+            .update_cidr(cidrs, enabled_invalid_log, has_invalid_log);
     }
 
     pub fn update_container(&mut self, containers: &Vec<Arc<Container>>) {
         self.policy().update_container(containers);
     }
 
-    pub fn update_acl(&mut self, acls: &Vec<Arc<Acl>>, check: bool) -> PResult<()> {
-        self.policy().update_acl(acls, check)?;
+    pub fn update_acl(
+        &mut self,
+        acls: &Vec<Arc<Acl>>,
+        check: bool,
+        enabled_invalid_log: bool,
+        has_invalid_log: &mut bool,
+    ) -> PResult<()> {
+        self.policy()
+            .update_acl(acls, check, enabled_invalid_log, has_invalid_log)?;
 
         Ok(())
     }
@@ -801,7 +834,7 @@ mod test {
             ..Default::default()
         };
         setter.update_interfaces(AgentType::TtHostPod, &vec![Arc::new(interface)]);
-        setter.update_cidr(&vec![Arc::new(cidr)]);
+        setter.update_cidr(&vec![Arc::new(cidr)], false, &mut false);
         setter.flush();
 
         let mut key = LookupKey {

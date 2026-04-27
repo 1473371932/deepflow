@@ -20,9 +20,12 @@
 #include <sched.h>
 #include <sys/prctl.h>
 #include <arpa/inet.h>
+#include <signal.h>
+#include <sys/stat.h>
 #include <bcc/perf_reader.h>
 #include <linux/version.h>
 #include "clib.h"
+#include "config.h"
 #include "symbol.h"
 #include "proc.h"
 #include "tracer.h"
@@ -40,6 +43,7 @@
 #include "perf_reader.h"
 #include "common_utils.h"
 #include "extended/extended.h"
+#include "trace_utils.h"
 
 #include "socket_trace_bpf_common.c"
 #include "socket_trace_bpf_3_10_0.c"
@@ -50,9 +54,12 @@
 #include "socket_trace_bpf_kprobe.c"
 
 static enum linux_kernel_type g_k_type;
+static bool use_kfunc_bin;		// Whether to use fentry/fexit binary eBPF bytecode
 static struct list_head events_list;	// Use for extra register events
 static pthread_t proc_events_pthread;	// Process exec/exit thread
-static bool kprobe_feature_disable;	// Whether to enable the kprobe feature.
+static bool kprobe_feature_disable;	// Whether to disable the kprobe feature?
+static bool unix_socket_feature_enable; // Whether to enable the kprobe feature?
+static bool virtual_file_collect_enable; // Whether to enable virtual file collect?
 /*
  * Control whether to disable the tracing feature.
  * 'true' disables the tracing feature, and 'false' enables it.
@@ -99,6 +106,8 @@ static uint64_t datadump_seq;
 static uint32_t datadump_timeout;
 static char datadump_comm[16];	// If null, process or thread name filtering is not performed.
 static uint8_t datadump_proto;
+static uint16_t datadump_port;
+static char datadump_ipaddr[ADDRSTRLEN];
 static char datadump_file_path[DATADUMP_FILE_PATH_SIZE];
 static FILE *datadump_file;
 static pthread_mutex_t datadump_mutex;
@@ -122,6 +131,7 @@ static uint64_t io_event_minimal_duration = 1000000;
 static uint32_t conf_socket_map_max_reclaim;
 
 struct bpf_tracer *g_tracer;
+bpf_offset_param_t g_kern_offsets;
 
 /*
  * The table for L7 protocol filtering ports.
@@ -136,6 +146,7 @@ extern uint64_t sys_boot_time_ns;
 extern uint64_t prev_sys_boot_time_ns;
 
 extern uint64_t adapt_kern_uid;
+extern int bpf_raw_tracepoint_open(const char *name, int prog_fd);
 
 static bool bpf_stats_map_collect(struct bpf_tracer *tracer,
 				  struct trace_stats *stats_total);
@@ -148,7 +159,8 @@ static bool bpf_stats_map_update(struct bpf_tracer *tracer,
 				 int conflict_count,
 				 int max_delay,
 				 int total_time, int event_count);
-extern int bpf_raw_tracepoint_open(const char *name, int prog_fd);
+static void save_kern_offsets(struct bpf_tracer *t);
+static void display_kern_offsets(bpf_offset_param_t *offset);
 static bool fentry_try_attach(const char *fn)
 {
 	int prog_fd, attach_fd;
@@ -265,7 +277,6 @@ static void config_probes_for_kfunc(struct tracer_probes_conf *tps)
 	kfunc_set_sym_for_entry_and_exit(tps, "ksys_write");
 	kfunc_set_sym_for_entry_and_exit(tps, "ksys_read");
 	kfunc_set_sym_for_entry_and_exit(tps, "__sys_sendto");
-	kfunc_set_sym_for_entry_and_exit(tps, "__sys_recvfrom");
 	kfunc_set_sym_for_entry_and_exit(tps, "__sys_sendmsg");
 	kfunc_set_sym_for_entry_and_exit(tps, "__sys_sendmmsg");
 	kfunc_set_sym_for_entry_and_exit(tps, "__sys_recvmsg");
@@ -284,14 +295,20 @@ static void config_probes_for_kfunc(struct tracer_probes_conf *tps)
 
 	/*
 	 * On certain kernels, such as 5.15.0-127-generic and 5.10.134-18.al8.x86_64,
-	 * `recvmmsg()` probes of type `kprobe`/`kfunc` may not work properly. To address
+	 * `recvmmsg()/recvfrom()` probes of type `kprobe`/`kfunc` may not work properly. To address
 	 * this, we use the more stable `tracepoint`-based probe instead.
 	 */
+	tps_set_symbol(tps, "tracepoint/syscalls/sys_enter_recvfrom");
+	tps_set_symbol(tps, "tracepoint/syscalls/sys_exit_recvfrom");	
 	tps_set_symbol(tps, "tracepoint/syscalls/sys_enter_recvmmsg");
 	tps_set_symbol(tps, "tracepoint/syscalls/sys_exit_recvmmsg");
 
 	// Periodic trigger for timeout checks on cached data
 	tps_set_symbol(tps, "tracepoint/syscalls/sys_enter_getppid");
+
+	// If file I/O event collection is not enabled, hook installation will be skipped
+	if (io_event_collect_mode == IO_EVENT_COLLECT_DISABLE)
+		return;
 
         // file R/W probes
 	tps_set_symbol(tps, "tracepoint/syscalls/sys_enter_pread64");
@@ -373,7 +390,11 @@ static void config_probes_for_kprobe_and_tracepoint(struct tracer_probes_conf
 
 	// Periodic trigger for timeout checks on cached data
 	tps_set_symbol(tps, "tracepoint/syscalls/sys_enter_getppid");
-	
+
+	// If file I/O event collection is not enabled, hook installation will be skipped
+	if (io_event_collect_mode == IO_EVENT_COLLECT_DISABLE)
+		return;
+
         // file R/W probes
 	tps_set_symbol(tps, "tracepoint/syscalls/sys_enter_pread64");
 	tps_set_symbol(tps, "tracepoint/syscalls/sys_enter_preadv");
@@ -420,10 +441,12 @@ static void config_probes_for_kprobe(struct tracer_probes_conf *tps)
 	probes_set_symbol(tps, "__sys_sendmmsg");
 	probes_set_symbol(tps, "__sys_recvmsg");
 	probes_set_symbol(tps, "__sys_recvmmsg");
-	probes_set_symbol(tps, "ksys_pread64");
-	probes_set_symbol(tps, "do_preadv");
-	probes_set_symbol(tps, "ksys_pwrite64");
-	probes_set_symbol(tps, "do_pwritev");
+	if (io_event_collect_mode != IO_EVENT_COLLECT_DISABLE) {
+		probes_set_symbol(tps, "ksys_pread64");
+		probes_set_symbol(tps, "do_preadv");
+		probes_set_symbol(tps, "ksys_pwrite64");
+		probes_set_symbol(tps, "do_pwritev");
+	}
 
 	if (k_version == KERNEL_VERSION(3, 10, 0)) {
 		/*
@@ -679,6 +702,42 @@ static int socktrace_sockopt_get(sockoptid_t opt, const void *conf, size_t size,
 	struct bpf_offset_param_array *array = &params->offset_array;
 	array->count = sys_cpus_count;
 
+	// Fetch socket Information from eBPF map
+	struct ebpf_map *map =
+	    ebpf_obj__get_map_by_name(t->obj, MAP_SOCKET_INFO_NAME);
+	if (map == NULL) {
+		ebpf_warning("[%s] map(name:%s) is NULL.\n", __func__,
+			     MAP_SOCKET_INFO_NAME);
+	}
+	int map_fd = map->fd;
+	struct socktrace_msg *msg = (struct socktrace_msg *)conf;
+	if (size != sizeof(*msg)) {
+		ebpf_warning("The parameter 'socktrace_msg' is passed"
+			     "incorrectly with a size mismatch. The passed"
+			     " size is %d, while the actual structure length"
+			     " is %d.\n", size, sizeof(*msg));
+		return -1;
+	}
+	uint64_t conn_key = (uint64_t)msg->pid << 32 | msg->fd;
+	struct socket_info_s info;
+	if (bpf_lookup_elem(map_fd, &conn_key, &info) == 0) {
+		params->socket_id = info.uid;
+		params->seq = info.seq;
+		params->l7_proto = info.l7_proto;
+		params->data_source = info.data_source;
+		params->direction = info.direction;
+		params->pre_direction = info.pre_direction;
+		params->is_tls = info.is_tls;
+		params->peer_fd = info.peer_fd;
+		params->prev_data_len = info.prev_data_len;
+		params->allow_reassembly = info.allow_reassembly;
+		params->finish_reasm = info.finish_reasm;
+		params->force_reasm = info.force_reasm;
+		params->no_trace = info.no_trace;
+		params->reasm_bytes = info.reasm_bytes;
+		params->update_time = info.update_time;
+	}
+
 	params->kern_socket_map_max = conf_max_socket_entries;
 	params->kern_trace_map_max = conf_max_trace_entries;
 	params->tracer_state = t->state;
@@ -687,6 +746,7 @@ static int socktrace_sockopt_get(sockoptid_t opt, const void *conf, size_t size,
 	params->datadump_enable = datadump_enable;
 	params->datadump_pid = datadump_pid;
 	params->datadump_proto = datadump_proto;
+	params->datadump_port = datadump_port;
 
 	params->proc_exec_event_count = get_proc_exec_event_count();
 	params->proc_exit_event_count = get_proc_exit_event_count();
@@ -695,6 +755,7 @@ static int socktrace_sockopt_get(sockoptid_t opt, const void *conf, size_t size,
 		      sizeof(params->datadump_file_path),
 		      (void *)datadump_file_path, sizeof(datadump_file_path));
 	memcpy(params->datadump_comm, datadump_comm, sizeof(datadump_comm));
+	memcpy(params->datadump_ipaddr, datadump_ipaddr, sizeof(datadump_ipaddr));
 	pthread_mutex_unlock(&datadump_mutex);
 
 	struct trace_stats stats_total;
@@ -729,10 +790,14 @@ static int datadump_sockopt_set(sockoptid_t opt, const void *conf, size_t size)
 	if (msg->is_params) {
 		datadump_pid = msg->pid;
 		datadump_proto = msg->proto;
+		datadump_port = msg->port;
 		safe_buf_copy(datadump_comm, sizeof(datadump_comm),
 			      (void *)msg->comm, sizeof(msg->comm));
-		ebpf_info("Set datadump pid %d comm %s proto %d\n",
-			  datadump_pid, datadump_comm, datadump_proto);
+		safe_buf_copy(datadump_ipaddr, sizeof(datadump_ipaddr),
+			      (void *)msg->ipaddr, sizeof(msg->ipaddr));
+		ebpf_info("Set datadump pid %d comm %s proto %d ip %s port %d\n",
+			  datadump_pid, datadump_comm, datadump_proto,
+			  datadump_ipaddr, datadump_port);
 	} else {
 		if (!datadump_enable && msg->enable) {
 			// create a new output file
@@ -768,7 +833,9 @@ static int datadump_sockopt_set(sockoptid_t opt, const void *conf, size_t size)
 			datadump_seq = 0;
 			datadump_timeout = 0;
 			datadump_pid = 0;
+			datadump_port = 0;
 			datadump_comm[0] = '\0';
+			datadump_ipaddr[0] = '\0';
 			datadump_proto = 0;
 			fprintf(datadump_file,
 				"\n\nDump data is finished, use time: %us.\n\n",
@@ -809,6 +876,10 @@ static int datadump_sockopt_get(sockoptid_t opt, const void *conf, size_t size,
  * @proto
  *   Specifying the L7 protocol number. If set to '0', it indicates all
  *   L7 protocols.
+ * @ipaddr
+ *    Specifying ip address.
+ * @port
+ *    Specifying port.
  * @timeout
  *   Specifying the timeout duration. If the elapsed time exceeds this
  *   duration, datadump will stop. The unit is in seconds.
@@ -817,8 +888,8 @@ static int datadump_sockopt_get(sockoptid_t opt, const void *conf, size_t size,
  *
  * @return 0 on success, and a negative value on failure.
  */
-int datadump_set_config(int pid, const char *comm, int proto, int timeout,
-			debug_callback_t cb)
+int datadump_set_config(int pid, const char *comm, int proto, const char *ipaddr,
+			int port, int timeout, debug_callback_t cb)
 {
 	if (pid < 0 || proto < 0 || proto >= PROTO_NUM || comm == NULL
 	    || timeout <= 0) {
@@ -836,16 +907,22 @@ int datadump_set_config(int pid, const char *comm, int proto, int timeout,
 	datadump_use_remote = true;
 	datadump_seq = 0;
 	datadump_pid = pid;
-	datadump_proto = (uint8_t) proto;
+	datadump_port = (uint16_t)port;
+	datadump_proto = (uint8_t)proto;
 	datadump_cb = cb;
 	datadump_comm[0] = '\0';
+	datadump_ipaddr[0] = '\0';
 	datadump_start_time = get_sys_uptime();
 	datadump_timeout = timeout;
 	if (strlen(comm) > 0)
 		safe_buf_copy(datadump_comm, sizeof(datadump_comm),
 			      (void *)comm, strlen(comm));
-	ebpf_info("Set datadump pid %d comm '%s' proto %d\n",
-		  datadump_pid, datadump_comm, datadump_proto);
+	if (strlen(ipaddr) > 0)
+		safe_buf_copy(datadump_ipaddr, sizeof(datadump_ipaddr),
+			      (void *)ipaddr, strlen(ipaddr));
+	ebpf_info("Set datadump pid %d comm '%s' proto %d ip '%s' port %d\n",
+		  datadump_pid, datadump_comm, datadump_proto,
+		  datadump_ipaddr, datadump_port);
 
 finish:
 	pthread_mutex_unlock(&datadump_mutex);
@@ -862,19 +939,48 @@ static struct tracer_sockopts datadump_sockopts = {
 	.get = datadump_sockopt_get,
 };
 
+static inline int process_exists(pid_t pid)
+{
+	if (kill(pid, 0) == 0) {
+		return 1; // exists, and we have permission
+	}
+
+	if (errno == EPERM) {
+		ebpf_info("Pid %d exists, but no permission\n", pid);
+		return 1;
+	}
+
+	return 0; // does not exist
+}
+
 static void process_event(struct process_event_t *e)
 {
 	if (e->meta.event_type == EVENT_TYPE_PROC_EXEC) {
 		if (e->maybe_thread && !is_user_process(e->pid))
 			return;
+
+		/*
+		 * To prevent 'numad' from interfering with the CPU
+		 * affinity settings of deepflow-agent, the following
+		 * actions are taken:
+		 * If deepflow-agent starts before numad, use eBPF
+		 * process monitor to detect numad startup and run
+		 * "numad -x " to exclude the agent.
+		 */
+		if (strcmp((const char *)e->name, "numad") == 0 && process_exists(e->pid)) {
+			int ret = protect_cpu_affinity_c();
+			if (ret == 0)
+				ebpf_info("numad(pid %d) found and execution succeeded\n", e->pid);
+			else
+				ebpf_info("numad(pid %d) execution failed\n", e->pid);
+		}
+
 		update_proc_info_cache(e->pid, PROC_EXEC);
-		unwind_process_exec(e->pid);
 		extended_process_exec(e->pid);
 	} else if (e->meta.event_type == EVENT_TYPE_PROC_EXIT) {
 		/* Cache for updating process information used in
 		 * symbol resolution. */
 		update_proc_info_cache(e->pid, PROC_EXIT);
-		unwind_process_exit(e->pid);
 		extended_process_exit(e->pid);
 	}
 }
@@ -945,107 +1051,29 @@ static int register_events_handle(struct reader_forward_info *fwd_info,
 	return ETR_OK;
 }
 
-static u32 copy_regular_file_data(void *dst, void *src, int len)
+/**
+ * Calculate the extra memory size required when allocating,
+ * due to file I/O events and the need to pass mount-related
+ * information. These details are obtained in user space and
+ * are not stored in the kernel structures, so additional
+ * memory must be reserved to hold them.
+ */
+static inline int get_additional_memory_size(struct __socket_data_buffer *buf)
 {
-	if (len <= 0)
-		return 0;
-
-	struct user_io_event_buffer u_event;
-	struct __io_event_buffer event;
-	memcpy(&event, src, sizeof(event));
-	char *buffer = event.filename;
-	u32 buffer_len = event.len;
-	u32 buf_offset =
-	    offsetof(typeof(struct user_io_event_buffer), filename);
-
-	/*
-	 * Due to the maximum length limitation of the data, the file
-	 * path may be truncated. Here, only the valid length is considered.
-	 */
-	if (buf_offset + buffer_len > len) {
-		buffer_len = len - buf_offset;
-	}
-
-	buffer[buffer_len - 1] = '\0';
-	int event_len;
-	int i, temp_index = 0;
-	char temp[buffer_len + 1];
-	temp[0] = '\0';
-
-	/*
-	 * The path content is in the form "a\0b\0c\0" and needs to
-	 * be converted into the directory format "/c/b/a".
-	 *
-	 * e.g.:
-	 *
-	 * buffer "comm\019317\0task\032148\0/\0"
-	 * convert to "/32148/task/19317/comm"
-	 */
-	if (buffer_len <= 1)
-		goto copy_event;
-
-	char *p;
-	for (i = buffer_len - 2; i >= 0; i--) {
-		if (i == 0) {
-			p = &buffer[0];
-		} else {
-			if (buffer[i] != '\0')
-				continue;
-			p = &buffer[i + 1];
+	int i, start = 0, extra_size = 0;
+	struct __socket_data *sd;
+	for (i = 0; i < buf->events_num; i++) {
+		sd = (struct __socket_data *)&buf->data[start];
+		if (sd->source == DATA_SOURCE_IO_EVENT) {
+			extra_size += (sizeof(struct user_io_event_buffer) - sd->data_len);
 		}
-
-		temp_index +=
-		    snprintf(temp + temp_index, sizeof(temp) - temp_index,
-			     "%s%s", p, (temp_index > 0 && i != 0) ? "/" : "");
-
+		start +=
+		    (offsetof(typeof(struct __socket_data), data) +
+		     sd->data_len);
 	}
 
-copy_event:
-	buffer = u_event.filename;
-	memcpy(buffer, temp, temp_index + 1);
-	buffer_len = temp_index + 1;
-	u_event.bytes_count = event.bytes_count;
-	u_event.operation = event.operation;
-	u_event.latency = event.latency;
-	u_event.offset = event.offset;
-	event_len = offsetof(typeof(struct user_io_event_buffer),
-			     filename) + buffer_len;
-	safe_buf_copy(dst, len, &u_event, event_len);
-
-	return event_len;
-}
-
-static void set_cid_and_name(struct socket_bpf_data *submit_data,
-			     struct __socket_data *sd)
-{
-	int ret;
-	ret = get_cid_and_name_from_cache(sd->tgid, submit_data->container_id,
-					  sizeof(submit_data->container_id),
-					  submit_data->process_kname,
-					  sizeof(submit_data->process_kname));
-
-	// Not found in the process cache, attempting to retrieve from procfs.
-	if (ret) {
-		fetch_container_id_from_proc(sd->tgid,
-					     (char *)submit_data->container_id,
-					     sizeof(submit_data->container_id));
-	}
-
-	if (submit_data->process_kname[0] == '\0') {
-		if (fetch_process_name_from_proc(sd->tgid,
-						 (char *)submit_data->process_kname,
-						 sizeof(submit_data->process_kname))) {
-			safe_buf_copy(submit_data->process_kname,
-				      sizeof(submit_data->process_kname),
-				      sd->comm, sizeof(sd->comm));
-		}
-	}
-
-	submit_data->process_kname[sizeof(submit_data->process_kname) -
-				   1] = '\0';
-	submit_data->container_id[sizeof(submit_data->container_id) -
-				   1] = '\0';
-}
+	return extra_size;
+}	
 
 // Read datas from perf ring-buffer and dispatch.
 static void reader_raw_cb(void *cookie, void *raw, int raw_size)
@@ -1190,6 +1218,9 @@ static void reader_raw_cb(void *cookie, void *raw, int raw_size)
 	struct socket_bpf_data *submit_data;
 	int len;
 	void *data_buf_ptr;
+	char mount_point[MAX_PATH_LENGTH] = {0}, mount_source[MAX_PATH_LENGTH] = {0};
+	char root[MAX_PATH_LENGTH] = {0};
+	fs_type_t file_type = FS_TYPE_UNKNOWN;
 
 	// 所有载荷的数据总大小（去掉头）
 	int alloc_len = buf->len - offsetof(typeof(struct __socket_data),
@@ -1197,6 +1228,7 @@ static void reader_raw_cb(void *cookie, void *raw, int raw_size)
 	alloc_len += sizeof(*submit_data) * buf->events_num;	// 计算长度包含要提交的数据的头
 	alloc_len += sizeof(struct mem_block_head) * buf->events_num;	// 包含内存块head
 	alloc_len += sizeof(sd->extra_data) * buf->events_num;	// 可能包含额外数据
+	alloc_len += get_additional_memory_size(buf);
 	alloc_len = CACHE_LINE_ROUNDUP(alloc_len);	// 保持cache line对齐
 
 	void *socket_data_buff = malloc(alloc_len);
@@ -1221,16 +1253,37 @@ static void reader_raw_cb(void *cookie, void *raw, int raw_size)
 		memset(submit_data, 0, sizeof(*submit_data));
 
 		submit_data->timestamp = sd->timestamp;
+		submit_data->cap_timestamp = sd->cap_timestamp;
 		submit_data->direction = sd->direction;
+		submit_data->fd = sd->fd;
 		submit_data->source = sd->source;
 		submit_data->cap_data =
 		    (char *)((void **)&submit_data->cap_data + 1);
 		submit_data->syscall_len = sd->syscall_len;
 		submit_data->l7_protocal_hint = sd->data_type;
 		submit_data->batch_last_data = false;
+
+		u32 mntns_id = 0;
+		u32 self_mntns_id = 0;
 		if (sd->source != DATA_SOURCE_DPDK) {
 			submit_data->socket_id = sd->socket_id;
 			submit_data->tuple = sd->tuple;
+			submit_data->tcp_seq = sd->tcp_seq;
+			if (sd->source == DATA_SOURCE_UNIX_SOCKET) {
+				submit_data->tuple.l4_protocol = IPPROTO_TCP;
+				submit_data->tuple.dport = submit_data->tuple.num = 0;
+				// 0:unkonwn 1:client(connect) 2:server(accept)
+				if (sd->socket_role == 1) {
+					submit_data->tuple.dport = 1;
+				} else if (sd->socket_role == 2) {
+					submit_data->tuple.num = 1;
+				}
+				submit_data->tuple.addr_len = 4;
+				*(in_addr_t *)submit_data->tuple.rcv_saddr = htonl(0x7F000001); 
+				*(in_addr_t *)submit_data->tuple.daddr = htonl(0x7F000001);
+				submit_data->tcp_seq = 0;
+			}
+
 			submit_data->process_id = sd->tgid;
 			submit_data->thread_id = sd->pid;
 			submit_data->coroutine_id = sd->coroutine_id;
@@ -1239,11 +1292,48 @@ static void reader_raw_cb(void *cookie, void *raw, int raw_size)
 			    sd->source == DATA_SOURCE_OPENSSL_UPROBE)
 				submit_data->is_tls = true;
 
-			submit_data->tcp_seq = sd->tcp_seq;
 			submit_data->cap_seq = sd->data_seq;
 			submit_data->syscall_trace_id_call =
 			    sd->thread_trace_id;
-			set_cid_and_name(submit_data, sd);
+			int ret = 0;
+			kern_dev_t s_dev = DEV_INVALID;
+			int mnt_id = 0;
+			if (sd->source == DATA_SOURCE_IO_EVENT) {
+				struct __io_event_buffer *event =
+					(struct __io_event_buffer *)sd->data;
+				s_dev = sd->s_dev;
+				mnt_id = event->mnt_id;
+				mntns_id = event->mntns_id;
+			}
+			ret = get_proc_info_from_cache(sd->tgid, submit_data->container_id,
+						       sizeof(submit_data->container_id),
+						       submit_data->process_kname,
+						       sizeof(submit_data->process_kname),
+						       mnt_id, mntns_id, &self_mntns_id,
+						       s_dev, mount_point, mount_source,
+						       root, sizeof(mount_point), &file_type);
+
+			// Not found in the process cache, attempting to retrieve from procfs.
+			if (ret) {
+				fetch_container_id_from_proc(sd->tgid,
+							     (char *)submit_data->container_id,
+							     sizeof(submit_data->container_id));
+			}
+
+			if (submit_data->process_kname[0] == '\0') {
+				if (fetch_process_name_from_proc(sd->tgid,
+								 (char *)submit_data->process_kname,
+								 sizeof(submit_data->process_kname))) {
+					safe_buf_copy(submit_data->process_kname,
+						      sizeof(submit_data->process_kname),
+						      sd->comm, sizeof(sd->comm));
+				}
+			}
+
+			submit_data->process_kname[sizeof(submit_data->process_kname) -
+						   1] = '\0';
+			submit_data->container_id[sizeof(submit_data->container_id) -
+						   1] = '\0';
 			submit_data->msg_type = sd->msg_type;
 			submit_data->socket_role = sd->socket_role;
 		} else {
@@ -1276,10 +1366,14 @@ static void reader_raw_cb(void *cookie, void *raw, int raw_size)
 				offset = sd->extra_data_count;
 			}
 			if (sd->source == DATA_SOURCE_IO_EVENT) {
+				u32 display_mntns_id = 0;
+				if (self_mntns_id > 0 && mntns_id != self_mntns_id)
+					display_mntns_id = mntns_id;
 				len =
-				    copy_regular_file_data(submit_data->cap_data
-							   + offset, sd->data,
-							   len);
+				    copy_file_metrics(sd->tgid, submit_data->cap_data
+						      + offset, sd->data, len,
+						      display_mntns_id, mount_point,
+						      mount_source, root, file_type);
 			} else {
 				memcpy_fast(submit_data->cap_data + offset,
 					    sd->data, len);
@@ -1484,6 +1578,8 @@ static int check_kern_adapt_and_state_update(void)
 		set_period_event_invalid("check-kern-adapt");
 		set_period_event_invalid("trigger_kern_adapt");
 		t->adapt_success = true;
+		save_kern_offsets(t);
+		display_kern_offsets(&g_kern_offsets);
 	}
 
 	return 0;
@@ -1550,7 +1646,9 @@ static void check_datadump_timeout(void)
 			datadump_enable = false;
 			datadump_use_remote = false;
 			datadump_pid = 0;
+			datadump_port = 0;
 			datadump_comm[0] = '\0';
+			datadump_ipaddr[0] = '\0';
 			datadump_proto = 0;
 			fprintf(datadump_file,
 				"\n\nDump data is finished, use time: %us.\n\n",
@@ -1569,13 +1667,29 @@ static void check_datadump_timeout(void)
 	pthread_mutex_unlock(&datadump_mutex);
 }
 
+static inline u64 monotonic_ns()
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (u64)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
 // Manage process start or exit events.
 static void process_events_handle_main(__unused void *arg)
 {
 	prctl(PR_SET_NAME, "proc-events");
 	thread_index = THREAD_PROC_EVENTS_HANDLE_IDX;
 	struct bpf_tracer *t = arg;
+	u64 proc_last_ts, mnt_last_ts, now_ts;
+	proc_last_ts = mnt_last_ts = monotonic_ns();
+	const u64 proc_intv_ns = PROCESS_CACHE_UPDATE_INTERVAL_NS;
+	const u64 mnt_intv_ns = MOUNT_CACHE_UPDATE_INTERVAL_NS;
+	const u32 log_intv = OUTPUT_LOG_INTERVAL_NS / PROCESS_CACHE_UPDATE_INTERVAL_NS;
+	u64 count = 0;
+	bool output_log;
+
 	for (;;) {
+		output_log = false;
 		/*
 		 * Will attach/detach all probes in the following cases:
 		 *
@@ -1597,6 +1711,20 @@ static void process_events_handle_main(__unused void *arg)
 		check_datadump_timeout();
 		/* check and clean symbol cache */
 		exec_proc_info_cache_update();
+		now_ts = monotonic_ns();
+		if (now_ts - proc_last_ts >= proc_intv_ns) {
+			proc_last_ts = now_ts;
+			if (++count % log_intv == 0)
+				output_log = true;
+			check_and_update_proc_info(output_log);
+			collect_mount_info_stats(output_log);
+		}
+
+		if (now_ts - mnt_last_ts >= mnt_intv_ns) {
+			mnt_last_ts = now_ts;
+			check_root_mount_info(output_log);
+		}
+		
 		usleep(LOOP_DELAY_US);
 	}
 }
@@ -1611,38 +1739,55 @@ static int update_offset_map_default(struct bpf_tracer *t,
 		offset.kprobe_invalid = 1;
 	}
 
+	if (unix_socket_feature_enable) {
+		offset.enable_unix_socket = 1;
+	}
+
 	switch (kern_type) {
 	case K_TYPE_VER_3_10:
 		offset.struct_files_struct_fdt_offset = 0x8;
-		offset.struct_files_private_data_offset = 0xa8;
+		offset.struct_file_private_data_offset = 0xa8;
 		offset.struct_file_f_pos_offset = 0x68;
+		offset.struct_ns_common_inum_offset = 0x4;
 		break;
 	case K_TYPE_KYLIN:
 		offset.struct_files_struct_fdt_offset = 0x20;
-		offset.struct_files_private_data_offset = 0xc0;
+		offset.struct_file_private_data_offset = 0xc0;
 		offset.struct_file_f_pos_offset = 0x60;
+		offset.struct_ns_common_inum_offset = 0x10;
 		break;
 	default:
 		offset.struct_files_struct_fdt_offset = 0x20;
-		offset.struct_files_private_data_offset = 0xc8;
+		offset.struct_file_private_data_offset = 0xc8;
 		offset.struct_file_f_pos_offset = 0x68;
+		offset.struct_ns_common_inum_offset = 0x10;
 	};
 
 	/*
 	 * In Tencent Linux (4.14.105-1-tlinux3-0023.1), there is a difference in
-	 * `struct_files_private_data_offset`. If the offset value of the generic
+	 * `struct_file_private_data_offset`. If the offset value of the generic
 	 * eBPF program is used, it will result in the kernel being unable to adapt.
 	 * A separate correction is made here.
 	 */
 	if (strstr(linux_release, "tlinux3"))
-		offset.struct_files_private_data_offset = 0xc0;
+		offset.struct_file_private_data_offset = 0xc0;
 
 	// For 4.19.90-2211.5.0.0178.22.uel20.x86_64
 	if (strstr(linux_release, "uel20"))
-		offset.struct_files_private_data_offset = 0xc0;
+		offset.struct_file_private_data_offset = 0xc0;
 
-	offset.struct_file_f_inode_offset = 0x20;
+	/*
+	 * The corresponding offset is used to access `file->f_op->read_iter`, which
+	 * is then used to determine whether the file belongs to a standard VFS
+	 * filesystem or is a virtual file.
+	 */
+	offset.struct_file_f_op_offset = 0x28;
+	offset.struct_file_operations_read_iter_offset = 0x20;
+
+	offset.struct_file_f_inode_offset = 0x20;	
 	offset.struct_inode_i_mode_offset = 0x0;
+	offset.struct_inode_i_sb_offset = 0x28;
+	offset.struct_super_block_s_dev_offset = 0x10;
 	offset.struct_file_dentry_offset = 0x18;
 	offset.struct_dentry_d_parent_offset = 0x18;
 	offset.struct_dentry_name_offset = 0x28;
@@ -1655,6 +1800,16 @@ static int update_offset_map_default(struct bpf_tracer *t,
 	offset.struct_sock_sport_offset = 0xe;
 	offset.struct_sock_skc_state_offset = 0x12;
 	offset.struct_sock_common_ipv6only_offset = 0x13;
+
+	/*
+	 * Mount information related offsets
+	 */ 
+	offset.struct_file_f_path_offset      = 0x10;
+	offset.struct_path_mnt_offset         = 0x0;
+	offset.struct_mount_mnt_offset        = 0x20;
+	offset.struct_mount_mnt_ns_offset     = 0xe0;
+	offset.struct_mnt_namespace_ns_offset = 0x8; // On Linux 5.11 and later, this value is 0.
+	offset.struct_mount_mnt_id_offset     = 0x11c;
 
 	if (update_offsets_table(t, &offset) != ETR_OK) {
 		ebpf_error("update_offset_map_default failed.\n");
@@ -1705,14 +1860,22 @@ static int update_offset_map_from_btf_vmlinux(struct bpf_tracer *t)
 
 	int struct_files_struct_fdt_offset =
 	    kernel_struct_field_offset(obj, "files_struct", "fdt");
-	int struct_files_private_data_offset =
+	int struct_file_private_data_offset =
 	    kernel_struct_field_offset(obj, "file", "private_data");
+	int struct_file_f_op_offset =
+	    kernel_struct_field_offset(obj, "file", "f_op");
+	int struct_file_operations_read_iter_offset =
+	    kernel_struct_field_offset(obj, "file_operations", "read_iter");
 	int struct_file_f_inode_offset =
 	    kernel_struct_field_offset(obj, "file", "f_inode");
 	int struct_file_f_pos_offset =
 	    kernel_struct_field_offset(obj, "file", "f_pos");
 	int struct_inode_i_mode_offset =
 	    kernel_struct_field_offset(obj, "inode", "i_mode");
+	int struct_inode_i_sb_offset =
+	    kernel_struct_field_offset(obj, "inode", "i_sb");
+	int struct_super_block_s_dev_offset =
+	    kernel_struct_field_offset(obj, "super_block", "s_dev");
 	int struct_file_dentry_offset_1 =
 	    kernel_struct_field_offset(obj, "file", "f_path");
 	int struct_file_dentry_offset_2 =
@@ -1752,18 +1915,40 @@ static int update_offset_map_from_btf_vmlinux(struct bpf_tracer *t)
 	int struct_sock_common_ipv6only_offset =
 	    struct_sock_skc_state_offset + 1;
 
+	// Mount information related offsets
+	int struct_file_f_path_offset =
+	    kernel_struct_field_offset(obj, "file", "f_path");
+	int struct_path_mnt_offset =
+	    kernel_struct_field_offset(obj, "path", "mnt");
+	int struct_mount_mnt_offset =
+	    kernel_struct_field_offset(obj, "mount", "mnt");
+	int struct_mount_mnt_ns_offset =
+	    kernel_struct_field_offset(obj, "mount", "mnt_ns");
+        int struct_mnt_namespace_ns_offset =
+	    kernel_struct_field_offset(obj, "mnt_namespace", "ns");
+	int struct_ns_common_inum_offset =
+	    kernel_struct_field_offset(obj, "ns_common", "inum");
+	int struct_mount_mnt_id_offset =
+	    kernel_struct_field_offset(obj, "mount", "mnt_id");
 	if (copied_seq_offs < 0 || write_seq_offs < 0 || files_offs < 0 ||
 	    sk_flags_offs < 0 || struct_files_struct_fdt_offset < 0 ||
-	    struct_files_private_data_offset < 0 ||
+	    struct_file_private_data_offset < 0 ||
+	    struct_file_f_op_offset < 0 ||
+	    struct_file_operations_read_iter_offset < 0 ||
 	    struct_file_f_inode_offset < 0 || struct_inode_i_mode_offset < 0 ||
-	    struct_inode_i_mode_offset < 0 || struct_file_dentry_offset < 0 ||
+	    struct_inode_i_sb_offset < 0 || 
+	    struct_super_block_s_dev_offset < 0 || struct_file_dentry_offset < 0 ||
 	    struct_dentry_name_offset < 0 || struct_sock_family_offset < 0 ||
 	    struct_sock_saddr_offset < 0 || struct_sock_daddr_offset < 0 ||
 	    struct_sock_ip6saddr_offset < 0 ||
 	    struct_sock_ip6daddr_offset < 0 || struct_sock_dport_offset < 0 ||
 	    struct_sock_sport_offset < 0 || struct_sock_skc_state_offset < 0 ||
 	    struct_sock_common_ipv6only_offset < 0 ||
-	    struct_dentry_d_parent_offset < 0 || struct_file_f_pos_offset < 0) {
+	    struct_dentry_d_parent_offset < 0 || struct_file_f_pos_offset < 0 ||
+	    struct_file_f_path_offset < 0 || struct_path_mnt_offset < 0 ||
+	    struct_mount_mnt_offset < 0 || struct_mount_mnt_ns_offset < 0 ||
+	    struct_mnt_namespace_ns_offset < 0 || struct_ns_common_inum_offset < 0 ||
+	    struct_mount_mnt_id_offset < 0) {
 		return ETR_NOTSUPP;
 	}
 
@@ -1774,8 +1959,12 @@ static int update_offset_map_from_btf_vmlinux(struct bpf_tracer *t)
 	ebpf_info("    sk_flags_offs: 0x%x\n", sk_flags_offs);
 	ebpf_info("    struct_files_struct_fdt_offset: 0x%x\n",
 		  struct_files_struct_fdt_offset);
-	ebpf_info("    struct_files_private_data_offset: 0x%x\n",
-		  struct_files_private_data_offset);
+	ebpf_info("    struct_file_private_data_offset: 0x%x\n",
+		  struct_file_private_data_offset);
+	ebpf_info("    struct_file_f_op_offset: 0x%x\n",
+		  struct_file_f_op_offset);
+	ebpf_info("    struct_file_operations_read_iter_offset: 0x%x\n",
+		  struct_file_operations_read_iter_offset);
 	ebpf_info("    struct_file_f_inode_offset: 0x%x\n",
 		  struct_file_f_inode_offset);
 	ebpf_info("    struct_file_f_pos_offset: 0x%x\n",
@@ -1784,6 +1973,10 @@ static int update_offset_map_from_btf_vmlinux(struct bpf_tracer *t)
 		  struct_inode_i_mode_offset);
 	ebpf_info("    struct_file_dentry_offset: 0x%x\n",
 		  struct_file_dentry_offset);
+	ebpf_info("    struct_inode_i_sb_offset: 0x%x\n",
+		  struct_inode_i_sb_offset);
+	ebpf_info("    struct_super_block_s_dev_offset: 0x%x\n",
+		  struct_super_block_s_dev_offset);
 	ebpf_info("    struct_dentry_name_offset: 0x%x\n",
 		  struct_dentry_name_offset);
 	ebpf_info("    struct_dentry_d_parent_offset: 0x%x\n",
@@ -1806,6 +1999,20 @@ static int update_offset_map_from_btf_vmlinux(struct bpf_tracer *t)
 		  struct_sock_skc_state_offset);
 	ebpf_info("    struct_sock_common_ipv6only_offset: 0x%x\n",
 		  struct_sock_common_ipv6only_offset);
+	ebpf_info("    struct_file_f_path_offset: 0x%x\n",
+		  struct_file_f_path_offset);
+	ebpf_info("    struct_path_mnt_offset: 0x%x\n",
+		  struct_path_mnt_offset);
+	ebpf_info("    struct_mount_mnt_offset: 0x%x\n",
+		  struct_mount_mnt_offset);
+	ebpf_info("    struct_mount_mnt_ns_offset: 0x%x\n",
+		  struct_mount_mnt_ns_offset);
+	ebpf_info("    struct_mnt_namespace_ns_offset: 0x%x\n",
+		  struct_mnt_namespace_ns_offset);
+	ebpf_info("    struct_ns_common_inum_offset: 0x%x\n",
+		  struct_ns_common_inum_offset);
+	ebpf_info("    struct_mount_mnt_id_offset: 0x%x\n",
+		  struct_mount_mnt_id_offset);
 
 	bpf_offset_param_t offset;
 	memset(&offset, 0, sizeof(offset));
@@ -1813,17 +2020,27 @@ static int update_offset_map_from_btf_vmlinux(struct bpf_tracer *t)
 		offset.kprobe_invalid = 1;
 	}
 
+	if (unix_socket_feature_enable) {
+		offset.enable_unix_socket = 1;
+	}
+
 	offset.ready = 1;
+	offset.files_infer_done = 1;
 	offset.task__files_offset = files_offs;
 	offset.sock__flags_offset = sk_flags_offs;
 	offset.tcp_sock__copied_seq_offset = copied_seq_offs;
 	offset.tcp_sock__write_seq_offset = write_seq_offs;
 	offset.struct_files_struct_fdt_offset = struct_files_struct_fdt_offset;
-	offset.struct_files_private_data_offset =
-	    struct_files_private_data_offset;
+	offset.struct_file_private_data_offset =
+	    struct_file_private_data_offset;
+	offset.struct_file_f_op_offset = struct_file_f_op_offset;
+	offset.struct_file_operations_read_iter_offset =
+	    struct_file_operations_read_iter_offset;
 	offset.struct_file_f_inode_offset = struct_file_f_inode_offset;
 	offset.struct_file_f_pos_offset = struct_file_f_pos_offset;
 	offset.struct_inode_i_mode_offset = struct_inode_i_mode_offset;
+	offset.struct_inode_i_sb_offset = struct_inode_i_sb_offset;	
+	offset.struct_super_block_s_dev_offset = struct_super_block_s_dev_offset;
 	offset.struct_file_dentry_offset = struct_file_dentry_offset;
 	offset.struct_dentry_name_offset = struct_dentry_name_offset;
 	offset.struct_dentry_d_parent_offset = struct_dentry_d_parent_offset;
@@ -1837,6 +2054,13 @@ static int update_offset_map_from_btf_vmlinux(struct bpf_tracer *t)
 	offset.struct_sock_skc_state_offset = struct_sock_skc_state_offset;
 	offset.struct_sock_common_ipv6only_offset =
 	    struct_sock_common_ipv6only_offset;
+	offset.struct_file_f_path_offset      = struct_file_f_path_offset;
+	offset.struct_path_mnt_offset         = struct_path_mnt_offset;
+	offset.struct_mount_mnt_offset        = struct_mount_mnt_offset;
+	offset.struct_mount_mnt_ns_offset     = struct_mount_mnt_ns_offset;
+	offset.struct_mnt_namespace_ns_offset = struct_mnt_namespace_ns_offset;
+	offset.struct_ns_common_inum_offset   = struct_ns_common_inum_offset;
+	offset.struct_mount_mnt_id_offset     = struct_mount_mnt_id_offset;
 
 	if (update_offsets_table(t, &offset) != ETR_OK) {
 		ebpf_warning("Update offsets map failed.\n");
@@ -1844,6 +2068,117 @@ static int update_offset_map_from_btf_vmlinux(struct bpf_tracer *t)
 	}
 
 	return ETR_OK;
+}
+
+static void display_kern_offsets(bpf_offset_param_t * offset)
+{
+	if (!offset)
+		return;
+
+	ebpf_info("member_fields_offset:\n");
+
+	ebpf_info("\tready: 0x%x\n", offset->ready);
+	ebpf_info("\tkprobe_invalid: 0x%x\n", offset->kprobe_invalid);
+	ebpf_info("\tenable_unix_socket: 0x%x\n", offset->enable_unix_socket);
+	ebpf_info("\tfiles_infer_done: 0x%x\n", offset->files_infer_done);
+	ebpf_info("\treserved: 0x%x\n", offset->reserved);
+
+	ebpf_info("\tstruct_dentry_d_parent_offset: 0x%x\n",
+		  offset->struct_dentry_d_parent_offset);
+	ebpf_info("\ttask__files_offset: 0x%x\n", offset->task__files_offset);
+	ebpf_info("\tsock__flags_offset: 0x%x\n", offset->sock__flags_offset);
+	ebpf_info("\ttcp_sock__copied_seq_offset: 0x%x\n",
+		  offset->tcp_sock__copied_seq_offset);
+	ebpf_info("\ttcp_sock__write_seq_offset: 0x%x\n",
+		  offset->tcp_sock__write_seq_offset);
+
+	ebpf_info("\tstruct_files_struct_fdt_offset: 0x%x\n",
+		  offset->struct_files_struct_fdt_offset);
+	ebpf_info("\tstruct_file_f_pos_offset: 0x%x\n",
+		  offset->struct_file_f_pos_offset);
+	ebpf_info("\tstruct_file_private_data_offset: 0x%x\n",
+		  offset->struct_file_private_data_offset);
+	ebpf_info("\tstruct_file_f_op_offset: 0x%x\n",
+		  offset->struct_file_f_op_offset);
+	ebpf_info("\tstruct_file_operations_read_iter_offset: 0x%x\n",
+		  offset->struct_file_operations_read_iter_offset);
+	ebpf_info("\tstruct_file_f_inode_offset: 0x%x\n",
+		  offset->struct_file_f_inode_offset);
+	ebpf_info("\tstruct_inode_i_mode_offset: 0x%x\n",
+		  offset->struct_inode_i_mode_offset);
+	ebpf_info("\tstruct_inode_i_sb_offset: 0x%x\n",
+		  offset->struct_inode_i_sb_offset);
+	ebpf_info("\tstruct_super_block_s_dev_offset: 0x%x\n",
+		  offset->struct_super_block_s_dev_offset);
+	ebpf_info("\tstruct_file_dentry_offset: 0x%x\n",
+		  offset->struct_file_dentry_offset);
+	ebpf_info("\tstruct_dentry_name_offset: 0x%x\n",
+		  offset->struct_dentry_name_offset);
+	ebpf_info("\tstruct_sock_family_offset: 0x%x\n",
+		  offset->struct_sock_family_offset);
+	ebpf_info("\tstruct_sock_saddr_offset: 0x%x\n",
+		  offset->struct_sock_saddr_offset);
+	ebpf_info("\tstruct_sock_daddr_offset: 0x%x\n",
+		  offset->struct_sock_daddr_offset);
+	ebpf_info("\tstruct_sock_ip6saddr_offset: 0x%x\n",
+		  offset->struct_sock_ip6saddr_offset);
+	ebpf_info("\tstruct_sock_ip6daddr_offset: 0x%x\n",
+		  offset->struct_sock_ip6daddr_offset);
+	ebpf_info("\tstruct_sock_dport_offset: 0x%x\n",
+		  offset->struct_sock_dport_offset);
+	ebpf_info("\tstruct_sock_sport_offset: 0x%x\n",
+		  offset->struct_sock_sport_offset);
+	ebpf_info("\tstruct_sock_skc_state_offset: 0x%x\n",
+		  offset->struct_sock_skc_state_offset);
+	ebpf_info("\tstruct_sock_common_ipv6only_offset: 0x%x\n",
+		  offset->struct_sock_common_ipv6only_offset);
+
+	ebpf_info("\tstruct_file_f_path_offset: 0x%x\n",
+		  offset->struct_file_f_path_offset);
+	ebpf_info("\tstruct_path_mnt_offset: 0x%x\n",
+		  offset->struct_path_mnt_offset);
+	ebpf_info("\tstruct_mount_mnt_offset: 0x%x\n",
+		  offset->struct_mount_mnt_offset);
+	ebpf_info("\tstruct_mount_mnt_ns_offset: 0x%x\n",
+		  offset->struct_mount_mnt_ns_offset);
+	ebpf_info("\tstruct_mnt_namespace_ns_offset: 0x%x\n",
+		  offset->struct_mnt_namespace_ns_offset);
+	ebpf_info("\tstruct_ns_common_inum_offset: 0x%x\n",
+		  offset->struct_ns_common_inum_offset);
+	ebpf_info("\tstruct_mount_mnt_id_offset: 0x%x\n",
+		  offset->struct_mount_mnt_id_offset);
+}
+
+static void save_kern_offsets(struct bpf_tracer *t)
+{
+	int i;
+
+	if (sys_cpus_count > 0) {
+		bpf_offset_param_t *offset;
+		struct bpf_offset_param_array *array =
+		    malloc(sizeof(*array) + sizeof(*offset) * sys_cpus_count);
+		if (array == NULL) {
+			ebpf_warning("malloc() error.\n");
+			return;
+		}
+
+		array->count = sys_cpus_count;
+
+		if (!bpf_offset_map_collect(t, array)) {
+			free(array);
+			return;
+		}
+
+		offset = (bpf_offset_param_t *) (array + 1);
+		for (i = 0; i < sys_cpus_count; i++) {
+			if (!cpu_online[i])
+				continue;
+			g_kern_offsets = offset[i];
+			break;
+		}
+
+		free(array);
+	}
 }
 
 static void update_protocol_filter_array(struct bpf_tracer *tracer)
@@ -1940,13 +2275,14 @@ static void config_proto_ports_bitmap(struct bpf_tracer *tracer)
 	}
 }
 
-static void insert_adapt_kern_uid_to_map(struct bpf_tracer *tracer)
+void insert_adapt_kern_data_to_map(struct bpf_tracer *tracer,
+				   int mnt_id, u32 mntns_id)
 {
-	bpf_table_set_value(tracer, MAP_ADAPT_KERN_UID_NAME, 0,
-			    &adapt_kern_uid);
-
-	ebpf_info("Insert adapt kern uid : %d , %d\n",
-		  adapt_kern_uid >> 32, (uint32_t) adapt_kern_uid);
+	struct adapt_kern_data val = { 0 };
+	val.id = adapt_kern_uid;
+	val.mnt_id = mnt_id;
+	val.mntns_id = mntns_id;
+	bpf_table_set_value(tracer, MAP_ADAPT_KERN_DATA_NAME, 0, &val);
 }
 
 static inline int __set_data_limit_max(int limit_size)
@@ -1971,8 +2307,8 @@ static inline int __set_data_limit_max(int limit_size)
 
 /**
  * Set maximum amount of data passed to the agent by eBPF programe.
- * @limit_size : The maximum length of data. If @limit_size exceeds 8192,
- *               it will automatically adjust to 8192 bytes.
+ * @limit_size : The maximum length of data. If @limit_size exceeds 16384,
+ *               it will automatically adjust to 16384 bytes.
  *               If limit_size is 0, Use the default values 4096.
  *
  * @return the set maximum buffer size value on success, < 0 on failure.
@@ -2053,6 +2389,8 @@ int set_io_event_collect_mode(uint32_t mode)
 {
 	io_event_collect_mode = mode;
 
+	ebpf_info("Set io_event_collect_mode %d\n", io_event_collect_mode);
+
 	struct bpf_tracer *tracer = find_bpf_tracer(SK_TRACER_NAME);
 	if (tracer == NULL) {
 		return 0;
@@ -2111,6 +2449,42 @@ int set_io_event_minimal_duration(uint64_t duration)
 		return ETR_UPDATE_MAP_FAILD;
 	}
 
+	ebpf_info("Set io_event_minimal_duration %llu ns\n", io_event_minimal_duration);
+	return 0;
+}
+
+int set_virtual_file_collect(bool enabled)
+{
+	virtual_file_collect_enable = enabled;
+
+	struct bpf_tracer *tracer = find_bpf_tracer(SK_TRACER_NAME);
+	if (tracer == NULL) {
+		return 0;
+	}
+
+	int cpu;
+	int nr_cpus = get_num_possible_cpus();
+	struct tracer_ctx_s values[nr_cpus];
+	memset(values, 0, sizeof(values));
+
+	if (!bpf_table_get_value(tracer, MAP_TRACER_CTX_NAME, 0, values)) {
+		ebpf_warning("Get map '%s' failed.\n", MAP_TRACER_CTX_NAME);
+		return ETR_NOTEXIST;
+	}
+
+	for (cpu = 0; cpu < nr_cpus; cpu++) {
+		values[cpu].virtual_file_collect_enabled =
+					virtual_file_collect_enable;
+	}
+
+	if (!bpf_table_set_value
+	    (tracer, MAP_TRACER_CTX_NAME, 0, (void *)&values)) {
+		ebpf_warning("Set '%s' failed\n", MAP_TRACER_CTX_NAME);
+		return ETR_UPDATE_MAP_FAILD;
+	}
+
+	ebpf_info("IO event virtual_file_collect_enable set to %s\n",
+		   virtual_file_collect_enable ? "true" : "false");
 	return 0;
 }
 
@@ -2125,7 +2499,10 @@ static void insert_output_prog_to_map(struct bpf_tracer *tracer)
 	// jmp for tracepoints
 	insert_prog_to_map(tracer,
 			   MAP_PROGS_JMP_TP_NAME,
-			   PROG_PROTO_INFER_FOR_TP, PROG_PROTO_INFER_TP_IDX);
+			   PROG_PROTO_INFER_2_FOR_TP, PROG_PROTO_INFER_TP_2_IDX);
+	insert_prog_to_map(tracer,
+			   MAP_PROGS_JMP_TP_NAME,
+			   PROG_PROTO_INFER_3_FOR_TP, PROG_PROTO_INFER_TP_3_IDX);
 	insert_prog_to_map(tracer,
 			   MAP_PROGS_JMP_TP_NAME,
 			   PROG_DATA_SUBMIT_NAME_FOR_TP,
@@ -2143,7 +2520,10 @@ static void insert_output_prog_to_map(struct bpf_tracer *tracer)
 	// jmp for kprobe/uprobe
 	insert_prog_to_map(tracer,
 			   MAP_PROGS_JMP_KP_NAME,
-			   PROG_PROTO_INFER_FOR_KP, PROG_PROTO_INFER_KP_IDX);
+			   PROG_PROTO_INFER_2_FOR_KP, PROG_PROTO_INFER_KP_2_IDX);
+	insert_prog_to_map(tracer,
+			   MAP_PROGS_JMP_KP_NAME,
+			   PROG_PROTO_INFER_3_FOR_KP, PROG_PROTO_INFER_KP_3_IDX);
 	insert_prog_to_map(tracer,
 			   MAP_PROGS_JMP_KP_NAME,
 			   PROG_DATA_SUBMIT_NAME_FOR_KP,
@@ -2359,7 +2739,8 @@ static int check_dependencies(void)
 }
 
 static int select_bpf_binary(char load_name[NAME_LEN], void **bin_buffer,
-			     int *bin_buf_size, bool skip_kfunc)
+			     int *bin_buf_size, bool skip_kfunc,
+			     bool skip_k_5_2)
 {
 	void *bpf_bin_buffer;
 	int buffer_sz;
@@ -2391,7 +2772,7 @@ static int select_bpf_binary(char load_name[NAME_LEN], void **bin_buffer,
 		snprintf(load_name, NAME_LEN, "socket-trace-bpf-linux-kylin");
 		bpf_bin_buffer = (void *)socket_trace_kylin_ebpf_data;
 		buffer_sz = sizeof(socket_trace_kylin_ebpf_data);
-	} else if (major > 5 || (major == 5 && minor >= 2)) {
+	} else if (!skip_k_5_2 && (major > 5 || (major == 5 && minor >= 2))) {
 		g_k_type = K_TYPE_VER_5_2_PLUS;
 		snprintf(load_name, NAME_LEN,
 			 "socket-trace-bpf-linux-5.2_plus");
@@ -2436,6 +2817,38 @@ static void reconfig_load_resources(struct bpf_tracer *tracer, char *load_name,
 	socket_tracer_set_probes(tps);
 }
 
+static int ensure_datadump_dir_exists(const char *path)
+{
+	struct stat st;
+
+	// Check if the directory exists
+	if (stat(path, &st) == 0) {
+		// Check if the path is actually a directory
+		if (S_ISDIR(st.st_mode)) {
+			return 0; // Directory exists
+		} else {
+			ebpf_warning("Path exists but is not a "
+				     "directory: %s\n", path);
+			return -1;
+		}
+	} else {
+		// Directory does not exist, attempt to create it
+		if (mkdir(path, 0755) != 0) {
+			if (errno == EEXIST) {
+				// Directory was created by another thread/process
+				return 0;
+			} else {
+				ebpf_warning("Failed to create "
+					     "directory %s, %s (errno %d)\n",
+					     path, strerror(errno), errno);
+				return -1;
+			}
+		}
+	}
+
+	return 0;
+}
+
 /**
  * Start socket tracer
  *
@@ -2451,7 +2864,7 @@ static void reconfig_load_resources(struct bpf_tracer *tracer, char *load_name,
  *     in data processing, at the same time, it is also the number of threads reading the
  *     perf buffer.
  * @perf_pages_cnt
- *     Number of page frames with kernel shared memory footprint, the value is a power of 2.
+ *     Number of page frames with kernel shared memory footprint, the value is a power of 2, with page frame size of 4 KB.
  * @queue_size
  *     Ring cache queue size. The value is a power of 2.
  * @max_socket_entries
@@ -2495,11 +2908,16 @@ int running_socket_tracer(tracer_callback_t handle,
 	}
 
 	select_bpf_binary(bpf_load_buffer_name, &bpf_bin_buffer, &buffer_sz,
-			  false);
+			  !use_kfunc_bin, false);
 
 	/*
 	 * Initialize datadump
 	 */
+	if (ensure_datadump_dir_exists(DATADUMP_SAVE_DIR) == 0) {
+		ebpf_info("Datadump directory (%s) created or already"
+			  " exists.\n", DATADUMP_SAVE_DIR);
+	}
+
 	pthread_mutex_init(&datadump_mutex, NULL);
 	datadump_enable = false;
 	datadump_use_remote = false;
@@ -2552,16 +2970,38 @@ int running_socket_tracer(tracer_callback_t handle,
 	conf_max_trace_entries = max_trace_entries;
 
 	bool has_attempted = false;
-retry_load:
-	if (tracer_bpf_load(tracer)) {
-		if (!has_attempted && g_k_type == K_TYPE_KFUNC) {
-			has_attempted = true;
-			select_bpf_binary(bpf_load_buffer_name, &bpf_bin_buffer,
-					  &buffer_sz, true);
-			reconfig_load_resources(tracer, bpf_load_buffer_name,
-						bpf_bin_buffer, buffer_sz, tps);
-			goto retry_load;
+	while (true) {
+		if (tracer_bpf_load(tracer) == 0) {
+			// Loading succeeded, exit the loop
+			break;
 		}
+
+		if (!has_attempted) {
+			if (g_k_type == K_TYPE_KFUNC) {
+				has_attempted = true;
+				select_bpf_binary(bpf_load_buffer_name,
+						  &bpf_bin_buffer, &buffer_sz,
+						  true, false);
+				reconfig_load_resources(tracer,
+							bpf_load_buffer_name,
+							bpf_bin_buffer,
+							buffer_sz, tps);
+				continue;	/* Retry the load */
+			}
+
+			if (g_k_type == K_TYPE_VER_5_2_PLUS) {
+				has_attempted = true;
+				select_bpf_binary(bpf_load_buffer_name,
+						  &bpf_bin_buffer, &buffer_sz,
+						  true, true);
+				reconfig_load_resources(tracer,
+							bpf_load_buffer_name,
+							bpf_bin_buffer,
+							buffer_sz, tps);
+				continue;	/* Retry the load */
+			}
+		}
+
 		return -EINVAL;
 	}
 
@@ -2594,6 +3034,8 @@ retry_load:
 		    ("[eBPF Kernel Adapt] Set offsets map from btf_vmlinux, success.\n");
 	}
 
+	ebpf_info("== Unix domain socket ==\n");
+
 	// Set default maximum amount of data passed to the agent by eBPF.
 	if (socket_data_limit_max == 0)
 		__set_data_limit_max(0);
@@ -2614,6 +3056,7 @@ retry_load:
 		t_conf[cpu].io_event_collect_mode = io_event_collect_mode;
 		t_conf[cpu].io_event_minimal_duration =
 		    io_event_minimal_duration;
+		t_conf[cpu].virtual_file_collect_enabled = virtual_file_collect_enable;
 		t_conf[cpu].disable_tracing = g_disable_syscall_tracing;
 		if (!g_disable_syscall_tracing)
 			t_conf[cpu].go_tracing_timeout = go_tracing_timeout;
@@ -2623,13 +3066,20 @@ retry_load:
 	    (tracer, MAP_TRACER_CTX_NAME, 0, (void *)&t_conf))
 		return -EINVAL;
 
+	ebpf_info("Config socket_data_limit_max: %d\n", socket_data_limit_max);
+	ebpf_info("Config io_event_collect_mode: %d\n", io_event_collect_mode);
+	ebpf_info("Config io_event_minimal_duration: %llu ns\n", io_event_minimal_duration);
+	ebpf_info("Config virtual_file_collect_enable: %d\n", virtual_file_collect_enable);
+	ebpf_info("Config g_disable_syscall_tracing: %d\n", g_disable_syscall_tracing);
+	ebpf_info("Config go_tracing_timeout: %d\n", go_tracing_timeout);
+
 	tracer->data_limit_max = socket_data_limit_max;
 
 	// Insert prog of output data into map for using BPF Tail Calls.
 	insert_output_prog_to_map(tracer);
 
 	// Insert the unique identifier of the adaptation kernel into the map
-	insert_adapt_kern_uid_to_map(tracer);
+	insert_adapt_kern_data_to_map(tracer, 0, 0);
 
 	// Update protocol filter array
 	update_protocol_filter_array(tracer);
@@ -2671,6 +3121,11 @@ retry_load:
 					     EXTRA_TYPE_CLIENT)))
 		return ret;
 
+	if ((ret = register_extra_waiting_op("mount-offset-infer",
+					     mount_offset_infer,
+					     EXTRA_TYPE_CLIENT)))
+		return ret;
+
 	if ((ret =
 	     register_period_event_op("check-map-exceeded",
 				      check_map_exceeded,
@@ -2708,7 +3163,7 @@ int socket_tracer_stop(void)
 	if (t == NULL)
 		return ret;
 	if (t->state == TRACER_INIT) {
-		ebpf_warning
+		ebpf_info
 		    ("[eBPF Kernel Adapt] Adapting the linux kernel(%s) is in "
 		     "progress, please try the stop operation again later.\n",
 		     linux_release);
@@ -2716,7 +3171,7 @@ int socket_tracer_stop(void)
 	}
 
 	if (probes_act == ACT_DETACH) {
-		ebpf_warning
+		ebpf_info
 		    ("The latest probes_act is already ACT_DETACH, without operating.\n");
 
 		return 0;
@@ -2735,7 +3190,7 @@ int socket_tracer_start(void)
 		return ret;
 
 	if (t->state == TRACER_INIT) {
-		ebpf_warning
+		ebpf_info
 		    ("[eBPF Kernel Adapt] Adapting the linux kernel(%s) "
 		     "is in progress, please try "
 		     "the start operation again later.\n", linux_release);
@@ -2743,7 +3198,7 @@ int socket_tracer_start(void)
 	}
 
 	if (probes_act == ACT_ATTACH) {
-		ebpf_warning
+		ebpf_info
 		    ("The latest probes_act already ACT_ATTACH, without operating.\n");
 		return 0;
 	}
@@ -3094,9 +3549,18 @@ int print_uprobe_http2_info(const char *data, int len, char *buf, int buf_len)
 	return bytes;
 }
 
-int print_io_event_info(const char *data, int len, char *buf, int buf_len)
+int print_io_event_info(pid_t pid, u32 fd, const char *data, int len, char *buf, int buf_len)
 {
+	char *mount_file_tag;
+	char file_path[128];
+	snprintf(file_path, sizeof(file_path), "/proc/%d/mountinfo", pid);
+ 	if (access(file_path, F_OK) == 0)
+		mount_file_tag = "exist";
+	else
+		mount_file_tag = "not exist";
 
+	//char path[MAX_PATH_LENGTH];
+	//get_fd_path(pid, fd, path, sizeof(path));
 	int bytes = 0;
 	struct user_io_event_buffer *event =
 	    (struct user_io_event_buffer *)data;
@@ -3104,17 +3568,26 @@ int print_io_event_info(const char *data, int len, char *buf, int buf_len)
 	int path_len = strlen(event->filename) + 1;
 	if (datadump_enable) {
 		bytes = snprintf(buf, buf_len,
-				 "bytes_count=[%u]\noperation=[%u]\noffset=[%lu]\n"
-				 "latency=[%lu]\nfilename=[%s](len %d)\n",
+				 "bytes_count=[%u]\noperation=[%u]\noffset=[%llu]\n"
+				 "latency=[%llu]\nmount_source=[%s]\nmount_point=[%s]\n"
+				 "file_dir=[%s]\nfilename=[%s](len %d)\nfile_type=[%s]\n"
+				 "mountID=[%d]\nmntnsID=[%u]\nmountinfo file %s\n",
 				 event->bytes_count, event->operation,
-				 event->offset, event->latency, event->filename,
-				 path_len);
+				 event->offset, event->latency, event->mount_source,
+				 event->mount_point, event->file_dir, event->filename,
+				 path_len, fs_type_to_string(event->file_type),
+				 event->mnt_id, event->mntns_id, mount_file_tag);
 	} else {
 		fprintf(stdout,
-			"bytes_count=[%u]\noperation=[%u]\noffset=[%lu]\n"
-			"latency=[%lu]\nfilename=[%s](len %d)\n",
+			"bytes_count=[%u]\noperation=[%u]\noffset=[%llu]\n"
+			"latency=[%llu]\nmount_source=[%s]\nmount_point=[%s]\n"
+			"file_dir=[%s]\nfilename=[%s](len %d)\nfile_type=[%s]\n"
+			"mountID=[%d]\nmntnsID=[%u]\nmountinfo file %s\n",
 			event->bytes_count, event->operation, event->offset,
-			event->latency, event->filename, path_len);
+			event->latency, event->mount_source, event->mount_point,
+			event->file_dir, event->filename, path_len,
+			fs_type_to_string(event->file_type),
+			event->mnt_id, event->mntns_id, mount_file_tag);
 
 		fflush(stdout);
 	}
@@ -3252,69 +3725,78 @@ static char *flow_info(struct socket_bpf_data *sd)
 
 static bool allow_datadump(struct socket_bpf_data *sd)
 {
-	bool output = false;
-	if (datadump_pid == 0 && (strlen(datadump_comm) > 0)
-	    && (datadump_proto == 0)) {
-		if (strcmp((char *)sd->process_kname, (char *)datadump_comm) ==
-		    0) {
-			output = true;
-		}
+	bool match = true;
 
-	} else if (datadump_pid == 0 && (strlen(datadump_comm) == 0)
-		   && (datadump_proto == 0)) {
-		output = true;
-
-	} else if (datadump_pid > 0 && (strlen(datadump_comm) == 0)
-		   && (datadump_proto == 0)) {
-		if (sd->process_id == datadump_pid
-		    || sd->thread_id == datadump_pid)
-			output = true;
-
-	} else if (datadump_pid > 0 && (strlen(datadump_comm) > 0)
-		   && (datadump_proto == 0)) {
-		if ((sd->process_id == datadump_pid
-		     || sd->thread_id == datadump_pid)
-		    && (strcmp((char *)sd->process_kname, (char *)datadump_comm)
-			== 0))
-			output = true;
-	} else if (datadump_pid == 0 && (strlen(datadump_comm) > 0)
-		   && (datadump_proto > 0)) {
-		if (strcmp((char *)sd->process_kname, (char *)datadump_comm) ==
-		    0 && sd->l7_protocal_hint == datadump_proto)
-			output = true;
-
-	} else if (datadump_pid == 0 && (strlen(datadump_comm) == 0)
-		   && (datadump_proto > 0)) {
-		if (sd->l7_protocal_hint == datadump_proto)
-			output = true;
-
-	} else if (datadump_pid > 0 && (strlen(datadump_comm) == 0)
-		   && (datadump_proto > 0)) {
-		if ((sd->process_id == datadump_pid
-		     || sd->thread_id == datadump_pid)
-		    && sd->l7_protocal_hint == datadump_proto)
-			output = true;
-
-	} else if (datadump_pid > 0 && (strlen(datadump_comm) > 0)
-		   && (datadump_proto > 0)) {
-		if ((sd->process_id == datadump_pid
-		     || sd->thread_id == datadump_pid)
-		    && (strcmp((char *)sd->process_kname, (char *)datadump_comm)
-			== 0) && sd->l7_protocal_hint == datadump_proto)
-			output = true;
+	/* pid filter */
+	if (datadump_pid > 0) {
+		match &= (sd->process_id == datadump_pid ||
+			  sd->thread_id == datadump_pid);
 	}
 
-	return output;
+	/* comm filter */
+	if (strlen(datadump_comm) > 0) {
+		match &= strcmp((char *)sd->process_kname,
+				(char *)datadump_comm) == 0;
+	}
+
+	/* protocol filter */
+	if (datadump_proto > 0) {
+		match &= sd->l7_protocal_hint == datadump_proto;
+	}
+
+	/* ip filter */
+	if (strlen(datadump_ipaddr) > 0) {
+		char sbuf[64], dbuf[64];
+
+		if (sd->tuple.addr_len == 16) {
+			inet_ntop(AF_INET6, sd->tuple.rcv_saddr,
+				  sbuf, sizeof(sbuf));
+			inet_ntop(AF_INET6, sd->tuple.daddr,
+				  dbuf, sizeof(dbuf));
+		} else {
+			struct in_addr addr;
+
+			addr.s_addr = *((in_addr_t *) sd->tuple.rcv_saddr);
+			snprintf(sbuf, sizeof(sbuf), "%s", inet_ntoa(addr));
+
+			addr.s_addr = *((in_addr_t *) sd->tuple.daddr);
+			snprintf(dbuf, sizeof(dbuf), "%s", inet_ntoa(addr));
+		}
+
+		match &= (strcmp(sbuf, (char *)datadump_ipaddr) == 0 ||
+			  strcmp(dbuf, (char *)datadump_ipaddr) == 0);
+	}
+
+	/* port filter */
+	if (datadump_port > 0) {
+		match &= (datadump_port == sd->tuple.dport ||
+			  datadump_port == sd->tuple.num);
+	}
+
+	return match;
+}
+
+static int __unused get_fd_path(pid_t pid, u32 fd, char *buf, size_t bufsize)
+{
+	char link_path[64];
+	snprintf(link_path, sizeof(link_path), "/proc/%d/fd/%u", pid, fd);
+	ssize_t len = readlink(link_path, buf, bufsize - 1);
+	if (len < 0) {
+		return -1;
+	}
+
+	buf[len] = '\0';
+	return 0;
 }
 
 #define DATADUMP_FORMAT							\
 	"%s [datadump] SEQ %" PRIu64 " <%s> DIR %s TYPE %s(%d) PID %u "	\
-	"THREAD_ID %u COROUTINE_ID %" PRIu64 " ROLE %s"			\
+	"THREAD_ID %u COROUTINE_ID %" PRIu64 " FD %d ROLE %s"		\
 	" CONTAINER_ID %s SOURCE %d COMM %s "				\
 	"%s LEN %d SYSCALL_LEN %" PRIu64 " SOCKET_ID %" PRIu64		\
 	" " "TRACE_ID %" PRIu64 " TCP_SEQ %" PRIu64			\
-	" DATA_SEQ %" PRIu64 " TLS %s KernCapTime %s "			\
-	"KernMonoTime %llu us\n"
+	" DATA_SEQ %" PRIu64 " TLS %s SyscallTime %s "			\
+	"SyscallMonoTime %llu us CapTime %s CapMonoTime %llu us\n"
 
 static void print_socket_data(struct socket_bpf_data *sd, int64_t boot_time)
 {
@@ -3325,10 +3807,16 @@ static void print_socket_data(struct socket_bpf_data *sd, int64_t boot_time)
 	if (timestamp == NULL)
 		return;
 
-	int64_t k_fetch_time_us;
-	k_fetch_time_us = (sd->timestamp + boot_time) / NS_IN_USEC;
+	int64_t kern_time_us;
+	kern_time_us = (sd->timestamp + boot_time) / NS_IN_USEC;
+	char *kern_syscall_time = get_timestamp_from_us(kern_time_us);
+	if (kern_syscall_time == NULL) {
+		free(timestamp);
+		return;
+	}
 
-	char *kern_cap_time = get_timestamp_from_us(k_fetch_time_us);
+	kern_time_us = (sd->cap_timestamp + boot_time) / NS_IN_USEC;
+	char *kern_cap_time = get_timestamp_from_us(kern_time_us);
 	if (kern_cap_time == NULL) {
 		free(timestamp);
 		return;
@@ -3339,14 +3827,13 @@ static void print_socket_data(struct socket_bpf_data *sd, int64_t boot_time)
 	char *flow_str = flow_info(sd);
 	if (flow_str == NULL) {
 		free(timestamp);
+		free(kern_syscall_time);
 		free(kern_cap_time);
 		return;
 	}
 
 	if (sd->msg_type == MSG_REQUEST)
 		type = "req";
-	else if (sd->msg_type == MSG_RESPONSE)
-		type = "res";
 	else if (sd->msg_type == MSG_RESPONSE)
 		type = "res";
 	else
@@ -3367,14 +3854,15 @@ static void print_socket_data(struct socket_bpf_data *sd, int64_t boot_time)
 		     sd->source == DATA_SOURCE_DPDK ? "Pkt" : proto_tag,
 		     sd->direction == T_EGRESS ? "out" : "in", type,
 		     sd->msg_type, sd->process_id, sd->thread_id,
-		     sd->coroutine_id, role_str,
+		     sd->coroutine_id, sd->fd, role_str,
 		     strlen((char *)sd->container_id) ==
 		     0 ? "null" : (char *)sd->container_id, sd->source,
 		     sd->process_kname, flow_str, sd->cap_len,
 		     sd->syscall_len, sd->socket_id,
 		     sd->syscall_trace_id_call, sd->tcp_seq,
 		     sd->cap_seq, sd->is_tls ? "true" : "false",
-		     kern_cap_time, sd->timestamp / NS_IN_USEC);
+		     kern_syscall_time, sd->timestamp / NS_IN_USEC,
+		     kern_cap_time, sd->cap_timestamp / NS_IN_USEC);
 
 	if (sd->source == DATA_SOURCE_GO_HTTP2_UPROBE) {
 		len +=
@@ -3382,8 +3870,8 @@ static void print_socket_data(struct socket_bpf_data *sd, int64_t boot_time)
 					    buff + len, sizeof(buff) - len);
 	} else if (sd->source == DATA_SOURCE_IO_EVENT) {
 		len +=
-		    print_io_event_info(sd->cap_data, sd->cap_len, buff + len,
-					sizeof(buff) - len);
+		    print_io_event_info(sd->process_id, (__u32)sd->cap_seq, sd->cap_data,
+					sd->cap_len, buff + len, sizeof(buff) - len);
 	} else if (sd->source == DATA_SOURCE_GO_HTTP2_DATAFRAME_UPROBE) {
 		len +=
 		    print_uprobe_grpc_dataframe(sd->cap_data, sd->cap_len,
@@ -3429,6 +3917,7 @@ static void print_socket_data(struct socket_bpf_data *sd, int64_t boot_time)
 	}
 
 	free(timestamp);
+	free(kern_syscall_time);
 	free(kern_cap_time);
 	free(flow_str);
 
@@ -3538,7 +4027,31 @@ void enable_kprobe_feature(void)
 	ebpf_info("Kprobe feature has been enabled.\n");
 }
 
+void disable_unix_socket_feature(void)
+{
+	unix_socket_feature_enable = false;
+	ebpf_info("unix socket feature has been disabled.\n");
+}
+
+void enable_unix_socket_feature(void)
+{
+	unix_socket_feature_enable = true;
+	ebpf_info("unix socket feature has been enabled.\n");
+}
+
 bool is_pure_kprobe_ebpf(void)
 {
 	return g_k_type == K_TYPE_KPROBE;
+}
+
+void enable_fentry(void)
+{
+	use_kfunc_bin = true;
+	ebpf_info("Enabled the fentry/fexit feature\n");
+}
+
+void disable_fentry(void)
+{
+	use_kfunc_bin = false;
+	ebpf_info("Disabled the fentry/fexit feature\n");
 }

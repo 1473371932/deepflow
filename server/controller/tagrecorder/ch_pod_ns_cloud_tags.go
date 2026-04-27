@@ -28,12 +28,12 @@ import (
 
 type ChPodNSCloudTags struct {
 	SubscriberComponent[
-		*message.PodNamespaceAdd,
-		message.PodNamespaceAdd,
-		*message.PodNamespaceFieldsUpdate,
-		message.PodNamespaceFieldsUpdate,
-		*message.PodNamespaceDelete,
-		message.PodNamespaceDelete,
+		*message.AddedPodNamespaces,
+		message.AddedPodNamespaces,
+		*message.UpdatedPodNamespace,
+		message.UpdatedPodNamespace,
+		*message.DeletedPodNamespaces,
+		message.DeletedPodNamespaces,
 		metadbmodel.PodNamespace,
 		metadbmodel.ChPodNSCloudTags,
 		IDKey,
@@ -43,12 +43,12 @@ type ChPodNSCloudTags struct {
 func NewChPodNSCloudTags() *ChPodNSCloudTags {
 	mng := &ChPodNSCloudTags{
 		newSubscriberComponent[
-			*message.PodNamespaceAdd,
-			message.PodNamespaceAdd,
-			*message.PodNamespaceFieldsUpdate,
-			message.PodNamespaceFieldsUpdate,
-			*message.PodNamespaceDelete,
-			message.PodNamespaceDelete,
+			*message.AddedPodNamespaces,
+			message.AddedPodNamespaces,
+			*message.UpdatedPodNamespace,
+			message.UpdatedPodNamespace,
+			*message.DeletedPodNamespaces,
+			message.DeletedPodNamespaces,
 			metadbmodel.PodNamespace,
 			metadbmodel.ChPodNSCloudTags,
 			IDKey,
@@ -61,51 +61,26 @@ func NewChPodNSCloudTags() *ChPodNSCloudTags {
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChPodNSCloudTags) onResourceUpdated(sourceID int, fieldsUpdate *message.PodNamespaceFieldsUpdate, db *metadb.DB) {
-	updateInfo := make(map[string]interface{})
-
-	if fieldsUpdate.CloudTags.IsDifferent() {
-		bytes, err := json.Marshal(fieldsUpdate.CloudTags.GetNew())
-		if err != nil {
-			log.Error(err, db.LogPrefixORGID)
-			return
-		}
-		updateInfo["cloud_tags"] = string(bytes)
-	}
-	targetKey := IDKey{ID: sourceID}
-	if len(updateInfo) > 0 {
-		var chItem metadbmodel.ChPodNSCloudTags
-		db.Where("id = ?", sourceID).First(&chItem)
-		if chItem.ID == 0 {
-			c.SubscriberComponent.dbOperator.add(
-				[]IDKey{targetKey},
-				[]metadbmodel.ChPodNSCloudTags{{
-					ChIDBase: metadbmodel.ChIDBase{ID: sourceID}, CloudTags: updateInfo["cloud_tags"].(string)}},
-				db,
-			)
-		} else {
-			c.SubscriberComponent.dbOperator.update(chItem, updateInfo, IDKey{ID: sourceID}, db)
-		}
-	}
-	c.updateOrSync(db, targetKey, updateInfo)
+func (c *ChPodNSCloudTags) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedPodNamespace) {
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
 func (c *ChPodNSCloudTags) sourceToTarget(md *message.Metadata, source *metadbmodel.PodNamespace) (keys []IDKey, targets []metadbmodel.ChPodNSCloudTags) {
-	if len(source.CloudTags) == 0 {
+	cloudTagMap := MergeCloudTags(source.LearnedCloudTags, source.CustomCloudTags)
+	if len(cloudTagMap) == 0 {
 		return
 	}
-	bytes, err := json.Marshal(source.CloudTags)
+	bytes, err := json.Marshal(cloudTagMap)
 	if err != nil {
-		log.Error(err, logger.NewORGPrefix(md.ORGID))
+		log.Error(err, logger.NewORGPrefix(md.GetORGID()))
 		return
 	}
 	return []IDKey{{ID: source.ID}}, []metadbmodel.ChPodNSCloudTags{{
 		ChIDBase:    metadbmodel.ChIDBase{ID: source.ID},
 		CloudTags:   string(bytes),
-		TeamID:      md.TeamID,
-		DomainID:    md.DomainID,
-		SubDomainID: md.SubDomainID,
+		TeamID:      md.GetTeamID(),
+		DomainID:    md.GetDomainID(),
+		SubDomainID: md.GetSubDomainID(),
 	}}
 }
 

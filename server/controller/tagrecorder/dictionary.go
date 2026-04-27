@@ -66,11 +66,19 @@ func (c *Dictionary) Start(sCtx context.Context) {
 	go func() {
 		ticker := time.NewTicker(time.Duration(c.cfg.TagRecorderCfg.Interval) * time.Second)
 		defer ticker.Stop()
+		count := 0
+		times := c.cfg.TagRecorderCfg.DictionaryReloadInterval / c.cfg.TagRecorderCfg.Interval
 	LOOP:
 		for {
 			select {
 			case <-ticker.C:
-				c.Update()
+				count++
+				if count >= times {
+					c.Update(c.reloadDict)
+					count = 0
+				} else {
+					c.Update(c.update)
+				}
 			case <-sCtx.Done():
 				break LOOP
 			}
@@ -78,11 +86,28 @@ func (c *Dictionary) Start(sCtx context.Context) {
 	}()
 }
 
-func (c *Dictionary) Update() {
+func (c *Dictionary) reloadDict(clickHouseCfg *clickhouse.ClickHouseConfig) {
+	// reload the dictionary at all data nodes in the region
+	ckDb, err := clickhouse.Connect(*clickHouseCfg)
+	if err != nil {
+		log.Error(err)
+		return
+	}
+	defer ckDb.Close()
+	log.Infof("reload clickhouse dictionary in (%s: %d)", clickHouseCfg.Host, clickHouseCfg.Port)
+	reloadSql := "SYSTEM RELOAD DICTIONARIES"
+	_, err = ckDb.Exec(reloadSql)
+	if err != nil {
+		log.Error(err)
+		return
+	}
+}
+
+func (c *Dictionary) Update(updateFunc func(*clickhouse.ClickHouseConfig)) {
 	log.Info("tagrecorder update ch dictionary")
 	if common.IsStandaloneRunningMode() {
 		// in standalone mode, only supports one ClickHouse node
-		c.update(&c.cfg.ClickHouseCfg)
+		updateFunc(&c.cfg.ClickHouseCfg)
 		return
 	}
 
@@ -136,7 +161,7 @@ func (c *Dictionary) Update() {
 				for _, port := range subset.Ports {
 					if port.Name == c.cfg.ClickHouseCfg.EndpointTcpPortName {
 						clickHouseCfg.Port = uint32(port.Port)
-						c.update(&clickHouseCfg)
+						updateFunc(&clickHouseCfg)
 					}
 				}
 			}
@@ -211,6 +236,7 @@ func (c *Dictionary) update(clickHouseCfg *clickhouse.ClickHouseConfig) {
 		CH_DICTIONARY_POD_K8S_ENVS,
 		CH_DICTIONARY_POD_SERVICE,
 		CH_DICTIONARY_CHOST,
+		CH_DICTIONARY_BIZ_SERVICE,
 		CH_TARGET_LABEL,
 		CH_APP_LABEL,
 		CH_PROMETHEUS_LABEL_NAME,
@@ -221,17 +247,18 @@ func (c *Dictionary) update(clickHouseCfg *clickhouse.ClickHouseConfig) {
 		CH_DICTIONARY_POLICY,
 		CH_DICTIONARY_NPB_TUNNEL,
 		CH_DICTIONARY_ALARM_POLICY,
+		CH_DICTIONARY_CUSTOM_BIZ_SERVICE,
+		CH_DICTIONARY_CUSTOM_BIZ_SERVICE_FILTER,
 	)
 	// 根据不同的组织进行更新
 	orgIDs, err := metadb.GetORGIDs()
 	if err != nil {
 		log.Errorf("get org info fail : %s", err)
 	}
-
 	for _, orgID := range orgIDs {
 		if orgID != metaDBCommon.DEFAULT_ORG_ID {
-			sqlDatabaseName = "`" + fmt.Sprintf(metaDBCommon.DATABASE_PREFIX_ALIGNMENT, orgID) + "_" + sqlDatabaseName + "`"
-			ckDatabaseName = "`" + fmt.Sprintf(metaDBCommon.DATABASE_PREFIX_ALIGNMENT, orgID) + "_" + ckDatabaseName + "`"
+			sqlDatabaseName = "`" + fmt.Sprintf(metaDBCommon.DATABASE_PREFIX_ALIGNMENT, orgID) + "_" + c.source.Database + "`"
+			ckDatabaseName = "`" + fmt.Sprintf(metaDBCommon.DATABASE_PREFIX_ALIGNMENT, orgID) + "_" + c.cfg.ClickHouseCfg.Database + "`"
 		}
 		var databases []string
 		// 检查并创建数据库
@@ -334,9 +361,11 @@ func (c *Dictionary) update(clickHouseCfg *clickhouse.ClickHouseConfig) {
 			if createSQL == checkDictSQL {
 				continue
 			}
+			logCheckSQL := strings.Replace(checkDictSQL, c.source.UserPassword, "[HIDDEN]", 1)
+			logCreateSQL := strings.Replace(createSQL, c.source.UserPassword, "[HIDDEN]", 1)
 			log.Infof("update dictionary %s", dictName, logger.NewORGPrefix(orgID))
-			log.Infof("exist dictionary %s", checkDictSQL, logger.NewORGPrefix(orgID))
-			log.Infof("wanted dictionary %s", createSQL, logger.NewORGPrefix(orgID))
+			log.Infof("exist dictionary %s", logCheckSQL, logger.NewORGPrefix(orgID))
+			log.Infof("wanted dictionary %s", logCreateSQL, logger.NewORGPrefix(orgID))
 			dropSQL := fmt.Sprintf("DROP DICTIONARY %s.%s", ckDatabaseName, dictName)
 			_, err = ckDb.Exec(dropSQL)
 			if err != nil {
@@ -360,7 +389,7 @@ func (c *Dictionary) update(clickHouseCfg *clickhouse.ClickHouseConfig) {
 			log.Error(err, logger.NewORGPrefix(orgID))
 			return
 		}
-		if versions[0] > common.CLICK_HOUSE_VERSION {
+		if common.CompareVersion(versions[0], common.CLICK_HOUSE_VERSION) >= 0 {
 			continue
 		}
 		// Get the current view in the database
@@ -438,21 +467,30 @@ func (c *Dictionary) update(clickHouseCfg *clickhouse.ClickHouseConfig) {
 
 }
 
+func (c *Dictionary) makeSourceClause(db, table string) string {
+	switch c.source.Name {
+	case metaDBCommon.SOURCE_MYSQL, metaDBCommon.SOURCE_POSTGRESQL:
+		return fmt.Sprintf(
+			SQL_SOURCE_MYSQL, c.source.Name, c.source.Host, c.source.Port, c.source.UserName, c.source.UserPassword, c.source.ReplicaSQL, db, table, table,
+		)
+	case metaDBCommon.SOURCE_DM:
+		return fmt.Sprintf(
+			SQL_SOURCE_DM, c.source.DSN, db, table, db, table,
+		)
+	default:
+		return ""
+	}
+}
+
 func (c *Dictionary) fillCreateSQL(dictName string, ckDatabaseName string, sqlDatabaseName string) string {
 	chTable := chDictNameToMetaDBTableName(dictName)
+	sourceClause := c.makeSourceClause(sqlDatabaseName, chTable)
 	createSQL := CREATE_SQL_MAP[dictName]
 	return fmt.Sprintf(
 		createSQL,
 		ckDatabaseName,
 		dictName,
-		c.source.Name,
-		c.source.Host,
-		c.source.Port,
-		c.source.UserName,
-		c.source.UserPassword,
-		c.source.ReplicaSQL,
-		sqlDatabaseName,
-		chTable,
-		chTable,
-		c.cfg.TagRecorderCfg.DictionaryRefreshInterval)
+		sourceClause,
+		c.cfg.TagRecorderCfg.DictionaryRefreshInterval,
+	)
 }

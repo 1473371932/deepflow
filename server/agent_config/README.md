@@ -39,7 +39,7 @@ deepflow-agent uses cgroups to limit CPU usage.
 
 **Tags**:
 
-`hot_update`
+<mark>agent_restart</mark>
 
 **FQCN**:
 
@@ -64,6 +64,11 @@ global:
 **Description**:
 
 deepflow-agent uses cgroups to limit memory usage.
+
+Note:
+- Memory of the dedicated deepflow-agent is not limited
+- Memory limits for container deepflow-agent are enforced by container
+- Memory limits for container deepflow-agent in the same cluster need to be consistent
 
 ### Maximum Log Backhaul Rate {#global.limits.max_log_backhaul_rate}
 
@@ -246,7 +251,9 @@ global:
 
 **Description**:
 
-Maximum number of threads that deepflow-agent is allowed to launch.
+The maximum number of threads deepflow-agent is allowed to create.
+- When the number of threads exceeds this limit, an exception alert will be triggered.
+- When the number of threads exceeds twice this limit value, a deepflow-agent restart will be triggered.
 
 ### Process Limit {#global.alerts.process_threshold}
 
@@ -275,7 +282,9 @@ global:
 
 **Description**:
 
-Maximum number of processes that deepflow-agent is allowed to launch.
+The maximum number of processes named `deepflow-agent` is allowed to launch.
+If the number of processes named `deepflow-agent` in the current system reaches this limit,
+subsequent processes named `deepflow-agent` will fail to start.
 
 ### Core File Checker {#global.alerts.check_core_file_disabled}
 
@@ -571,6 +580,103 @@ global:
 
 Monitoring interval for outbound traffic rate of NPB interface.
 
+### Free Disk {#global.circuit_breakers.free_disk}
+
+#### Percentage Trigger Threshold {#global.circuit_breakers.free_disk.percentage_trigger_threshold}
+
+**Tags**:
+
+`hot_update`
+
+**FQCN**:
+
+`global.circuit_breakers.free_disk.percentage_trigger_threshold`
+
+**Default value**:
+```yaml
+global:
+  circuit_breakers:
+    free_disk:
+      percentage_trigger_threshold: 15
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Unit | % |
+| Range | [0, 100] |
+
+**Description**:
+
+This configuration is only valid when the Agent runs in a non-container environment. Configuring to 0 means disabling the threshold.
+The observed disks are the disks where the `global.circuit_breakers.free_disk.directories` are located.
+1. When the system `free disk ratio` is lower than `this threshold`, the Agent enters the fuse disabled state,
+   and sets the `FREE_DISK_CIRCUIT_BREAKER` abnormal state, and reports the Agent abnormal alarm.
+2. When the system `free disk ratio` is higher than `this threshold * 110%`, the Agent recovers from the abnormal state.
+
+#### Absolute_Trigger Threshold {#global.circuit_breakers.free_disk.absolute_trigger_threshold}
+
+**Tags**:
+
+`hot_update`
+
+**FQCN**:
+
+`global.circuit_breakers.free_disk.absolute_trigger_threshold`
+
+**Default value**:
+```yaml
+global:
+  circuit_breakers:
+    free_disk:
+      absolute_trigger_threshold: 10
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Unit | GB |
+| Range | [0, 100000] |
+
+**Description**:
+
+This configuration is only valid when the Agent runs in a non-container environment. Configuring to 0 means disabling the threshold.
+The observed disks are the disks where the `global.circuit_breakers.free_disk.directories` is located.
+1. When the system `free disk size` is lower than `this threshold`, the Agent enters the fuse disabled state,
+   and sets the `FREE_DISK_CIRCUIT_BREAKER` abnormal state, and reports the Agent abnormal alarm.
+2. When the system `free disk size` is higher than `this threshold * 110%`, the Agent recovers from the abnormal state.
+
+#### Directories {#global.circuit_breakers.free_disk.directories}
+
+**Tags**:
+
+`hot_update`
+
+**FQCN**:
+
+`global.circuit_breakers.free_disk.directories`
+
+**Default value**:
+```yaml
+global:
+  circuit_breakers:
+    free_disk:
+      directories:
+      - /
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | string |
+
+**Description**:
+
+Observe the disk space where the directories is located.
+For the `windows` operating system, the default value is `c:\`.
+
 ## Tunning {#global.tunning}
 
 Tune the runtime of deepflow-agent.
@@ -603,8 +709,9 @@ global:
 **Description**:
 
 CPU affinity is the tendency of a process to run on a given CPU for as long as possible
-without being migrated to other processors. Invalid ID will be ignored. Currently only
-works for dispatcher threads. Example:
+without being migrated to other processors. Invalid ID will be ignored. The setting
+applies to existing deepflow-agent threads as well, except self-managed kick-kern.*
+eBPF threads. Example:
 ```yaml
 global:
   tunning:
@@ -615,7 +722,7 @@ global:
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -645,7 +752,7 @@ The smaller the value of process scheduling priority, the higher the priority of
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -669,6 +776,33 @@ global:
 
 Proactive memory trimming can effectively reduce memory usage, but there may be
 performance loss.
+
+### Turn off swap memory {#global.tunning.swap_disabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`global.tunning.swap_disabled`
+
+**Default value**:
+```yaml
+global:
+  tunning:
+    swap_disabled: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Note that disabling swap memory requires root and CAP_IPC_LOCK permissions, and disabling
+swap memory may improve performance and reduce CPU usage, but memory will increase.
 
 ### Page Cache Reclaim Percentage {#global.tunning.page_cache_reclaim_percentage}
 
@@ -713,7 +847,7 @@ Note:
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -778,6 +912,9 @@ global:
 Whether to synchronize the clock to the deepflow-server, this behavior
 will not change the time of the deepflow-agent running environment.
 
+Notice: Before enabling NTP, the controller needs to first start the NTP service. The agent will
+only continue to work after the time synchronization is complete.
+
 ### Maximum Drift {#global.ntp.max_drift}
 
 **Tags**:
@@ -801,7 +938,7 @@ global:
 | Key  | Value                        |
 | ---- | ---------------------------- |
 | Type | duration |
-| Range | [0, '365d'] |
+| Range | ['0ns', '365d'] |
 
 **Description**:
 
@@ -830,7 +967,7 @@ global:
 | Key  | Value                        |
 | ---- | ---------------------------- |
 | Type | duration |
-| Range | [0, '365d'] |
+| Range | ['0ns', '365d'] |
 
 **Description**:
 
@@ -1030,6 +1167,7 @@ of deepflow-agent outside the cluster is 30033.
 **Tags**:
 
 `hot_update`
+<mark>deprecated</mark>
 
 **FQCN**:
 
@@ -1185,7 +1323,7 @@ global:
 | ----- | ---------------------------- |
 | DEBUG | |
 | INFO | |
-| WARNING | |
+| WARN | |
 | ERROR | |
 
 **Schema**:
@@ -1217,7 +1355,7 @@ will set the log level to INFO for all modules and DEBUG for the rpc::session mo
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1537,7 +1675,7 @@ type in CLI environments.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1565,7 +1703,7 @@ The /proc fs mount path.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1577,30 +1715,30 @@ Upgrade from old version: `static_config.os-proc-socket-sync-interval`
 ```yaml
 inputs:
   proc:
-    socket_info_sync_interval: 0
+    socket_info_sync_interval: 0ns
 ```
 
 **Schema**:
 | Key  | Value                        |
 | ---- | ---------------------------- |
 | Type | duration |
-| Range | [0, '1h'] |
+| Range | ['0ns', '1h'] |
 
 **Description**:
 
 Synchronization interval for process Socket information.
 
-0 means disabled, do not configure a value less than `1s` except for 0.
+'0ns' means disabled, do not configure a value less than `1s` except for 0.
 
 Note: When enabling this feature, the specific process list must also be specified in `inputs.proc.process_matcher`,
-i.e., `inputs.proc.socket_info_sync_interval` must be included in `inputs.proc.process_matcher.[*].enabled_features`.
+i.e., `proc.socket_list` must be included in `inputs.proc.process_matcher.[*].enabled_features`.
 Additionally, ensure `inputs.proc.enabled` is configured to **true**.
 
 ### Minimal Lifetime {#inputs.proc.min_lifetime}
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1631,7 +1769,7 @@ Socket and Process will not be reported if their uptime is lower than this thres
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1678,7 +1816,7 @@ inputs:
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1703,11 +1841,46 @@ inputs:
 
 The user who should execute the `script_command` command.
 
+### Process Blacklist {#inputs.proc.process_blacklist}
+
+**Tags**:
+
+`hot_update`
+
+**FQCN**:
+
+`inputs.proc.process_blacklist`
+
+**Default value**:
+```yaml
+inputs:
+  proc:
+    process_blacklist:
+    - sleep
+    - sh
+    - bash
+    - pause
+    - runc
+    - grep
+    - awk
+    - sed
+    - curl
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | string |
+
+**Description**:
+
+The list of processe names ignored by process matcher.
+
 ### Process Matcher {#inputs.proc.process_matcher}
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1721,11 +1894,6 @@ inputs:
   proc:
     process_matcher:
     - enabled_features:
-      - proc.gprocess_info
-      ignore: true
-      match_regex: ^(sleep|sh|bash|pause|runc)$
-      only_in_container: false
-    - enabled_features:
       - ebpf.profile.on_cpu
       - proc.gprocess_info
       match_regex: \bjava( +\S+)* +-jar +(\S*/)*([^ /]+\.jar)
@@ -1735,7 +1903,35 @@ inputs:
     - enabled_features:
       - ebpf.profile.on_cpu
       - proc.gprocess_info
+      match_regex: \bjava( +\S+)* +-(?:cp|classpath) +\S+ +(?P<CLASS_NAME>[$_A-Za-z][$_0-9A-Za-z]*(?:\.[$_A-Za-z][$_0-9A-Za-z]*)*)
+      match_type: cmdline_with_args
+      only_in_container: false
+      rewrite_name: ${CLASS_NAME}
+    - enabled_features:
+      - ebpf.profile.on_cpu
+      - proc.gprocess_info
       match_regex: \bpython(\S)*( +-\S+)* +(\S*/)*([^ /]+)
+      match_type: cmdline_with_args
+      only_in_container: false
+      rewrite_name: $4
+    - enabled_features:
+      - ebpf.profile.on_cpu
+      - proc.gprocess_info
+      match_regex: \b(?:lua|luajit)(\S)*( +-\S+)* +(\S*/)*([^ /]+)
+      match_type: cmdline_with_args
+      only_in_container: false
+      rewrite_name: $5
+    - enabled_features:
+      - ebpf.profile.on_cpu
+      - proc.gprocess_info
+      match_regex: \bphp(\d+)?(-fpm|-cli|-cgi)?( +-\S+)* +(\S*/)*([^ /]+\.php)
+      match_type: cmdline_with_args
+      only_in_container: false
+      rewrite_name: $5
+    - enabled_features:
+      - ebpf.profile.on_cpu
+      - proc.gprocess_info
+      match_regex: \b(node|nodejs)( +--\S+)* +(\S*/)*([^ /]+\.js)
       match_type: cmdline_with_args
       only_in_container: false
       rewrite_name: $4
@@ -1813,7 +2009,7 @@ inputs:
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1842,7 +2038,7 @@ The regex of matcher.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1855,7 +2051,7 @@ Upgrade from old version: `static_config.os-proc-regex.match-type`
 inputs:
   proc:
     process_matcher:
-    - match_type: ''
+    - match_type: process_name
 ```
 
 **Enum options**:
@@ -1880,7 +2076,7 @@ The type of matcher.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1900,6 +2096,8 @@ inputs:
 | java | |
 | golang | |
 | python | |
+| lua | |
+| php | |
 | nodejs | |
 | dotnet | |
 
@@ -1916,7 +2114,7 @@ Default value `[]` match all languages.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1943,7 +2141,7 @@ Default value `[]` match all usernames.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1970,7 +2168,7 @@ Default value `true` means only match processes in container.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1999,7 +2197,7 @@ Default value `false` means match processes with or without tags.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -2028,7 +2226,7 @@ Whether to ignore matched processes.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -2057,7 +2255,7 @@ New name after matched.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -2076,14 +2274,14 @@ inputs:
 **Enum options**:
 | Value | Note                         |
 | ----- | ---------------------------- |
-| proc.gprocess_info | |
-| proc.golang_symbol_table | |
-| proc.socket_list | |
-| ebpf.socket.uprobe.golang | |
-| ebpf.socket.uprobe.tls | |
-| ebpf.profile.on_cpu | |
-| ebpf.profile.off_cpu | |
-| ebpf.profile.memory | |
+| proc.gprocess_info | Synchronize process resource information and inject process tags from the observation point into raw eBPF data |
+| proc.golang_symbol_table | Parse Golang-specific symbol tables to optimize profiling data when Golang processes prune the standard symbol table |
+| proc.socket_list | Synchronize active socket information of processes to inject process labels for both peers in application and network observation data |
+| ebpf.socket.uprobe.golang | Enable eBPF uprobe for Golang processes to trace goroutines and capture Golang HTTP/2 and HTTPS communications |
+| ebpf.socket.uprobe.tls | Enable eBPF uprobe for TLS communications to capture encrypted communication data from non-Golang processes |
+| ebpf.profile.on_cpu | Enable continuous On-CPU profiling |
+| ebpf.profile.off_cpu | Enable continuous Off-CPU profiling |
+| ebpf.profile.memory | Enable continuous memory profiling |
 
 **Schema**:
 | Key  | Value                        |
@@ -2887,7 +3085,7 @@ Note: After the NIC is enabled in promiscuous mode, more traffic will be collect
 
 #### DPDK {#inputs.cbpf.special_network.dpdk}
 
-##### source {#inputs.cbpf.special_network.dpdk.source}
+##### Data Source {#inputs.cbpf.special_network.dpdk.source}
 
 **Tags**:
 
@@ -2923,7 +3121,7 @@ inputs:
 
 Currently, there are two ways to collect DPDK traffic, including:
 - pdump: See details [https://dpdk-docs.readthedocs.io/en/latest/prog_guide/multi_proc_support.html](https://dpdk-docs.readthedocs.io/en/latest/prog_guide/multi_proc_support.html)
-- eBPF: Use eBPF Uprobe to obtain DPDK traffic
+- eBPF: Use eBPF Uprobe to obtain DPDK traffic, configuration `inputs.ebpf.socket.uprobe.dpdk` is also required.
 
 ##### reorder cache window size {#inputs.cbpf.special_network.dpdk.reorder_cache_window_size}
 
@@ -3366,12 +3564,18 @@ inputs:
 **Schema**:
 | Key  | Value                        |
 | ---- | ---------------------------- |
-| Type | int |
-| Range | [1, 65535] |
+| Type | string |
 
 **Description**:
 
 For the specified ports, consecutive TCP packets will be aggregated together for application log parsing.
+
+Example: 
+
+packet_segmentation_reassembly:
+- 1000
+- 2000-2010
+- 5000
 
 ### Physical Mirror Traffic {#inputs.cbpf.physical_mirror}
 
@@ -3572,12 +3776,12 @@ inputs:
 | Key  | Value                        |
 | ---- | ---------------------------- |
 | Type | duration |
-| Range | [0, '1d'] |
+| Range | ['0ns', '1d'] |
 
 **Description**:
 
 The expected maximum time interval between the server receiving the request and returning
-the response, If the value is 0, this feature is disabled. Tracing only considers the
+the response, If the value is '0ns', this feature is disabled. Tracing only considers the
 thread number.
 
 ##### TLS {#inputs.ebpf.socket.uprobe.tls}
@@ -3618,6 +3822,11 @@ One can use the following method to determine whether an application process can
 - Use the command `cat /proc/<PID>/maps | grep "libssl.so"` to check if it contains
   information about openssl. If it does, it indicates that this process is using the
   openssl library.
+- If "libssl.so" is not found above, it may indicate that the program
+  is statically linked with OpenSSL. In that case, you can verify it by:
+  running the command `sudo nm /proc/<PID>/exe | grep SSL_write`.
+  If the output contains symbols such as `0000000000502ac0 T SSL_write`,
+  it means the process is using a statically linked OpenSSL library.
 
 After enabled, deepflow-agent will retrieve process information that
 matches the regular expression, hooking the corresponding encryption/decryption
@@ -3625,9 +3834,12 @@ interfaces of the openssl library. In the logs, you will encounter a message sim
 to the following:
 ```
 [eBPF] INFO openssl uprobe, pid:1005, path:/proc/1005/root/usr/lib64/libssl.so.1.0.2k
+OR
+[eBPF] INFO openssl uprobe, pid:28890, path:/proc/28890/root/usr/sbin/nginx
 ```
 
-Note: When enabling this feature, the specific process list must also be specified in `inputs.proc.process_matcher`,
+Note: When this feature is enabled, Envoy mTLS traffic can be automatically traced.
+For non-Envoy traffic, the specific process list must also be specified in `inputs.proc.process_matcher`,
 i.e., `ebpf.socket.uprobe.tls` must be included in `inputs.proc.process_matcher.[*].enabled_features`.
 
 ##### DPDK {#inputs.ebpf.socket.uprobe.dpdk}
@@ -3663,7 +3875,13 @@ inputs:
 Set the command name of the DPDK application, eBPF will automatically
 locate and trace packets for data collection.
 
-Example: In the command line `/usr/bin/mydpdk`, it can be set as `command: mydpdk`
+Example: In the command line `/usr/bin/mydpdk`, it can be set as `command: mydpdk`, and set `inputs.cbpf.special_network.dpdk.source = eBPF`
+
+In scenarios where DPDK acts as the vhost-user backend, data exchange between the virtual machine and the DPDK
+application occurs through virtqueues (vrings). eBPF can automatically hook into the vring interface without
+requiring any modifications to DPDK or the virtual machine, enabling packet capture and traffic observability
+with zero additional configuration. In contrast, capturing packets on physical NICs requires explicit configuration
+of the corresponding DPDK driver interfaces.
 
 ###### DPDK Application RX Hooks Configuration {#inputs.ebpf.socket.uprobe.dpdk.rx_hooks}
 
@@ -3824,6 +4042,34 @@ inputs:
 
 When set to true, kprobe will be disabled.
 
+##### Unix Socket Enabled {#inputs.ebpf.socket.kprobe.enable_unix_socket}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.socket.kprobe.enable_unix_socket`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    socket:
+      kprobe:
+        enable_unix_socket: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+When set to true, enable tracing of Unix domain sockets.
+
 ##### Blacklist {#inputs.ebpf.socket.kprobe.blacklist}
 
 ###### Port Numbers {#inputs.ebpf.socket.kprobe.blacklist.ports}
@@ -3894,6 +4140,80 @@ TCP&UDP Port Whitelist, Priority lower than kprobe-blacklist.
 Use kprobe to collect data on ports that are not in the blacklist or whitelist.
 
 Example: `ports: 80,1000-2000`
+
+#### SockOps {#inputs.ebpf.socket.sock_ops}
+
+##### TCP Option Trace {#inputs.ebpf.socket.sock_ops.tcp_option_trace}
+
+###### TCP Option Tracing {#inputs.ebpf.socket.sock_ops.tcp_option_trace.enabled}
+
+**Tags**:
+
+`hot_update`
+
+**FQCN**:
+
+`inputs.ebpf.socket.sock_ops.tcp_option_trace.enabled`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    socket:
+      sock_ops:
+        tcp_option_trace:
+          enabled: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Whether to enable the tcp-option tracing SockOps program, which injects DeepFlow metadata
+(for example, process PID) into a custom TCP option for eligible connections.
+Note: This feature requires cgroup v2 (unified hierarchy) and kernel > 5.10. On hosts
+using cgroup v1 the SockOps program will fail to attach and the agent will log a warning.
+Compatibility: validated on x86 with kernel > 5.10; on arm we have only tested with
+kernel 6.8 so far.
+Limitation: PID tracking relies on the per-CPU syscall map in. Under CPU congestion,
+softirqs handling TCP may run on a different CPU than the userspace thread, so the
+injected metadata can be missing or stale.
+
+###### PID Injection Window {#inputs.ebpf.socket.sock_ops.tcp_option_trace.sampling_window_bytes}
+
+**Tags**:
+
+`hot_update`
+
+**FQCN**:
+
+`inputs.ebpf.socket.sock_ops.tcp_option_trace.sampling_window_bytes`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    socket:
+      sock_ops:
+        tcp_option_trace:
+          sampling_window_bytes: 16384
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Unit | Bytes |
+| Range | [0, 1048576] |
+
+**Description**:
+
+Minimum number of TCP payload bytes between PID injections. Default 16KB matches the
+legacy behavior; smaller windows increase frequency, larger windows decrease it. Set to
+0 to disable sampling and inject on every eligible packet.
 
 #### Tunning {#inputs.ebpf.socket.tunning}
 
@@ -3993,6 +4313,44 @@ degradation. This configuration only applies to maps of type 'BPF_MAP_TYPE_HASH'
 Currently applicable to socket trace and uprobe Golang/OpenSSL trace functionalities.
 Disabling memory preallocation will approximately reduce memory usage by 45MB.
 
+##### Enable the fentry/fexit feature {#inputs.ebpf.socket.tunning.fentry_enabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.socket.tunning.fentry_enabled`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    socket:
+      tunning:
+        fentry_enabled: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Explanation of Using fentry/fexit Features
+- Compared to traditional kprobes, fentry and fexit programs offer higher performance and
+  availability, providing approximately 5%-10% performance improvement.
+- Some Linux kernels do not fully support this feature, which may lead to kernel bugs and
+  node crashes. Known bug fixes include:
+  - Bug fix for TencentOS Linux kernel 5.4.119
+    [https://github.com/torvalds/linux/commit/c3d6324f841bab2403be6419986e2b1d1068d423](https://github.com/torvalds/linux/commit/c3d6324f841bab2403be6419986e2b1d1068d423)
+  - Bug fix for Alibaba Cloud Linux kernel 5.10.23
+    [https://github.com/gregkh/linux/commit/e21d2b92354b3cd25dd774ebb0f0e52ff04a7861](https://github.com/gregkh/linux/commit/e21d2b92354b3cd25dd774ebb0f0e52ff04a7861)
+- Kernel recommendation: To enable the fentry/fexit feature, it is recommended to use Linux
+  kernel 5.10.28 or later to ensure stability and performance.
+
 #### Preprocess {#inputs.ebpf.socket.preprocess}
 
 ##### OOOR Cache Size {#inputs.ebpf.socket.preprocess.out_of_order_reassembly_cache_size}
@@ -4014,7 +4372,7 @@ inputs:
   ebpf:
     socket:
       preprocess:
-        out_of_order_reassembly_cache_size: 16
+        out_of_order_reassembly_cache_size: 256
 ```
 
 **Schema**:
@@ -4077,7 +4435,40 @@ the agent's memory usage.
 
 Supported protocols: [https://www.deepflow.io/docs/features/l7-protocols/overview/](https://www.deepflow.io/docs/features/l7-protocols/overview/)
 
-Attention: use `HTTP2` for `gRPC` Protocol.
+Attention: configuring `HTTP2` or `gRPC` will enable both protocols.
+
+##### OOOR Timeout {#inputs.ebpf.socket.preprocess.out_of_order_reassembly_timeout}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`inputs.ebpf.socket.preprocess.out_of_order_reassembly_timeout`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    socket:
+      preprocess:
+        out_of_order_reassembly_timeout: 100ms
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | duration |
+| Range | ['100ms', '1s'] |
+
+**Description**:
+
+When the OOOR cache data times out, it will be output directly. This parameter can be adjusted according to metric
+`deepflow_agent_ebpf_collect.metrics.time_backtrack_max`.
+
+Note: Increasing this value will consume more memory
 
 ##### SR Protocols {#inputs.ebpf.socket.preprocess.segmentation_reassembly_protocols}
 
@@ -4121,7 +4512,7 @@ multiple syscalls before parsing it. This enhances the success rate of applicati
 protocol parsing. Note that `out_of_order_reassembly_protocols` must also be enabled for
 this feature to be effective.
 Supported protocols: [https://www.deepflow.io/docs/features/l7-protocols/overview/](https://www.deepflow.io/docs/features/l7-protocols/overview/)
-Attention: use `HTTP2` for `gRPC` Protocol.
+Attention: configuring `HTTP2` or `gRPC` will enable both protocols.
 
 ### File {#inputs.ebpf.file}
 
@@ -4167,6 +4558,14 @@ Collection modes:
 - Request Life Cycle: Indicates that only IO events within the request life cycle are collected.
 - All: Indicates that all IO events are collected.
 
+Note:
+- To obtain the full file path, we need to combine it with the process's mount information. However,
+  some processes exit quickly after completing their tasks. When we attempt to process the file I/O
+  data generated by such processes, the corresponding /proc/[pid]/mountinfo entry may no longer be
+  available, resulting in incomplete paths (missing mount points). For processes with a lifetime
+  shorter than 50 ms, the file path may lack mount point information. This issue does not occur with
+  long-running processes.
+
 ##### Minimal Duration {#inputs.ebpf.file.io_event.minimal_duration}
 
 **Tags**:
@@ -4197,6 +4596,38 @@ inputs:
 **Description**:
 
 Only collect IO events with delay exceeding this threshold.
+
+##### Virtual File Collection Enabled {#inputs.ebpf.file.io_event.enable_virtual_file_collect}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.file.io_event.enable_virtual_file_collect`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    file:
+      io_event:
+        enable_virtual_file_collect: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+When set to true, the agent will collect file I/O events generated on
+virtual file systems (such as /proc, /sys, /run, and other kernel
+pseudo file systems).
+When set to false, the agent will not collect file I/O events from
+virtual file systems.
 
 ### Profile {#inputs.ebpf.profile}
 
@@ -4540,11 +4971,11 @@ inputs:
 | Key  | Value                        |
 | ---- | ---------------------------- |
 | Type | duration |
-| Range | [0, '1h'] |
+| Range | ['0ns', '1h'] |
 
 **Description**:
 
-If set to 0, there will be no minimum value limitation. Scheduler events are still
+If set to '0ns', there will be no minimum value limitation. Scheduler events are still
 high-frequency events, as their rate may exceed 1 million events per second, so
 caution should still be exercised.
 
@@ -4653,6 +5084,106 @@ inputs:
 Agent uses LRU cache to record process allocated addresses to avoid uncontrolled
 memory usage. Each record in this LRU is about 80B.
 
+##### Sort length {#inputs.ebpf.profile.memory.sort_length}
+
+**Tags**:
+
+`hot_update`
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.memory.sort_length`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      memory:
+        sort_length: 16384
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [0, 65536] |
+
+**Description**:
+
+In order to match mallocs and frees, memory profiler will sort data by timestamp before processing.
+This parameter is the length of the sorted array.
+When configuring this option, first adjust the `sort_interval` parameter according to the instructions,
+and then refer to the agent performance statistics in `deepflow_agent_ebpf_memory_profiler`
+`dequeued_by_length` and `dequeued_by_interval` metrics, appropriately reduce this parameter
+while ensuring that the former is several times smaller than the latter.
+
+##### Sort interval {#inputs.ebpf.profile.memory.sort_interval}
+
+**Tags**:
+
+`hot_update`
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.memory.sort_interval`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      memory:
+        sort_interval: 1500ms
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | duration |
+| Range | ['1ns', '10s'] |
+
+**Description**:
+
+In order to match mallocs and frees, memory profiler will sort data by timestamp before processing.
+This parameter controls the max span of interval between the first and last item in the sorted array.
+Refer to agent performance statistics in `deepflow_agent_ebpf_memory_profiler`,
+making `time_backtracked` to 0. Configurion `sort_length` may also need to be increased.
+
+##### Queue Size {#inputs.ebpf.profile.memory.queue_size}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.memory.queue_size`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      memory:
+        queue_size: 32768
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [4096, 64000000] |
+
+**Description**:
+
+Memory profiler inner queue size.
+Refer to agent performance statistics in `deepflow_agent_ebpf_memory_profiler`,
+making `overwritten` to 0 and `pending` not exceeding this configuration.
+
 #### Preprocess {#inputs.ebpf.profile.preprocess}
 
 ##### Stack Compression {#inputs.ebpf.profile.preprocess.stack_compression}
@@ -4688,6 +5219,493 @@ memory usage, data transmission bandwidth consumption, and ingester's CPU overhe
 it also increases the CPU usage of the agent. Tests have shown that compressing the on-cpu
 function call stack of the deepflow-agent can reduce bandwidth consumption by `x` times, but
 it will result in an additional `y%` CPU usage for the agent.
+
+#### Language-specific Profiling {#inputs.ebpf.profile.languages}
+
+Control which interpreter languages to profile. Disabling unused languages can save ~5-6 MB memory per language.
+Total memory: ~17-20 MB (all enabled), ~6.1 MB (Python only), ~5.2 MB (PHP only), ~6.4 MB (Node.js only).
+
+##### Python profiling disabled {#inputs.ebpf.profile.languages.python_disabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.languages.python_disabled`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      languages:
+        python_disabled: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Disable Python interpreter profiling. When disabled, Python process stack traces will not be collected,
+saving approximately 6.1 MB of kernel memory (python_tstate_addr_map, python_unwind_info_map, python_offsets_map).
+
+##### PHP profiling disabled {#inputs.ebpf.profile.languages.php_disabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.languages.php_disabled`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      languages:
+        php_disabled: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Disable PHP interpreter profiling. When disabled, PHP process stack traces will not be collected,
+saving approximately 5.2 MB of kernel memory (php_unwind_info_map, php_offsets_map).
+
+##### Node.js profiling disabled {#inputs.ebpf.profile.languages.nodejs_disabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.languages.nodejs_disabled`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      languages:
+        nodejs_disabled: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Disable Node.js (V8) interpreter profiling. When disabled, Node.js process stack traces will not be collected,
+saving approximately 6.4 MB of kernel memory (v8_unwind_info_map).
+
+##### Lua profiling disabled {#inputs.ebpf.profile.languages.lua_disabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.languages.lua_disabled`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      languages:
+        lua_disabled: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Disable Lua interpreter profiling. When disabled, Lua process stack traces will not be collected,
+saving approximately 13 MB of kernel memory (lua_tstate_map, lua_lang_flags_map, lua_unwind_info_map, lua_offsets_map, luajit_offsets_map).
+
+### Network {#inputs.ebpf.network}
+
+#### NIC optimization Enabled {#inputs.ebpf.network.nic_opt_enabled}
+
+**Tags**:
+
+`hot_update`
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_opt_enabled`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_opt_enabled: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Whether to enable NIC optimization for enhanced multi-core packet
+processing and burst traffic resilience.
+
+When enabled, the system applies a combination of:
+  - RSS hardware queue configuration
+  - RX ring descriptor size tuning
+  - IRQ (interrupt) CPU affinity binding
+  - Optional XDP CPUMAP-based CPU redirection
+
+This optimization mitigates scenarios where RSS hardware cannot hash
+inner headers of encapsulated traffic (e.g., GRE, Double VLAN,
+VXLAN, ERSPAN), which may otherwise cause traffic to be concentrated
+on a single CPU core and lead to packet drops or performance bottlenecks.
+
+RX ring tuning improves burst handling capability by increasing
+the number of descriptors available for packet reception, reducing
+the likelihood of ring overflow under high traffic conditions.
+
+When XDP CPU redirect is enabled, packets are redistributed in
+software across multiple CPU cores after initial reception,
+providing better load balancing beyond hardware RSS capabilities.
+
+Recommended to enable this feature when:
+  1) Traffic on the interface consists primarily of encapsulated
+     packets (e.g., verified via tcpdump showing GRE, Double VLAN,
+     VXLAN, etc.).
+  2) One CPU core shows near 100% softirq utilization (e.g.,
+     observed via `top` with per-CPU view), while other CPUs
+     remain underutilized.
+
+For optimal performance, IRQ CPUs and XDP redirect CPUs should be
+configured on the same NUMA node as the physical NIC.
+
+#### NIC Optimize {#inputs.ebpf.network.nic_optimize}
+
+**Tags**:
+
+`hot_update`
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - interface: ''
+        irq_cpu_list: ''
+        rss_channel_count: 0
+        rx_ring_size: 0
+        xdp_cpu_redirect: false
+        xdp_cpu_redirect_list: ''
+        xdp_queue_size: 2048
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | dict |
+
+**Description**:
+
+Configure NIC-level performance optimizations for specific interfaces.
+
+This feature improves packet processing scalability and burst handling
+by tuning hardware RSS queues, interrupt CPU affinity, RX ring size,
+and optional XDP CPUMAP-based CPU redirection.
+
+Recommended when:
+  - Traffic is primarily encapsulated (GRE, Double VLAN, VXLAN, ERSPAN).
+  - One CPU shows near 100% softirq usage while others are idle.
+
+To achieve better performance, the program will automatically disable the
+irqbalance service to prevent network interface interrupts from migrating
+between CPUs.
+
+Multiple NIC optimize entries can be configured for different interfaces.
+
+Example:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_opt_enabled: true
+      nic_optimize:
+      - interface: eth0
+        rx_ring_size: 4096
+        rss_channel_count: 2
+        irq_cpu_list: 1,2
+        xdp_cpu_redirect: true
+        xdp_queue_size: 2048
+        xdp_cpu_redirect_list: 4,5,6,7
+      - interface: eth1
+        rx_ring_size: 4096
+        rss_channel_count: 2
+        irq_cpu_list: 1,2
+        xdp_cpu_redirect: true
+        xdp_queue_size: 2048
+        xdp_cpu_redirect_list: 4,5,6,7
+```
+
+##### Interface {#inputs.ebpf.network.nic_optimize.interface}
+
+**Tags**:
+
+<mark></mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize.interface`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - interface: ''
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | string |
+
+**Description**:
+
+Name of the network interface to optimize.
+
+##### RX Ring Size {#inputs.ebpf.network.nic_optimize.rx_ring_size}
+
+**Tags**:
+
+<mark></mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize.rx_ring_size`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - rx_ring_size: 0
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+
+**Description**:
+
+Number of RX descriptors in NIC receive ring.
+
+Increasing this value improves burst traffic buffering
+and reduces packet drops caused by ring overflow.
+Specifically, use `ethtool -g <iface>` to check the current
+configuration, and adjust to an appropriate value based on your workload.
+
+0 (default) means keep the original state and ignore this setting.
+
+##### RSS Channel Count {#inputs.ebpf.network.nic_optimize.rss_channel_count}
+
+**Tags**:
+
+<mark></mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize.rss_channel_count`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - rss_channel_count: 0
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+
+**Description**:
+
+Number of hardware RSS queues.
+Determines how many queues packets are distributed to after
+hardware hash calculation.
+
+Maximum supported value is typically 16 and must not exceed
+the number of logical CPU cores.
+Specifically, use `ethtool -l <iface>` to check the current configuration
+and adjust to an appropriate value based on your workload.
+
+When XDP CPU redirect is enabled, it is recommended to set this to 1.
+0 (default) means keep the original state and ignore this setting.
+
+##### Hardware IRQ CPU List {#inputs.ebpf.network.nic_optimize.irq_cpu_list}
+
+**Tags**:
+
+<mark></mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize.irq_cpu_list`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - irq_cpu_list: ''
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | string |
+
+**Description**:
+
+CPU ID or comma-separated CPU list used for handling NIC interrupts.
+
+Recommended to match the number of RSS queues.
+If XDP CPU redirect is enabled, only one CPU is required.
+
+Value can be:
+  - Specific CPU list (e.g., 2,4,6)
+  - "local" (auto match CPUs in local NUMA node)
+
+CPUs should be located on the same NUMA node as the NIC.
+
+##### Enable XDP CPU Redirect {#inputs.ebpf.network.nic_optimize.xdp_cpu_redirect}
+
+**Tags**:
+
+<mark></mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize.xdp_cpu_redirect`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - xdp_cpu_redirect: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Enable XDP CPUMAP redirect to redistribute packets across CPUs
+in software.
+
+Useful when hardware RSS cannot distribute encapsulated traffic
+(e.g., Double VLAN, ERSPAN) evenly across CPUs, resulting in
+single-core overload and packet drops.
+
+##### XDP Queue Size {#inputs.ebpf.network.nic_optimize.xdp_queue_size}
+
+**Tags**:
+
+<mark></mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize.xdp_queue_size`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - xdp_queue_size: 2048
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+
+**Description**:
+
+Size of the XDP CPUMAP queue.
+
+Valid range: [512, 8192]. Powers of two are recommended.
+
+Larger values improve burst tolerance but consume more memory.
+
+##### XDP Redirect CPU List {#inputs.ebpf.network.nic_optimize.xdp_cpu_redirect_list}
+
+**Tags**:
+
+<mark></mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize.xdp_cpu_redirect_list`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - xdp_cpu_redirect_list: ''
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | string |
+
+**Description**:
+
+CPU list used for processing packets after XDP redirection.
+
+Format example: 4,6,8
 
 ### Tunning {#inputs.ebpf.tunning}
 
@@ -4756,6 +5774,49 @@ The number of worker threads refers to how many threads participate
 in data processing in user-space. The actual maximal value is the number
 of CPU logical cores on the host.
 
+#### Kick Thread Nice Value {#inputs.ebpf.tunning.kick_kern_nice}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.tunning.kick_kern_nice`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    tunning:
+      kick_kern_nice: 0
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [-20, 19] |
+
+**Description**:
+
+Controls the Linux nice value of per-CPU kick threads.
+
+These threads wake up after the periodic timer expires and issue a
+lightweight syscall to trigger kernel-side timeout checks that flush
+batched eBPF data.
+
+Pay attention to this option when `metrics.period_push_max_delay`
+under `deepflow_tenant -> deepflow_agent_ebpf_collector` in Metrics
+Center reaches 199 ms. This means the periodic push delay has hit
+the exceeded marker, and the value can be decreased appropriately to
+give the kick threads more scheduling preference.
+
+Smaller nice values mean higher scheduling preference. Larger nice
+values mean lower scheduling preference. Valid values range from
+-20 to 19. A negative value may require CAP_SYS_NICE or a sufficient
+RLIMIT_NICE. This can still affect other workloads.
+
 #### Perf Pages Count {#inputs.ebpf.tunning.perf_pages_count}
 
 **Tags**:
@@ -4788,6 +5849,7 @@ The number of page occupied by the shared memory of the kernel. The
 value is `2^n (5 <= n <= 13)`. Used for perf data transfer. If the
 value is between `2^n` and `2^(n+1)`, it will be automatically adjusted
 by the ebpf configurator to the minimum value `2^n`.
+The page size is 4 KB.
 
 #### Kernel Ring Size {#inputs.ebpf.tunning.kernel_ring_size}
 
@@ -5656,7 +6718,7 @@ inputs:
 **Description**:
 
 Whether to enable receiving external data sources such as Prometheus,
-Telegraf, OpenTelemetry, and SkyWalking.
+Telegraf, OpenTelemetry, SkyWalking and Vector.
 
 ### Listen Port {#inputs.integration.listen_port}
 
@@ -6036,308 +7098,313 @@ The detail config for Vector Component, all availble config keys could be found 
 Here's an example for how to capture kubernetes logs、host metrics in virtual machine and kubelet metrics in kubernetes. It'll send to DeepFlow-Agent as output.
 
 scrape host metrics:
+`K8S_NODE_NAME_FOR_DEEPFLOW` only required in k8s container environment
 ```yaml
-config:
-  sources:
-    host_metrics:
-      type: host_metrics
-      scrape_interval_secs: 10
-      namespace: node
-  transforms:
-    host_metrics_relabel:
-      type: remap
-      inputs:
-      - host_metrics
-      source: |
-        .tags.instance = "${K8S_NODE_IP_FOR_DEEPFLOW}"
-        .tags.host = "${K8S_NODE_NAME_FOR_DEEPFLOW}"
-        metrics_map = {
-          "boot_time": "boot_time_seconds",
-          "memory_active_bytes": "memory_Active_bytes",
-          "memory_available_bytes": "memory_MemAvailable_bytes",
-          "memory_buffers_bytes": "memory_Buffers_bytes",
-          "memory_cached_bytes": "memory_Cached_bytes",
-          "memory_free_bytes": "memory_MemFree_bytes",
-          "memory_swap_free_bytes": "memory_SwapFree_bytes",
-          "memory_swap_total_bytes": "memory_SwapTotal_bytes",
-          "memory_swap_used_bytes": "memory_SwapCached_bytes",
-          "memory_total_bytes": "memory_MemTotal_bytes",
-          "network_transmit_packets_drop_total": "network_transmit_drop_total",
-          "uptime": "uname_info",
-          "filesystem_total_bytes": "filesystem_size_bytes",
-        }
-        metric_name = get!(value: metrics_map, path: [.name])
-        if !is_null(metric_name) {
-          .name = metric_name
-        }
-        if .tags.collector == "filesystem" {
-          .tags.fstype = .tags.filesystem
-          del(.tags.filesystem)
-        }
-  sinks:
-    prometheus_remote_write:
-      type: prometheus_remote_write
-      inputs:
-      - host_metrics_relabel
-      endpoint: http://127.0.0.1:38086/api/v1/prometheus
-      healthcheck:
-        enabled: false
+sources:
+  host_metrics:
+    type: host_metrics
+    scrape_interval_secs: 10
+    namespace: node
+transforms:
+  host_process_filter:
+    type: filter
+    condition: '!starts_with(string!(.name), "process_")'
+    inputs:
+    - host_metrics
+  host_metrics_relabel:
+    type: remap
+    inputs:
+    - host_process_filter
+    source: |
+      .tags.instance = "${K8S_NODE_IP_FOR_DEEPFLOW}"
+      host_name, _ = get_env_var("K8S_NODE_NAME_FOR_DEEPFLOW")
+      if !is_empty(host_name) {
+        .tags.host = host_name
+      }
+      metrics_map = {
+        "boot_time": "boot_time_seconds",
+        "memory_active_bytes": "memory_Active_bytes",
+        "memory_available_bytes": "memory_MemAvailable_bytes",
+        "memory_buffers_bytes": "memory_Buffers_bytes",
+        "memory_cached_bytes": "memory_Cached_bytes",
+        "memory_free_bytes": "memory_MemFree_bytes",
+        "memory_swap_free_bytes": "memory_SwapFree_bytes",
+        "memory_swap_total_bytes": "memory_SwapTotal_bytes",
+        "memory_swap_used_bytes": "memory_SwapCached_bytes",
+        "memory_total_bytes": "memory_MemTotal_bytes",
+        "network_transmit_packets_drop_total": "network_transmit_drop_total",
+        "uptime": "uname_info",
+        "filesystem_total_bytes": "filesystem_size_bytes",
+      }
+      metric_name = get!(value: metrics_map, path: [.name])
+      if !is_null(metric_name) {
+        .name = metric_name
+      }
+      if .tags.collector == "filesystem" {
+        .tags.fstype = .tags.filesystem
+        del(.tags.filesystem)
+      }
+sinks:
+  prometheus_remote_write:
+    type: prometheus_remote_write
+    inputs:
+    - host_metrics_relabel
+    endpoint: http://127.0.0.1:38086/api/v1/prometheus
+    healthcheck:
+      enabled: false
 
 ```
 
 scrape kubernetes metrics
 ```yaml
-config:
-  secret:
-    kube_token:
-      type: directory
-      path: /var/run/secrets/kubernetes.io/serviceaccount
-  sources:
-    cadvisor_metrics:
-      type: prometheus_scrape
-      endpoints:
-      - https://${K8S_NODE_IP_FOR_DEEPFLOW}:10250/metrics/cadvisor
-      auth:
-        strategy: bearer
-        token: SECRET[kube_token.token]
-      scrape_interval_secs: 10
-      scrape_timeout_secs: 10
-      honor_labels: true
-      instance_tag: instance
-      endpoint_tag: metrics_endpoint
-      tls:
-        verify_certificate: false
-    kubelet_metrics:
-      type: prometheus_scrape
-      endpoints:
-      - http://${K8S_NODE_IP_FOR_DEEPFLOW}:10250/metrics
-      auth:
-        strategy: bearer
-        token: SECRET[kube_token.token]
-      scrape_interval_secs: 10
-      scrape_timeout_secs: 10
-      honor_labels: true
-      instance_tag: instance
-      endpoint_tag: metrics_endpoint
-      tls:
-        verify_certificate: false
-    kube_state_metrics:
-      type: prometheus_scrape
-      endpoints:
-      - http://opensource-kube-state-metrics:8080/metrics
-      scrape_interval_secs: 10
-      scrape_timeout_secs: 10
-      honor_labels: true
-      instance_tag: instance
-      endpoint_tag: metrics_endpoint
-  transforms:
-    cadvisor_relabel_filter:
-      type: filter
-      inputs:
-      - cadvisor_metrics
-      condition: "!match(string!(.name), r'container_cpu_(cfs_throttled_seconds_total|load_average_10s|system_seconds_total|user_seconds_total)|container_fs_(io_current|io_time_seconds_total|io_time_weighted_seconds_total|reads_merged_total|sector_reads_total|sector_writes_total|writes_merged_total)|container_memory_(mapped_file|swap)|container_(file_descriptors|tasks_state|threads_max)|container_spec.*')"
-    kubelet_relabel_filter:
-      type: filter
-      inputs:
-      - kubelet_metrics
-      condition: "match(string!(.name), r'kubelet_cgroup_(manager_duration_seconds_bucket|manager_duration_seconds_count)|kubelet_node_(config_error|node_name)|kubelet_pleg_relist_(duration_seconds_bucket|duration_seconds_count|interval_seconds_bucket)|kubelet_pod_(start_duration_seconds_count|worker_duration_seconds_bucket|worker_duration_seconds_count)|kubelet_running_(container_count|containers|pod_count|pods)|kubelet_runtime_(operations_duration_seconds_bucket|perations_errors_total|operations_total)|kubelet_volume_stats_(available_bytes|capacity_bytes|inodes|inodes_used)|process_(cpu_seconds_total|resident_memory_bytes)|rest_client_(request_duration_seconds_bucket|requests_total)|storage_operation_(duration_seconds_bucket|duration_seconds_count|errors_total)|up|volume_manager_total_volumes')"
-    kube_state_relabel_filter:
-      type: filter
-      inputs:
-      - kube_state_metrics
-      condition: "!match(string!(.name), r'kube_endpoint_address_not_ready|kube_endpoint_address_available')"
-    common_relabel_config:
-      type: remap
-      inputs:
-      - cadvisor_relabel_filter
-      - kubelet_relabel_filter
-      - kube_state_relabel_filter
-      source: |-
-        if !is_null(.tags) && is_string(.tags.metrics_endpoint) {
-        .tags.metrics_path = parse_regex!(.tags.metrics_endpoint, r'https?:\/\/[^\/]+(?<path>\/.*)$').path
-        }
-  sinks:
-    prometheus_remote_write:
-      type: prometheus_remote_write
-      inputs:
-      - common_relabel_config
-      endpoint: http://127.0.0.1:38086/api/v1/prometheus
-      healthcheck:
-        enabled: false
+secret:
+  kube_token:
+    type: directory
+    path: /var/run/secrets/kubernetes.io/serviceaccount
+sources:
+  cadvisor_metrics:
+    type: prometheus_scrape
+    endpoints:
+    - https://${K8S_NODE_IP_FOR_DEEPFLOW}:10250/metrics/cadvisor
+    auth:
+      strategy: bearer
+      token: SECRET[kube_token.token]
+    scrape_interval_secs: 10
+    scrape_timeout_secs: 10
+    honor_labels: true
+    instance_tag: instance
+    endpoint_tag: metrics_endpoint
+    tls:
+      verify_certificate: false
+  kubelet_metrics:
+    type: prometheus_scrape
+    endpoints:
+    - https://${K8S_NODE_IP_FOR_DEEPFLOW}:10250/metrics
+    auth:
+      strategy: bearer
+      token: SECRET[kube_token.token]
+    scrape_interval_secs: 10
+    scrape_timeout_secs: 10
+    honor_labels: true
+    instance_tag: instance
+    endpoint_tag: metrics_endpoint
+    tls:
+      verify_certificate: false
+  kube_state_metrics:
+    type: prometheus_scrape
+    endpoints:
+    - http://opensource-kube-state-metrics:8080/metrics
+    scrape_interval_secs: 10
+    scrape_timeout_secs: 10
+    honor_labels: true
+    instance_tag: instance
+    endpoint_tag: metrics_endpoint
+transforms:
+  cadvisor_relabel_filter:
+    type: filter
+    inputs:
+    - cadvisor_metrics
+    condition: "!match(string!(.name), r'container_cpu_(cfs_throttled_seconds_total|load_average_10s|system_seconds_total|user_seconds_total)|container_fs_(io_current|io_time_seconds_total|io_time_weighted_seconds_total|reads_merged_total|sector_reads_total|sector_writes_total|writes_merged_total)|container_memory_(mapped_file|swap)|container_(file_descriptors|tasks_state|threads_max)')"
+  kubelet_relabel_filter:
+    type: filter
+    inputs:
+    - kubelet_metrics
+    condition: "match(string!(.name), r'kubelet_cgroup_(manager_duration_seconds_bucket|manager_duration_seconds_count)|kubelet_node_(config_error|node_name)|kubelet_pleg_relist_(duration_seconds_bucket|duration_seconds_count|interval_seconds_bucket)|kubelet_pod_(start_duration_seconds_count|worker_duration_seconds_bucket|worker_duration_seconds_count)|kubelet_running_(container_count|containers|pod_count|pods)|kubelet_runtime_(operations_duration_seconds_bucket|perations_errors_total|operations_total)|kubelet_volume_stats_(available_bytes|capacity_bytes|inodes|inodes_used)|process_(cpu_seconds_total|resident_memory_bytes)|rest_client_(request_duration_seconds_bucket|requests_total)|storage_operation_(duration_seconds_bucket|duration_seconds_count|errors_total)|up|volume_manager_total_volumes')"
+  kube_state_relabel_filter:
+    type: filter
+    inputs:
+    - kube_state_metrics
+    condition: "!match(string!(.name), r'kube_endpoint_address_not_ready|kube_endpoint_address_available')"
+  common_relabel_config:
+    type: remap
+    inputs:
+    - cadvisor_relabel_filter
+    - kubelet_relabel_filter
+    - kube_state_relabel_filter
+    source: |-
+      if !is_null(.tags) && is_string(.tags.metrics_endpoint) {
+      .tags.metrics_path = parse_regex!(.tags.metrics_endpoint, r'https?:\/\/[^\/]+(?<path>\/.*)$').path
+      }
+sinks:
+  prometheus_remote_write:
+    type: prometheus_remote_write
+    inputs:
+    - common_relabel_config
+    endpoint: http://127.0.0.1:38086/api/v1/prometheus
+    healthcheck:
+      enabled: false
 
 ```
 
 scrape kubernentes logs (capture DeepFlow Pod logs as example, if other Pod logs is required, update `extra_label_selector` add custom filters)
 ```yaml
-config:
-  data_dir: /vector-log-checkpoint
-  sources:
-    kubernetes_logs:
-      self_node_name: ${K8S_NODE_NAME_FOR_DEEPFLOW}
-      type: kubernetes_logs
-      namespace_annotation_fields:
-        namespace_labels: ""
-      node_annotation_fields:
-        node_labels: ""
-      pod_annotation_fields:
-        pod_annotations: ""
-        pod_labels: ""
-      extra_label_selector: "app=deepflow,component!=front-end"
-    kubernetes_logs_frontend:
-      self_node_name: ${K8S_NODE_NAME_FOR_DEEPFLOW}
-      type: kubernetes_logs
-      namespace_annotation_fields:
-        namespace_labels: ""
-      node_annotation_fields:
-        node_labels: ""
-      pod_annotation_fields:
-        pod_annotations: ""
-        pod_labels: ""
-      extra_label_selector: "app=deepflow,component=front-end"
-  transforms:
-    multiline_kubernetes_logs:
-      type: reduce
-      inputs:
-        - kubernetes_logs
-      group_by:
-        - file
-        - stream
-      merge_strategies:
-        message: concat_newline
-      starts_when: match(string!(.message), r'^(.+=|\[|\[?\u001B\[[0-9;]*m|\[mysql\]\s|\{\".+\"|(::ffff:)?([0-9]{1,3}.){3}[0-9]{1,3}[\s\-]+(\[)?)?\d{4}[-\/\.]?\d{2}[-\/\.]?\d{2}[T\s]?\d{2}:\d{2}:\d{2}')
-      expire_after_ms: 2000
-      flush_period_ms: 500
-    flush_kubernetes_logs:
-     type: remap
-     inputs:
-       - multiline_kubernetes_logs
-     source: |-
-         .message = replace(string!(.message), r'\u001B\[([0-9]{1,3}(;[0-9]{1,3})*)?m', "")
-    remap_kubernetes_logs:
-      type: remap
-      inputs:
-      - flush_kubernetes_logs
-      - kubernetes_logs_frontend
-      source: |-
-          if is_string(.message) && is_json(string!(.message)) {
-              tags = parse_json(.message) ?? {}
-              ._df_log_type = tags._df_log_type
-              .org_id = to_int(tags.org_id) ?? 0
-              .user_id = to_int(tags.user_id) ?? 0
-              .message = tags.message || tags.msg
-              del(tags._df_log_type)
-              del(tags.org_id)
-              del(tags.user_id)
-              del(tags.message)
-              del(tags.msg)
-              .json = tags
-          }
-          if !exists(.level) {
-             if exists(.json) {
-                .level = to_string!(.json.level)
-                del(.json.level)
-             } else {
-               level_tags = parse_regex(.message, r'[\[\\<](?<level>(?i)INFOR?(MATION)?|WARN(ING)?|DEBUG?|ERROR?|TRACE|FATAL|CRIT(ICAL)?)[\]\\>]') ?? {}
-               if !exists(level_tags.level) {
-                  level_tags = parse_regex(.message, r'[\s](?<level>INFOR?(MATION)?|WARN(ING)?|DEBUG?|ERROR?|TRACE|FATAL|CRIT(ICAL)?)[\s]') ?? {}
-               }
-               if exists(level_tags.level) {
-                  level_tags.level = upcase(string!(level_tags.level))
-                  if level_tags.level == "INFORMATION" || level_tags.level == "INFOMATION" {
-                      level_tags.level = "INFO"
-                  }
-                  if level_tags.level == "WARNING" {
-                      level_tags.level = "WARN"
-                  }
-                  if level_tags.level == "DEBU" {
-                      level_tags.level = "DEBUG"
-                  }
-                  if level_tags.level == "ERRO" {
-                      level_tags.level = "ERROR"
-                  }
-                  if level_tags.level == "CRIT" || level_tags.level == "CRITICAL" {
-                      level_tags.level = "FATAL"
-                  }
-                  .level = level_tags.level
-               }
+data_dir: /vector-log-checkpoint
+sources:
+  kubernetes_logs:
+    self_node_name: ${K8S_NODE_NAME_FOR_DEEPFLOW}
+    type: kubernetes_logs
+    namespace_annotation_fields:
+      namespace_labels: ""
+    node_annotation_fields:
+      node_labels: ""
+    pod_annotation_fields:
+      pod_annotations: ""
+      pod_labels: ""
+    extra_label_selector: "app=deepflow,component!=front-end"
+  kubernetes_logs_frontend:
+    self_node_name: ${K8S_NODE_NAME_FOR_DEEPFLOW}
+    type: kubernetes_logs
+    namespace_annotation_fields:
+      namespace_labels: ""
+    node_annotation_fields:
+      node_labels: ""
+    pod_annotation_fields:
+      pod_annotations: ""
+      pod_labels: ""
+    extra_label_selector: "app=deepflow,component=front-end"
+transforms:
+  multiline_kubernetes_logs:
+    type: reduce
+    inputs:
+      - kubernetes_logs
+    group_by:
+      - file
+      - stream
+    merge_strategies:
+      message: concat_newline
+    starts_when: match(string!(.message), r'^(.+=|\[|\[?\u001B\[[0-9;]*m|\[mysql\]\s|\{\".+\"|(::ffff:)?([0-9]{1,3}.){3}[0-9]{1,3}[\s\-]+(\[)?)?\d{4}[-\/\.]?\d{2}[-\/\.]?\d{2}[T\s]?\d{2}:\d{2}:\d{2}')
+    expire_after_ms: 2000
+    flush_period_ms: 500
+  flush_kubernetes_logs:
+   type: remap
+   inputs:
+     - multiline_kubernetes_logs
+   source: |-
+       .message = replace(string!(.message), r'\u001B\[([0-9]{1,3}(;[0-9]{1,3})*)?m', "")
+  remap_kubernetes_logs:
+    type: remap
+    inputs:
+    - flush_kubernetes_logs
+    - kubernetes_logs_frontend
+    source: |-
+        if is_string(.message) && is_json(string!(.message)) {
+            tags = parse_json(.message) ?? {}
+            ._df_log_type = tags._df_log_type
+            .org_id = to_int(tags.org_id) ?? 0
+            .user_id = to_int(tags.user_id) ?? 0
+            .message = tags.message || tags.msg
+            del(tags._df_log_type)
+            del(tags.org_id)
+            del(tags.user_id)
+            del(tags.message)
+            del(tags.msg)
+            .json = tags
+        }
+        if !exists(.level) {
+           if exists(.json) {
+              .level = to_string!(.json.level)
+              del(.json.level)
+           } else {
+             level_tags = parse_regex(.message, r'[\[\\<](?<level>(?i)INFOR?(MATION)?|WARN(ING)?|DEBUG?|ERROR?|TRACE|FATAL|CRIT(ICAL)?)[\]\\>]') ?? {}
+             if !exists(level_tags.level) {
+                level_tags = parse_regex(.message, r'[\s](?<level>INFOR?(MATION)?|WARN(ING)?|DEBUG?|ERROR?|TRACE|FATAL|CRIT(ICAL)?)[\s]') ?? {}
              }
-          }
-          if !exists(._df_log_type) {
-              ._df_log_type = "system"
-          }
-          if !exists(.app_service) {
-              .app_service = .kubernetes.container_name
-          }
-  sinks:
-    http:
-      type: http
-      inputs: [remap_kubernetes_logs]
-      uri: http://127.0.0.1:38086/api/v1/log
-      encoding:
-        codec: json
+             if exists(level_tags.level) {
+                level_tags.level = upcase(string!(level_tags.level))
+                if level_tags.level == "INFORMATION" || level_tags.level == "INFOMATION" {
+                    level_tags.level = "INFO"
+                }
+                if level_tags.level == "WARNING" {
+                    level_tags.level = "WARN"
+                }
+                if level_tags.level == "DEBU" {
+                    level_tags.level = "DEBUG"
+                }
+                if level_tags.level == "ERRO" {
+                    level_tags.level = "ERROR"
+                }
+                if level_tags.level == "CRIT" || level_tags.level == "CRITICAL" {
+                    level_tags.level = "FATAL"
+                }
+                .level = level_tags.level
+             }
+           }
+        }
+        if !exists(._df_log_type) {
+            ._df_log_type = "system"
+        }
+        if !exists(.app_service) {
+            .app_service = .kubernetes.container_name
+        }
+sinks:
+  http:
+    type: http
+    inputs: [remap_kubernetes_logs]
+    uri: http://127.0.0.1:38086/api/v1/log
+    encoding:
+      codec: json
 
 ```
 
 use http_client or socket to dial a remote server for testing
 ```yaml
-config:
-  sources:
-    http_client_dial:
-      type: http_client
-      endpoint: http://$HOST:$PORT
-      method: GET
-      scrape_interval_secs: 10
-      scrape_timeout_secs: 5
-    internal_metrics:
-      type: internal_metrics
-      scrape_interval_secs: 10
-      namespace: ${K8S_NAMESPACE_FOR_DEEPFLOW}
-    socket_dial_input:
-      type: demo_logs
-      interval: 10
-      format: shuffle
-      lines: [""]
-  transforms:
-    internal_metrics_relabel:
-      type: remap
-      inputs:
-      - internal_metrics
-      source: |-
-        .tags.instance = "${K8S_NODE_IP_FOR_DEEPFLOW}"
-    internal_metrics_dispatch:
-      type: route
-      inputs:
-      - internal_metrics_relabel
-      route:
-        http_client_dial_metrics: '.tags.component_id == "http_client_dial"'
-        socket_dial_metrics: '.tags.component_id == "socket_dial"'
-    http_client_dial_metrics:
-      type: filter
-      inputs:
-      - internal_metrics_dispatch.http_client_dial_metrics
-      condition: "match(string!(.name),r'http_client_.*')"
-    socket_dial_metrics:
-      type: filter
-      inputs:
-      - internal_metrics_dispatch.socket_dial_metrics
-      condition: "match(string!(.name),r'buffer.*')"
-  sinks:
-    socket_dial:
-      type: socket
-      inputs:
-      - socket_dial_input
-      address: $HOST:$PORT
-      mode: tcp
-      encoding:
-        codec: raw_message
-    prometheus_remote_write:
-      type: prometheus_remote_write
-      inputs:
-      - http_client_dial_metrics
-      - socket_dial_metrics
-      endpoint: http://127.0.0.1:38086/api/v1/prometheus
-      healthcheck:
-        enabled: false
+sources:
+  http_client_dial:
+    type: http_client
+    endpoint: http://$HOST:$PORT
+    method: GET
+    scrape_interval_secs: 10
+    scrape_timeout_secs: 5
+  internal_metrics:
+    type: internal_metrics
+    scrape_interval_secs: 10
+    namespace: ${K8S_NAMESPACE_FOR_DEEPFLOW}
+  socket_dial_input:
+    type: demo_logs
+    interval: 10
+    format: shuffle
+    lines: [""]
+transforms:
+  internal_metrics_relabel:
+    type: remap
+    inputs:
+    - internal_metrics
+    source: |-
+      .tags.instance = "${K8S_NODE_IP_FOR_DEEPFLOW}"
+  internal_metrics_dispatch:
+    type: route
+    inputs:
+    - internal_metrics_relabel
+    route:
+      http_client_dial_metrics: '.tags.component_id == "http_client_dial"'
+      socket_dial_metrics: '.tags.component_id == "socket_dial"'
+  http_client_dial_metrics:
+    type: filter
+    inputs:
+    - internal_metrics_dispatch.http_client_dial_metrics
+    condition: "match(string!(.name),r'http_client_.*')"
+  socket_dial_metrics:
+    type: filter
+    inputs:
+    - internal_metrics_dispatch.socket_dial_metrics
+    condition: "match(string!(.name),r'buffer.*')"
+sinks:
+  socket_dial:
+    type: socket
+    inputs:
+    - socket_dial_input
+    address: $HOST:$PORT
+    mode: tcp
+    encoding:
+      codec: raw_message
+  prometheus_remote_write:
+    type: prometheus_remote_write
+    inputs:
+    - http_client_dial_metrics
+    - socket_dial_metrics
+    endpoint: http://127.0.0.1:38086/api/v1/prometheus
+    healthcheck:
+      enabled: false
 
 ```
 
@@ -6609,6 +7676,36 @@ processors:
 The length of the following queues:
 - 1-mini-meta-packet-to-pcap
 
+#### Sender Queue Size {#processors.packet.pcap_stream.sender_queue_size}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.packet.pcap_stream.sender_queue_size`
+
+**Default value**:
+```yaml
+processors:
+  packet:
+    pcap_stream:
+      sender_queue_size: 8192
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [4096, 64000000] |
+
+**Description**:
+
+The length of the following queues:
+- 2-pcap-batch-to-sender
+
 #### Buffer Size Per Flow {#processors.packet.pcap_stream.buffer_size_per_flow}
 
 **Tags**:
@@ -6846,7 +7943,7 @@ processors:
 | Key  | Value                        |
 | ---- | ---------------------------- |
 | Type | duration |
-| Range | [0, '1d'] |
+| Range | ['0ns', '1d'] |
 
 **Description**:
 
@@ -6854,6 +7951,100 @@ deepflow-agent will mark the application protocol for each
 <vpc, ip, protocol, port> tuple. In order to avoid misidentification caused by IP
 changes, the validity period after successfully identifying the protocol will be
 limited to this value.
+
+#### Inference whitelist {#processors.request_log.application_protocol_inference.inference_whitelist}
+
+**Tags**:
+
+`hot_update`
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.inference_whitelist`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      inference_whitelist:
+      - port_list:
+        - 15001
+        - 15006
+        process_name: envoy
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | dict |
+
+**Description**:
+
+Application protocol port whitelist, currently only supports eBPF traffic. When eBPF data is on the whitelist,
+the application table is no longer used to query the application protocol. The corresponding application protocol
+is obtained by polling all currently supported protocols. Having too much data on the whitelist greatly reduces the
+processing performance of eBPF data.
+
+Configuration Key:
+- process_name: Process name, regular expressions are not supported
+- port_list: Port Whitelist
+
+##### Process name {#processors.request_log.application_protocol_inference.inference_whitelist.process_name}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.inference_whitelist.process_name`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      inference_whitelist:
+      - process_name: ''
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | string |
+
+**Description**:
+
+Process name
+
+##### Port list {#processors.request_log.application_protocol_inference.inference_whitelist.port_list}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.inference_whitelist.port_list`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      inference_whitelist:
+      - port_list: []
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+
+**Description**:
+
+Port list
 
 #### Enabled Protocols {#processors.request_log.application_protocol_inference.enabled_protocols}
 
@@ -6996,6 +8187,306 @@ processors:
 Due to the response with data id 0x04 has different struct in
 different version, it may has one byte before row affect.
 
+##### ISO8583 {#processors.request_log.application_protocol_inference.protocol_special_config.iso8583}
+
+###### Value Translation {#processors.request_log.application_protocol_inference.protocol_special_config.iso8583.translation_enabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.iso8583.translation_enabled`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        iso8583:
+          translation_enabled: true
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Whether to perform field value translation.
+
+###### PAN Obfuscate {#processors.request_log.application_protocol_inference.protocol_special_config.iso8583.pan_obfuscate}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.iso8583.pan_obfuscate`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        iso8583:
+          pan_obfuscate: true
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Whether to obfuscate the Primary Account Number (PAN).
+
+###### Extract Fields {#processors.request_log.application_protocol_inference.protocol_special_config.iso8583.extract_fields}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.iso8583.extract_fields`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        iso8583:
+          extract_fields: 2,7,11,32,33
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | string |
+
+**Description**:
+
+Extracted fields are displayed in `data native tags`.
+  - Example: `extract_fields: 0,2-33`
+Field Reference:
+
+| Field No. | Description |
+|-----------|-------------|
+| 0   | Message Type Identifier (MTI) |
+| 1   | Bitmap |
+| 2   | Primary Account Number (PAN) |
+| 3   | Processing Code |
+| 4   | Amount, Transaction |
+| 5   | Amount, Settlement |
+| 6   | Amount, Cardholder Billing |
+| 7   | Transmission Date & Time |
+| 9   | Conversion Rate, Settlement |
+| 10  | Conversion Rate, Cardholder Billing |
+| 11  | System Trace Audit Number (STAN) |
+| 12  | Local Transaction Time |
+| 13  | Local Transaction Date |
+| 14  | Expiration Date |
+| 15  | Settlement Date |
+| 16  | Conversion Date |
+| 18  | Merchant Type |
+| 19  | Acquiring Institution Country Code |
+| 22  | POS Entry Mode Code |
+| 23  | Card Sequence Number |
+| 25  | POS Condition Code |
+| 26  | POS PIN Capture Code |
+| 28  | Transaction Fee |
+| 32  | Acquiring Institution Identification Code |
+| 33  | Forwarding Institution Identification Code |
+| 35  | Track 2 Data |
+| 36  | Track 3 Data |
+| 37  | Retrieval Reference Number (RRN) |
+| 38  | Authorization Identification Response |
+| 39  | Response Code |
+| 41  | Card Acceptor Terminal ID |
+| 42  | Card Acceptor ID Code |
+| 43  | Card Acceptor Name/Location |
+| 44  | Additional Response Data |
+| 45  | Track 1 Data |
+| 48  | Additional Data – Private |
+| 49  | Currency Code, Transaction |
+| 50  | Currency Code, Settlement |
+| 51  | Currency Code, Cardholder Billing |
+| 52  | PIN Data |
+| 53  | Security Related Control Information |
+| 54  | Additional Amounts (Balance) |
+| 55  | ICC Data (EMV Data) |
+| 56  | Additional Data |
+| 57  | Additional Transaction Data |
+| 59  | Detail Data / Reserved for National Use |
+| 60  | Reserved for Private Use |
+| 61  | Cardholder Authentication Information |
+| 62  | Switch Data |
+| 63  | Network Data |
+| 70  | Network Management Information Code |
+| 90  | Original Data Elements |
+| 96  | Message Security Code |
+| 100 | Receiving Institution Identification Code |
+| 102 | Account Identification 1 |
+| 103 | Account Identification 2 |
+| 104 | Additional Data |
+| 113 | Additional Data |
+| 116 | Additional Data |
+| 117 | Additional Data |
+| 121 | Reserved by China UnionPay (CUPS) |
+| 122 | Reserved for Acquirer |
+| 123 | Reserved for Issuer |
+| 125 | Additional Data |
+| 126 | Additional Data |
+| 128 | Message Authentication Code (MAC) |
+
+##### WebSphereMQ {#processors.request_log.application_protocol_inference.protocol_special_config.web_sphere_mq}
+
+###### Parse XML {#processors.request_log.application_protocol_inference.protocol_special_config.web_sphere_mq.parse_xml_enabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.web_sphere_mq.parse_xml_enabled`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        web_sphere_mq:
+          parse_xml_enabled: true
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Whether to parse XML.
+
+###### Decompress Payload {#processors.request_log.application_protocol_inference.protocol_special_config.web_sphere_mq.decompress_enabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.web_sphere_mq.decompress_enabled`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        web_sphere_mq:
+          decompress_enabled: true
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Some web_sphere_mq messages use zlib compression. When this option is enabled,
+the agent will decompress the data packets during parsing.
+
+###### Attribute Field Filter {#processors.request_log.application_protocol_inference.protocol_special_config.web_sphere_mq.filter_attributes_enabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.web_sphere_mq.filter_attributes_enabled`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        web_sphere_mq:
+          filter_attributes_enabled: true
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Enabling this option will cause the agent to retain only the following fields in the XML during parsing, reducing data storage.
+- Document.ComConf.ConfInf.MT
+- Document.ComConf.ConfInf.MsgId
+- Document.ComConf.ConfInf.MsgPrcCd
+- Document.ComConf.ConfInf.MsgRefId
+- Document.ComConf.ConfInf.OrigSndDt
+- Document.ComConf.ConfInf.OrigSndr
+- Document.ComuCnfm.MsgId
+- Document.ComuCnfm.MsgProCd
+- Document.ComuCnfm.MsgRefId
+- Document.ComuCnfm.MsgTp
+- Document.ComuCnfm.OrigSndDt
+- Document.ComuCnfm.OrigSndr
+
+##### NetSign {#processors.request_log.application_protocol_inference.protocol_special_config.net_sign}
+
+###### Extract Biz Data {#processors.request_log.application_protocol_inference.protocol_special_config.net_sign.extract_biz_data_enabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.net_sign.extract_biz_data_enabled`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        net_sign:
+          extract_biz_data_enabled: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Whether to extract the full bizData field into data attributes.
+
 ##### MySQL {#processors.request_log.application_protocol_inference.protocol_special_config.mysql}
 
 ###### Decompress MySQL Payload {#processors.request_log.application_protocol_inference.protocol_special_config.mysql.decompress_payload}
@@ -7029,6 +8520,94 @@ Some MySQL packets have payload compressed with LZ77 algorithm. Enable this opti
 Set to false to disable decompression for better performance.
 ref: [MySQL Source Code Documentation](https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_compression.html)
 
+###### Endpoint Disabled {#processors.request_log.application_protocol_inference.protocol_special_config.mysql.endpoint_disabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.mysql.endpoint_disabled`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        mysql:
+          endpoint_disabled: true
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+After turning it off, the actions and table names in the SQL statement will not be extracted into the endpoint.
+
+##### Grpc {#processors.request_log.application_protocol_inference.protocol_special_config.grpc}
+
+###### Enable gRPC stream data {#processors.request_log.application_protocol_inference.protocol_special_config.grpc.streaming_data_enabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.grpc.streaming_data_enabled`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        grpc:
+          streaming_data_enabled: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+When enabled, all gRPC packets are considered to be of the `stream` type, and the `data` will be reported,
+and the rrt calculation of the response will use the `grpc-status` field.
+
+#### Custom Protocol Parsing {#processors.request_log.application_protocol_inference.custom_protocols}
+
+**Tags**:
+
+<mark></mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.custom_protocols`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      custom_protocols: []
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | dict |
+
+**Description**:
+
+deprecated
+
 ### Filters {#processors.request_log.filters}
 
 #### Port Number Pre-filters {#processors.request_log.filters.port_number_prefilters}
@@ -7056,12 +8635,14 @@ processors:
         FastCGI: 1-65535
         HTTP: 1-65535
         HTTP2: 1-65535
+        ISO8583: 1-65535
         Kafka: 1-65535
         MQTT: 1-65535
         Memcached: 11211
         MongoDB: 1-65535
         MySQL: 1-65535
         NATS: 1-65535
+        NetSign: 1-65535
         OpenWire: 1-65535
         Oracle: 1521
         PING: 1-65535
@@ -7073,6 +8654,7 @@ processors:
         SomeIP: 1-65535
         TLS: 443,6443
         Tars: 1-65535
+        WebSphereMQ: 1-65535
         ZMTP: 1-65535
         bRPC: 1-65535
 ```
@@ -7127,12 +8709,14 @@ processors:
         FastCGI: []
         HTTP: []
         HTTP2: []
+        ISO8583: []
         Kafka: []
         MQTT: []
         Memcached: []
         MongoDB: []
         MySQL: []
         NATS: []
+        NetSign: []
         OpenWire: []
         Oracle: []
         PING: []
@@ -7144,6 +8728,7 @@ processors:
         SomeIP: []
         TLS: []
         Tars: []
+        WebSphereMQ: []
         ZMTP: []
         bRPC: []
         gRPC: []
@@ -7342,7 +8927,7 @@ Match field value.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -7419,7 +9004,7 @@ Upgrade from old version: `static_config.rrt-tcp-timeout`
 processors:
   request_log:
     timeouts:
-      tcp_request_timeout: 1800s
+      tcp_request_timeout: 300s
 ```
 
 **Schema**:
@@ -7432,7 +9017,8 @@ processors:
 
 The timeout of l7 log info rrt calculate, when rrt exceed the value will act as timeout and will not
 calculate the sum and average and will not merge the request and response in session aggregate. the value
-must greater than session aggregate SLOT_TIME (const 10s) and less than 3600 on tcp.
+must greater than the timeout period of the TCP type in configured `processors.request_log.timeouts.session_aggregate`
+(For example, the HTTP2 default is 120s) and less than 3600s on tcp.
 
 #### UDP Request Timeout {#processors.request_log.timeouts.udp_request_timeout}
 
@@ -7464,7 +9050,8 @@ processors:
 
 The timeout of l7 log info rrt calculate, when rrt exceed the value will act as timeout and will not
 calculate the sum and average and will not merge the request and response in session aggregate. the value
-must greater than session aggregate SLOT_TIME (const 10s) and less than 300 on udp.
+must greater than the timeout period of the UDP type in configured `processors.request_log.timeouts.session_aggregate`
+(For example, the DNS default is 15s) and less than 300 on udp.
 
 #### Session Aggregate Window Duration {#processors.request_log.timeouts.session_aggregate_window_duration}
 
@@ -7591,7 +9178,9 @@ processors:
 
 **Description**:
 
-Set the timeout for the application.
+Set the timeout for the application. The timeout period of TCP application protocols must be less than
+`processors.request_log.timeouts.tcp_request_timeout`, and the timeout period of UDP must be less than
+`processors.request_log.timeouts.udp_request_timeout`.
 
 ### Tag Extraction {#processors.request_log.tag_extraction}
 
@@ -7667,6 +9256,36 @@ it to empty.
 If multiple values are specified, the first match will be used.
 Fields rewritten by plugins have the highest priority.
 
+##### Multiple TraceID Collection {#processors.request_log.tag_extraction.tracing_tag.multiple_trace_id_collection}
+
+**Tags**:
+
+`hot_update`
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.request_log.tag_extraction.tracing_tag.multiple_trace_id_collection`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    tag_extraction:
+      tracing_tag:
+        multiple_trace_id_collection: true
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+When configured as `false`, only one TraceID is collected.
+When configured as `true`, multiple TraceIDs will be collected.
+
 ##### APM TraceID {#processors.request_log.tag_extraction.tracing_tag.apm_trace_id}
 
 **Tags**:
@@ -7703,6 +9322,42 @@ setting it to empty.
 If multiple values are specified, the first match will be used.
 Fields rewritten by plugins have the highest priority.
 
+Supports extracting the trace id from the following headers, in the following format:
+- traceparent: 00-TRACEID-SPANID-01
+- sw3: SEGMENTID|SPANID|100|100|#IPPORT|#PARENT_ENDPOINT|#ENDPOINT|TRACEID|SAMPLING 
+- sw6: 1-TRACEID-SEGMENTID-3-5-2-IPPORT-ENTRYURI-PARENTURI
+- sw8: 1-TRACEID-SEGMENTID-3-PARENT_SERVICE-PARENT_INSTANCE-PARENT_ENDPOINT-IPPORT
+- uber-trace-id: TRACEID:SPANID:PARENTSPANID:FLAGS
+- b3: TRACEID-SPANID-1
+
+##### Copy APM TraceID {#processors.request_log.tag_extraction.tracing_tag.copy_apm_trace_id}
+
+**Tags**:
+
+`hot_update`
+
+**FQCN**:
+
+`processors.request_log.tag_extraction.tracing_tag.copy_apm_trace_id`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    tag_extraction:
+      tracing_tag:
+        copy_apm_trace_id: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+When set to true, the APM TraceID will be copied to the attribute.apm_trace_id field.
+
 ##### APM SpanID {#processors.request_log.tag_extraction.tracing_tag.apm_span_id}
 
 **Tags**:
@@ -7738,6 +9393,14 @@ in multiple values separated by commas. This feature can be turned off by
 setting it to empty.
 If multiple values are specified, the first match will be used.
 Fields rewritten by plugins have the highest priority.
+
+Supports extracting the span id from the following headers, in the following format:
+- traceparent: 00-TRACEID-SPANID-01
+- sw3: SEGMENTID|SPANID|100|100|#IPPORT|#PARENT_ENDPOINT|#ENDPOINT|TRACEID|SAMPLING 
+- sw6: 1-TRACEID-SEGMENTID-3-5-2-IPPORT-ENTRYURI-PARENTURI
+- sw8: 1-TRACEID-SEGMENTID-3-PARENT_SERVICE-PARENT_INSTANCE-PARENT_ENDPOINT-IPPORT
+- uber-trace-id: TRACEID:SPANID:PARENTSPANID:FLAGS
+- b3: TRACEID-SPANID-1
 
 #### HTTP Endpoint {#processors.request_log.tag_extraction.http_endpoint}
 
@@ -7997,6 +9660,33 @@ processors:
 
 Field name.
 
+#### Custom Protocol Parsing {#processors.request_log.tag_extraction.custom_field_policies}
+
+**Tags**:
+
+<mark></mark>
+
+**FQCN**:
+
+`processors.request_log.tag_extraction.custom_field_policies`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    tag_extraction:
+      custom_field_policies: []
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | dict |
+
+**Description**:
+
+deprecated
+
 #### Obfuscate Protocols {#processors.request_log.tag_extraction.obfuscate_protocols}
 
 **Tags**:
@@ -8039,6 +9729,140 @@ to be desensitized is configured here and is not processed by default.
 Obfuscated fields mainly include:
 - Authorization information
 - Value information in various statements
+
+#### Raw Data {#processors.request_log.tag_extraction.raw}
+
+控制提取 L7 日志对应的原始数据
+
+##### Length of extracted request header {#processors.request_log.tag_extraction.raw.error_request_header}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.tag_extraction.raw.error_request_header`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    tag_extraction:
+      raw:
+        error_request_header: 0
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [0, 16384] |
+
+**Description**:
+
+When set to a value greater than 0, for call logs with abnormal states, the request Header is automatically collected
+(truncated to $error_request_header bytes) into attribute.request_header. Recommended for temporary use only for the
+following reasons:
+- On one hand, directly storing the header carries a certain risk of exposing sensitive information, which may
+  lead to compliance issues.
+- On the other hand, it can also cause all request header (currently only for the HTTP protocol) to be cached
+  until the response status is parsed to determine whether to send them, consuming collector resources.
+
+##### Length of extracted request header {#processors.request_log.tag_extraction.raw.error_response_header}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.tag_extraction.raw.error_response_header`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    tag_extraction:
+      raw:
+        error_response_header: 0
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [0, 16384] |
+
+**Description**:
+
+When set to a value greater than 0, for call logs with abnormal states, the response Header is automatically collected
+(truncated to $error_response_header bytes) into attribute.response_header.
+
+##### Length of extracted response header {#processors.request_log.tag_extraction.raw.error_request_payload}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.tag_extraction.raw.error_request_payload`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    tag_extraction:
+      raw:
+        error_request_payload: 0
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [0, 16384] |
+
+**Description**:
+
+When set to a value greater than 0, for call logs with abnormal status, the request payload is automatically
+collected (truncated to $error_request_payload) into attribute.request_payload. Recommended for temporary use
+only for the following reasons:
+- On one hand, directly storing the payload carries a certain risk of exposing sensitive information, which may
+  lead to compliance issues.
+- On the other hand, it can also cause all request payloads (currently only for the HTTP protocol) to be cached
+  until the response status is parsed to determine whether to send them, consuming collector resources.
+
+##### Length of extracted request header {#processors.request_log.tag_extraction.raw.error_response_payload}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.tag_extraction.raw.error_response_payload`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    tag_extraction:
+      raw:
+        error_response_payload: 256
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [0, 16384] |
+
+**Description**:
+
+The default value is 256, which means collecting the first 256 bytes of an abnormal response payload and placing
+them into attribute.response_payload. When set to 0, it means that abnormal response payloads are not collected.
 
 ### Tunning {#processors.request_log.tunning}
 
@@ -8321,6 +10145,12 @@ processors:
 
 Service port list, priority lower than TCP SYN flags.
 
+The server determines the priority order from highest to lowest as:
+- TCP Flags: SYN|ACK, GPID
+- Layer 7 Parsing
+- `server_ports` Configuration
+- Packet Count (The side with more sent packets is the server.)
+
 ##### Cloud Traffic Ignore MAC {#processors.flow_log.conntrack.flow_generation.cloud_traffic_ignore_mac}
 
 **Tags**:
@@ -8425,7 +10255,7 @@ set this value at this time. Only valid for IDC (not Cloud) traffic.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -8456,7 +10286,7 @@ Timeouts for TCP State Machine - Established.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -8487,7 +10317,7 @@ Timeouts for TCP State Machine - Closing Reset.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -8518,7 +10348,7 @@ Timeouts for TCP State Machine - Opening Reset.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -8607,10 +10437,37 @@ processors:
 
 **Description**:
 
-Maximum number of flows that can be stored in FlowMap, It will also affect the capacity of
-the RRT cache, Example: `rrt-cache-capacity` = `flow-count-limit`. When `rrt-cache-capacity`
-is not enough, it will be unable to calculate the rrt of l7. When `inputs.cbpf.common.capture_mode`
-is `Physical Mirror` and concurrent_flow_limit is less than or equal to 65535, it will be forced to u32::MAX.
+Maximum number of flows that can be stored in FlowMap. When `inputs.cbpf.common.capture_mode` is `Physical Mirror`
+and concurrent_flow_limit is less than or equal to 65535, it will be forced to u32::MAX.
+
+#### RRT Cache Capacity {#processors.flow_log.tunning.rrt_cache_capacity}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.flow_log.tunning.rrt_cache_capacity`
+
+**Default value**:
+```yaml
+processors:
+  flow_log:
+    tunning:
+      rrt_cache_capacity: 16000
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [1024, 64000000] |
+
+**Description**:
+
+The capacity of the RRT Cache table in FlowMap. This table is used to calculate RRT latency metrics. If it is too large,
+it will cause high memory usage in the agent; if it is too small, RRT metrics may be missing.
 
 #### Memory Pool Size {#processors.flow_log.tunning.memory_pool_size}
 
@@ -9846,6 +11703,12 @@ outputs:
 Whether to compress the l4 flow log.
 
 # Plugins {#plugins}
+
+Plugin support
+When both plugins and custom extraction policies match, the priority is:
+1. Plugin extraction
+2. Custom field policies extraction
+3. Agent default extraction
 
 ## Wasm Plugins {#plugins.wasm_plugins}
 

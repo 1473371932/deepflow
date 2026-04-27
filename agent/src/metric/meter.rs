@@ -358,6 +358,9 @@ pub struct Anomaly {
     pub l7_client_error: u32,
     pub l7_server_error: u32,
     pub l7_timeout: u32,
+
+    pub client_ooo: u64,
+    pub server_ooo: u64,
 }
 
 impl Anomaly {
@@ -379,6 +382,8 @@ impl Anomaly {
         self.l7_client_error += other.l7_client_error;
         self.l7_server_error += other.l7_server_error;
         self.l7_timeout += other.l7_timeout;
+        self.client_ooo += other.client_ooo;
+        self.server_ooo += other.server_ooo;
     }
 }
 
@@ -402,6 +407,9 @@ impl From<Anomaly> for metric::Anomaly {
             l7_client_error: m.l7_client_error,
             l7_server_error: m.l7_server_error,
             l7_timeout: m.l7_timeout,
+
+            client_ooo: m.client_ooo,
+            server_ooo: m.server_ooo,
         }
     }
 }
@@ -429,7 +437,7 @@ impl From<FlowLoad> for metric::FlowLoad {
     }
 }
 
-#[derive(Serialize, Debug, Default, Clone, Copy)]
+#[derive(Serialize, Debug, Default, Clone, Copy, PartialEq)]
 pub struct AppMeter {
     pub traffic: AppTraffic,
     pub latency: AppLatency,
@@ -442,8 +450,15 @@ impl AppMeter {
         self.latency.sequential_merge(&other.latency);
         self.anomaly.sequential_merge(&other.anomaly);
     }
+
     pub fn reverse(&mut self) {
         self.traffic.reverse()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.traffic.is_empty()
+            && self.latency == AppLatency::default()
+            && self.anomaly == AppAnomaly::default()
     }
 }
 
@@ -457,7 +472,7 @@ impl From<AppMeter> for metric::AppMeter {
     }
 }
 
-#[derive(Serialize, Debug, Default, Clone, Copy)]
+#[derive(Serialize, Debug, Default, Clone, Copy, PartialEq)]
 pub struct AppTraffic {
     pub request: u32,
     pub response: u32,
@@ -474,6 +489,10 @@ impl AppTraffic {
         swap(&mut self.request, &mut self.response);
         self.direction_score = 0;
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.request == 0 && self.response == 0
+    }
 }
 
 impl From<AppTraffic> for metric::AppTraffic {
@@ -486,7 +505,7 @@ impl From<AppTraffic> for metric::AppTraffic {
     }
 }
 
-#[derive(Serialize, Debug, Default, Clone, Copy)]
+#[derive(Serialize, Debug, Default, Clone, Copy, PartialEq)]
 pub struct AppLatency {
     pub rrt_max: u32,
     pub rrt_sum: u64,
@@ -513,7 +532,7 @@ impl From<AppLatency> for metric::AppLatency {
     }
 }
 
-#[derive(Serialize, Debug, Default, Clone, Copy)]
+#[derive(Serialize, Debug, Default, Clone, Copy, PartialEq)]
 pub struct AppAnomaly {
     pub client_error: u32,
     pub server_error: u32,

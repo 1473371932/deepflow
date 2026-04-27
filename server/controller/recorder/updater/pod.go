@@ -26,8 +26,28 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 	"github.com/deepflowio/deepflow/server/controller/recorder/statsd"
 )
+
+// PodMessageFactory defines the message factory for Pod
+type PodMessageFactory struct{}
+
+func (f *PodMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedPods{}
+}
+
+func (f *PodMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedPod{}
+}
+
+func (f *PodMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedPods{}
+}
+
+func (f *PodMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedPodFields{}
+}
 
 type Pod struct {
 	UpdaterBase[
@@ -35,36 +55,12 @@ type Pod struct {
 		*diffbase.Pod,
 		*metadbmodel.Pod,
 		metadbmodel.Pod,
-		*message.PodAdd,
-		message.PodAdd,
-		message.AddNoneAddition,
-		*message.PodUpdate,
-		message.PodUpdate,
-		*message.PodFieldsUpdate,
-		message.PodFieldsUpdate,
-		*message.PodDelete,
-		message.PodDelete,
-		message.DeleteNoneAddition]
+	]
 }
 
 func NewPod(wholeCache *cache.Cache, cloudData []cloudmodel.Pod) *Pod {
 	updater := &Pod{
-		newUpdaterBase[
-			cloudmodel.Pod,
-			*diffbase.Pod,
-			*metadbmodel.Pod,
-			metadbmodel.Pod,
-			*message.PodAdd,
-			message.PodAdd,
-			message.AddNoneAddition,
-			*message.PodUpdate,
-			message.PodUpdate,
-			*message.PodFieldsUpdate,
-			message.PodFieldsUpdate,
-			*message.PodDelete,
-			message.PodDelete,
-			message.DeleteNoneAddition,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_POD_EN,
 			wholeCache,
 			db.NewPod().SetMetadata(wholeCache.GetMetadata()),
@@ -72,15 +68,16 @@ func NewPod(wholeCache *cache.Cache, cloudData []cloudmodel.Pod) *Pod {
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
+	updater.setDataGenerator(updater)
+
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &PodMessageFactory{})
+	}
+
 	return updater
 }
 
-func (p *Pod) getDiffBaseByCloudItem(cloudItem *cloudmodel.Pod) (diffBase *diffbase.Pod, exists bool) {
-	diffBase, exists = p.diffBaseData[cloudItem.Lcuuid]
-	return
-}
-
+// Implement DataGenerator interface
 func (p *Pod) generateDBItemToAdd(cloudItem *cloudmodel.Pod) (*metadbmodel.Pod, bool) {
 	vpcID, exists := p.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.VPCLcuuid)
 	if !exists {
@@ -122,6 +119,7 @@ func (p *Pod) generateDBItemToAdd(cloudItem *cloudmodel.Pod) (*metadbmodel.Pod, 
 				ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN, cloudItem.PodServiceLcuuid,
 				ctrlrcommon.RESOURCE_TYPE_POD_EN, cloudItem.Lcuuid,
 			), p.metadata.LogPrefixes)
+			return nil, false
 		}
 	}
 	var podReplicaSetID int
@@ -139,6 +137,7 @@ func (p *Pod) generateDBItemToAdd(cloudItem *cloudmodel.Pod) (*metadbmodel.Pod, 
 	dbItem := &metadbmodel.Pod{
 		Name:            cloudItem.Name,
 		Label:           cloudItem.Label,
+		UID:             ctrlrcommon.GenerateResourceShortUUID(ctrlrcommon.RESOURCE_TYPE_POD_EN),
 		ENV:             cloudItem.ENV,
 		ContainerIDs:    cloudItem.ContainerIDs,
 		Annotation:      cloudItem.Annotation,
@@ -150,7 +149,7 @@ func (p *Pod) generateDBItemToAdd(cloudItem *cloudmodel.Pod) (*metadbmodel.Pod, 
 		PodGroupID:      podGroupID,
 		PodServiceID:    podServiceID,
 		SubDomain:       cloudItem.SubDomainLcuuid,
-		Domain:          p.metadata.Domain.Lcuuid,
+		Domain:          p.metadata.GetDomainLcuuid(),
 		Region:          cloudItem.RegionLcuuid,
 		AZ:              cloudItem.AZLcuuid,
 		VPCID:           vpcID,
@@ -163,13 +162,13 @@ func (p *Pod) generateDBItemToAdd(cloudItem *cloudmodel.Pod) (*metadbmodel.Pod, 
 	return dbItem, true
 }
 
-func (m *Pod) recordStatsd(cloudItem *cloudmodel.Pod) {
+func (p *Pod) recordStatsd(cloudItem *cloudmodel.Pod) {
 	syncDelay := time.Since(cloudItem.CreatedAt).Seconds()
-	m.statsd.GetMonitor(statsd.TagTypePodSyncDelay).Fill(int(syncDelay))
+	p.statsd.GetMonitor(statsd.TagTypePodSyncDelay).Fill(int(syncDelay))
 }
 
-func (p *Pod) generateUpdateInfo(diffBase *diffbase.Pod, cloudItem *cloudmodel.Pod) (*message.PodFieldsUpdate, map[string]interface{}, bool) {
-	structInfo := new(message.PodFieldsUpdate)
+func (p *Pod) generateUpdateInfo(diffBase *diffbase.Pod, cloudItem *cloudmodel.Pod) (types.UpdatedFields, map[string]interface{}, bool) {
+	structInfo := new(message.UpdatedPodFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.VPCLcuuid != cloudItem.VPCLcuuid {
 		vpcID, exists := p.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.VPCLcuuid)
@@ -272,10 +271,6 @@ func (p *Pod) generateUpdateInfo(diffBase *diffbase.Pod, cloudItem *cloudmodel.P
 	if diffBase.CreatedAt != cloudItem.CreatedAt {
 		mapInfo["created_at"] = cloudItem.CreatedAt
 		structInfo.CreatedAt.Set(diffBase.CreatedAt, cloudItem.CreatedAt)
-	}
-
-	if len(mapInfo) > 0 {
-		structInfo.Name.SetNew(cloudItem.Name)
 	}
 
 	return structInfo, mapInfo, len(mapInfo) > 0

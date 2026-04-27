@@ -39,7 +39,7 @@ deepflow-agent 使用 cgroups 来限制自身的 CPU 用量，
 
 **标签**:
 
-`hot_update`
+<mark>agent_restart</mark>
 
 **FQCN**:
 
@@ -63,7 +63,12 @@ global:
 
 **详细描述**:
 
-deepflow-agent 使用 cgroups 限制自身的 memory 用量.
+deepflow-agent 使用 cgroups 限制自身的 memory 用量。
+
+注意：
+- 专属采集器内存不受限制
+- 容器采集器内存限制由容器管理工具来实现
+- 同集群的容器采集器内存限制需要一致
 
 ### 日志每小时回传上限 {#global.limits.max_log_backhaul_rate}
 
@@ -246,6 +251,8 @@ global:
 **详细描述**:
 
 用于控制 deepflow-agent 创建的线程数量。
+- 当线程数量超过该限制值，会触发采集器异常告警。
+- 当线程数量超过该限制值的2倍，会触发采集器重启。
 
 ### 进程数限制 {#global.alerts.process_threshold}
 
@@ -274,7 +281,8 @@ global:
 
 **详细描述**:
 
-用于控制 deepflow-agent 创建的进程数量。
+用于控制名称为`deepflow-agent`的进程数量。
+若当前系统中名为`deepflow-agent`的进程数达到该限制值，则之后名为`deepflow-agent`的进程将会启动失败。
 
 ### Core File 检查 {#global.alerts.check_core_file_disabled}
 
@@ -350,7 +358,7 @@ global:
 观测内存比率是由 `global.circuit_breakers.sys_memory_percentage.metric` 决定.
 1. 当系统`观测内存比率`低于 `trigger_threshold` * 70% 时，
    采集器将自动重启。
-2. 当系统`观测内存比率低于 `trigger_threshold` 但高于 70% 时，
+2. 当系统`观测内存比率`低于 `trigger_threshold` 但高于 70% 时，
    采集器设置为 `FREE_MEM_EXCEEDED` 的异常状态，并上报采集器异常告警。
 3. 当系统`观测内存比率`持续高于 `trigger_threshold` * 110% 时，
    采集器将从异常状态恢复。
@@ -564,6 +572,103 @@ global:
 
 deepflow-agent 对流量分发所使用网络接口的出方向吞吐量指标的监控周期。
 
+### 空闲磁盘 {#global.circuit_breakers.free_disk}
+
+#### 百分比触发阈值 {#global.circuit_breakers.free_disk.percentage_trigger_threshold}
+
+**标签**:
+
+`hot_update`
+
+**FQCN**:
+
+`global.circuit_breakers.free_disk.percentage_trigger_threshold`
+
+**默认值**:
+```yaml
+global:
+  circuit_breakers:
+    free_disk:
+      percentage_trigger_threshold: 15
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Unit | % |
+| Range | [0, 100] |
+
+**详细描述**:
+
+仅当采集器运行在非容器环境中时该配置有效。配置为 0 表示禁用该阈值。
+观测磁盘为`global.circuit_breakers.free_disk.directories`目录所在磁盘。
+1. 当系统`空闲磁盘比率`低于`该阈值`时，采集器进入熔断禁用状态，
+   并设置`磁盘空闲空间触发熔断`异常状态，同时上报采集器异常告警。
+2. 当系统`空闲磁盘比率`高于`该阈值 * 110%` 时，采集器从异常状态恢复。
+
+#### 绝对值触发阈值 {#global.circuit_breakers.free_disk.absolute_trigger_threshold}
+
+**标签**:
+
+`hot_update`
+
+**FQCN**:
+
+`global.circuit_breakers.free_disk.absolute_trigger_threshold`
+
+**默认值**:
+```yaml
+global:
+  circuit_breakers:
+    free_disk:
+      absolute_trigger_threshold: 10
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Unit | GB |
+| Range | [0, 100000] |
+
+**详细描述**:
+
+仅当采集器运行在非容器环境中时该配置有效。配置为 0 表示禁用该阈值。
+观测磁盘为`global.circuit_breakers.free_disk.directories`目录所在磁盘。
+1. 当系统`空闲磁盘大小`低于`该阈值`时，采集器进入熔断禁用状态，
+   并设置`磁盘空闲空间触发熔断`异常状态，同时上报采集器异常告警。
+2. 当系统`空闲磁盘大小`高于`该阈值 * 110%` 时，采集器从异常状态恢复。
+
+#### 观测目录 {#global.circuit_breakers.free_disk.directories}
+
+**标签**:
+
+`hot_update`
+
+**FQCN**:
+
+`global.circuit_breakers.free_disk.directories`
+
+**默认值**:
+```yaml
+global:
+  circuit_breakers:
+    free_disk:
+      directories:
+      - /
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | string |
+
+**详细描述**:
+
+观测目录所在磁盘的空间。
+对于`windows`操作系统，默认值则是`c:\`
+
 ## 调优 {#global.tunning}
 
 对 deepflow-agent 的运行进行调优。
@@ -595,8 +700,8 @@ global:
 
 **详细描述**:
 
-操作系统尽可能使用指定 ID 的 CPU 核运行 deepflow-agent 进程。无效的 ID 将被忽略。当前仅对
-dispatcher 线程生效。举例：
+操作系统尽可能使用指定 ID 的 CPU 核运行 deepflow-agent 进程。无效的 ID 将被忽略。该配置
+会作用于已存在的 deepflow-agent 线程，但 self-managed 的 kick-kern.* eBPF 线程除外。举例：
 ```yaml
 global:
   tunning:
@@ -607,7 +712,7 @@ global:
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -636,7 +741,7 @@ global:
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -659,6 +764,33 @@ global:
 **详细描述**:
 
 开启闲置内存修剪特性，将降低 agent 内存使用量，但可能会损失 agent 处理性能。
+
+### 禁用 swap 内存 {#global.tunning.swap_disabled}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`global.tunning.swap_disabled`
+
+**默认值**:
+```yaml
+global:
+  tunning:
+    swap_disabled: false
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+注意禁用 swap 内存需要 root 和 CAP_IPC_LOCK 权限，禁用 swap 内存后性能也许会提升并且CPU使用率会降低,
+但是内存会升高。
 
 ### Page Cache 回收百分比 {#global.tunning.page_cache_reclaim_percentage}
 
@@ -701,7 +833,7 @@ cgroup 因为内存不足杀死 agent 进程。为了避免这种情况，agent 
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -763,6 +895,8 @@ global:
 
 deepflow-agent 是否向 deepflow-server 做 NTP 同步的开关。
 
+注意：开启 NTP 前控制器需要先开启 NTP 服务，直到完成同步时间后采集器才会继续运行。
+
 ### 最大时钟偏差 {#global.ntp.max_drift}
 
 **标签**:
@@ -786,7 +920,7 @@ global:
 | Key  | Value                        |
 | ---- | ---------------------------- |
 | Type | duration |
-| Range | [0, '365d'] |
+| Range | ['0ns', '365d'] |
 
 **详细描述**:
 
@@ -815,7 +949,7 @@ global:
 | Key  | Value                        |
 | ---- | ---------------------------- |
 | Type | duration |
-| Range | [0, '365d'] |
+| Range | ['0ns', '365d'] |
 
 **详细描述**:
 
@@ -1006,6 +1140,7 @@ global:
 **标签**:
 
 `hot_update`
+<mark>deprecated</mark>
 
 **FQCN**:
 
@@ -1159,7 +1294,7 @@ global:
 | ----- | ---------------------------- |
 | DEBUG | |
 | INFO | |
-| WARNING | |
+| WARN | |
 | ERROR | |
 
 **模式**:
@@ -1191,7 +1326,7 @@ log_level: info,deepflow_agent::rpc::session=debug
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1511,7 +1646,7 @@ inputs:
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1539,7 +1674,7 @@ inputs:
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1551,30 +1686,30 @@ Upgrade from old version: `static_config.os-proc-socket-sync-interval`
 ```yaml
 inputs:
   proc:
-    socket_info_sync_interval: 0
+    socket_info_sync_interval: 0ns
 ```
 
 **模式**:
 | Key  | Value                        |
 | ---- | ---------------------------- |
 | Type | duration |
-| Range | [0, '1h'] |
+| Range | ['0ns', '1h'] |
 
 **详细描述**:
 
 进程 Socket 信息的同步周期。
 
-0 表示不开启，除 0 外不要配置小于 `1s` 的值。
+'0ns' 表示不开启，除 '0ns' 外不要配置小于 `1s` 的值。
 
 注意：开启此功能时，需要同时在 `inputs.proc.process_matcher` 中进一步指定具体的进程列表，
-即 `inputs.proc.process_matcher.[*].enabled_features` 中需要包含 `inputs.proc.socket_info_sync_interval`。
+即 `inputs.proc.process_matcher.[*].enabled_features` 中需要包含 `proc.socket_list`。
 另外，也要注意确认 `inputs.proc.enabled` 已配置为 **true**。
 
 ### 最小活跃时间 {#inputs.proc.min_lifetime}
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1605,7 +1740,7 @@ inputs:
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1652,7 +1787,7 @@ inputs:
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1677,11 +1812,46 @@ inputs:
 
 deepflow-agent 执行 `script_command` 脚本命令的用户名。
 
+### 进程黑名单 {#inputs.proc.process_blacklist}
+
+**标签**:
+
+`hot_update`
+
+**FQCN**:
+
+`inputs.proc.process_blacklist`
+
+**默认值**:
+```yaml
+inputs:
+  proc:
+    process_blacklist:
+    - sleep
+    - sh
+    - bash
+    - pause
+    - runc
+    - grep
+    - awk
+    - sed
+    - curl
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | string |
+
+**详细描述**:
+
+进程匹配器忽略的进程列表。
+
 ### 进程匹配器 {#inputs.proc.process_matcher}
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1695,11 +1865,6 @@ inputs:
   proc:
     process_matcher:
     - enabled_features:
-      - proc.gprocess_info
-      ignore: true
-      match_regex: ^(sleep|sh|bash|pause|runc)$
-      only_in_container: false
-    - enabled_features:
       - ebpf.profile.on_cpu
       - proc.gprocess_info
       match_regex: \bjava( +\S+)* +-jar +(\S*/)*([^ /]+\.jar)
@@ -1709,7 +1874,35 @@ inputs:
     - enabled_features:
       - ebpf.profile.on_cpu
       - proc.gprocess_info
+      match_regex: \bjava( +\S+)* +-(?:cp|classpath) +\S+ +(?P<CLASS_NAME>[$_A-Za-z][$_0-9A-Za-z]*(?:\.[$_A-Za-z][$_0-9A-Za-z]*)*)
+      match_type: cmdline_with_args
+      only_in_container: false
+      rewrite_name: ${CLASS_NAME}
+    - enabled_features:
+      - ebpf.profile.on_cpu
+      - proc.gprocess_info
       match_regex: \bpython(\S)*( +-\S+)* +(\S*/)*([^ /]+)
+      match_type: cmdline_with_args
+      only_in_container: false
+      rewrite_name: $4
+    - enabled_features:
+      - ebpf.profile.on_cpu
+      - proc.gprocess_info
+      match_regex: \b(?:lua|luajit)(\S)*( +-\S+)* +(\S*/)*([^ /]+)
+      match_type: cmdline_with_args
+      only_in_container: false
+      rewrite_name: $5
+    - enabled_features:
+      - ebpf.profile.on_cpu
+      - proc.gprocess_info
+      match_regex: \bphp(\d+)?(-fpm|-cli|-cgi)?( +-\S+)* +(\S*/)*([^ /]+\.php)
+      match_type: cmdline_with_args
+      only_in_container: false
+      rewrite_name: $5
+    - enabled_features:
+      - ebpf.profile.on_cpu
+      - proc.gprocess_info
+      match_regex: \b(node|nodejs)( +--\S+)* +(\S*/)*([^ /]+\.js)
       match_type: cmdline_with_args
       only_in_container: false
       rewrite_name: $4
@@ -1785,7 +1978,7 @@ inputs:
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1814,7 +2007,7 @@ inputs:
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1827,7 +2020,7 @@ Upgrade from old version: `static_config.os-proc-regex.match-type`
 inputs:
   proc:
     process_matcher:
-    - match_type: ''
+    - match_type: process_name
 ```
 
 **枚举可选值**:
@@ -1852,7 +2045,7 @@ inputs:
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1872,6 +2065,8 @@ inputs:
 | java | |
 | golang | |
 | python | |
+| lua | |
+| php | |
 | nodejs | |
 | dotnet | |
 
@@ -1888,7 +2083,7 @@ inputs:
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1915,7 +2110,7 @@ inputs:
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1942,7 +2137,7 @@ inputs:
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1971,7 +2166,7 @@ inputs:
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -2000,7 +2195,7 @@ inputs:
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -2029,7 +2224,7 @@ inputs:
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -2048,14 +2243,14 @@ inputs:
 **枚举可选值**:
 | Value | Note                         |
 | ----- | ---------------------------- |
-| proc.gprocess_info | |
-| proc.golang_symbol_table | |
-| proc.socket_list | |
-| ebpf.socket.uprobe.golang | |
-| ebpf.socket.uprobe.tls | |
-| ebpf.profile.on_cpu | |
-| ebpf.profile.off_cpu | |
-| ebpf.profile.memory | |
+| proc.gprocess_info | 同步进程资源信息，并为 eBPF 原始观测数据注入所在观测点上的进程标签 |
+| proc.golang_symbol_table | 解析 Golang 特有符号表，用于 Golang 进程裁剪了标准符号表时的剖析数据优化 |
+| proc.socket_list | 同步进程的活跃 Socket 信息，用于为应用和网络观测数据注入通信双方的进程标签 |
+| ebpf.socket.uprobe.golang | 为 Golang 进程开启 eBPF uprobe，用于协程追踪并采集 Golang HTTP2/HTTPS 通信 |
+| ebpf.socket.uprobe.tls | 为 TLS 通信开启 eBPF uprobe，用于采集非 Golang 进程的加密通信观测数据 |
+| ebpf.profile.on_cpu | 开启 On-CPU 持续剖析功能 |
+| ebpf.profile.off_cpu | 开启 Off-CPU 持续剖析功能 |
+| ebpf.profile.memory | 开启内存持续剖析功能 |
 
 **模式**:
 | Key  | Value                        |
@@ -2832,7 +3027,7 @@ inputs:
 
 #### DPDK {#inputs.cbpf.special_network.dpdk}
 
-##### source {#inputs.cbpf.special_network.dpdk.source}
+##### 数据源 {#inputs.cbpf.special_network.dpdk.source}
 
 **标签**:
 
@@ -2868,7 +3063,7 @@ inputs:
 
 目前支持两种采集 DPDK 流量的方式，包括：
 - pdump: 详情见 [https://dpdk-docs.readthedocs.io/en/latest/prog_guide/multi_proc_support.html](https://dpdk-docs.readthedocs.io/en/latest/prog_guide/multi_proc_support.html)
-- eBPF: 使用 eBPF Uprobe 的方式获取 DPDK 流量
+- eBPF: 使用 eBPF Uprobe 的方式获取 DPDK 流量，同时需要配置 `inputs.ebpf.socket.uprobe.dpdk`
 
 ##### 乱序重排缓存时间窗口大小 {#inputs.cbpf.special_network.dpdk.reorder_cache_window_size}
 
@@ -3304,12 +3499,18 @@ inputs:
 **模式**:
 | Key  | Value                        |
 | ---- | ---------------------------- |
-| Type | int |
-| Range | [1, 65535] |
+| Type | string |
 
 **详细描述**:
 
 对指定端口的流，相邻的两个TCP分段 Packet 聚合在一起解析应用日志
+
+配置示例：
+
+packet_segmentation_reassembly:
+- 1000
+- 2000-2010
+- 5000
 
 ### 物理网络流量镜像 {#inputs.cbpf.physical_mirror}
 
@@ -3508,11 +3709,11 @@ inputs:
 | Key  | Value                        |
 | ---- | ---------------------------- |
 | Type | duration |
-| Range | [0, '1d'] |
+| Range | ['0ns', '1d'] |
 
 **详细描述**:
 
-Golang 程序追踪时请求与响应之间的最大时间间隔，设置为 0 时，Golang 程序的零侵扰追踪特性自动关闭。
+Golang 程序追踪时请求与响应之间的最大时间间隔，设置为 '0ns' 时，Golang 程序的零侵扰追踪特性自动关闭。
 
 ##### TLS {#inputs.ebpf.socket.uprobe.tls}
 
@@ -3548,16 +3749,22 @@ inputs:
 是否启用使用 openssl 库的进程以支持 HTTPS 协议数据采集。
 
 可通过以下方式判断应用进程是否能够使用 `Uprobe hook openssl 库`来采集加密数据：
-- 执行命令`cat /proc/<PID>/maps | grep "libssl.so"`，若包含 openssl 相关信息
+- 执行命令`sudo cat /proc/<PID>/maps | grep "libssl.so"`，若包含 openssl 相关信息
   则说明该进程正在使用 openssl 库。
+- 如果上面没有搜到 "libssl.so" 也可能是静态编译了，这时候我们可以通过下面方式确认：
+  执行命令 `sudo nm /proc/<PID>/exe | grep SSL_write` 若包含 `SSL_write` 相关信息如：`0000000000502ac0 T SSL_write`
+  则说明该进程正在使用静态编译的 openssl 库。
 
 启用后，deepflow-agent 将获取符合正则表达式匹配的进程信息，并 Hook openssl 库的相应加解密接口。
 在日志中您会看到类似如下信息：
 ```
 [eBPF] INFO openssl uprobe, pid:1005, path:/proc/1005/root/usr/lib64/libssl.so.1.0.2k
+或者
+[eBPF] INFO openssl uprobe, pid:28890, path:/proc/28890/root/usr/sbin/nginx
 ```
 
-注意：开启此功能时，需要同时在 `inputs.proc.process_matcher` 中进一步指定具体的进程列表，
+注意：开启此功能后，Envoy mTLS 流量可自动完成追踪；
+若为非 Envoy 流量，则需要同时在 `inputs.proc.process_matcher` 中进一步指定具体的进程列表，
 即 `inputs.proc.process_matcher.[*].enabled_features` 中需要包含 `ebpf.socket.uprobe.tls`。
 
 ##### DPDK {#inputs.ebpf.socket.uprobe.dpdk}
@@ -3592,7 +3799,11 @@ inputs:
 
 设置 DPDK 应用的命令名称, eBPF 会自动寻找并进行追踪采集数据包
 
-配置样例: 如果命令行是 `/usr/bin/mydpdk`, 可以配置成 `command: mydpdk`
+配置样例: 如果命令行是 `/usr/bin/mydpdk`, 可以配置成 `command: mydpdk`, 并设置 `inputs.cbpf.special_network.dpdk.source = eBPF`
+
+在 DPDK 作为 vhost-user 后端的场景中，虚拟机与 DPDK 应用之间通过 virtqueue（vring）进行数据交换。
+eBPF 可以在无需修改 DPDK 或虚拟机的前提下，自动 hook 到 vring 接口，实现对传输数据包的捕获和分析，
+无需额外配置即可实现流量可观测。相比之下，若要捕获物理网卡上的数据包，则需要配合 DPDK 的驱动接口进行显式配置。
 
 ###### DPDK 应用数据包接收 hook 点设置 {#inputs.ebpf.socket.uprobe.dpdk.rx_hooks}
 
@@ -3744,6 +3955,34 @@ inputs:
 
 当设置为 true 时，kprobe 功能将被禁用。
 
+##### 启用 Unix Socket 追踪 {#inputs.ebpf.socket.kprobe.enable_unix_socket}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.socket.kprobe.enable_unix_socket`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    socket:
+      kprobe:
+        enable_unix_socket: false
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+当设置为 true 时，启用 Unix Socket 追踪。
+
 ##### 黑名单 {#inputs.ebpf.socket.kprobe.blacklist}
 
 ###### 端口号 {#inputs.ebpf.socket.kprobe.blacklist.ports}
@@ -3815,6 +4054,74 @@ TCP 和 UDP 的端口白名单列表，白名单生效优先级低于 kprobe 黑
 未列入黑名单、白名单的端口用 kprobe 做采集。
 
 配置样例: `ports: 80,1000-2000`
+
+#### SockOps {#inputs.ebpf.socket.sock_ops}
+
+##### TCP Option Trace {#inputs.ebpf.socket.sock_ops.tcp_option_trace}
+
+###### TCP Option 注入 {#inputs.ebpf.socket.sock_ops.tcp_option_trace.enabled}
+
+**标签**:
+
+`hot_update`
+
+**FQCN**:
+
+`inputs.ebpf.socket.sock_ops.tcp_option_trace.enabled`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    socket:
+      sock_ops:
+        tcp_option_trace:
+          enabled: false
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+是否开启 TCP Option Tracing SockOps 程序，用于在满足条件的 TCP 连接上注入 DeepFlow 元数据（如进程 PID）。
+注意：该功能依赖 cgroup v2（统一层级）和内核版本 > 5.10。在 cgroup v1 主机上 SockOps 绑定会失败.
+兼容性：已在 x86 上验证内核 > 5.10；arm 目前仅在 6.8 内核上测试。
+限制：PID 跟踪依赖per-CPU syscall map。CPU 拥堵、软中断可能在不同 CPU 运行时，注入的元数据可能缺失或过期。
+
+###### PID 注入窗口 {#inputs.ebpf.socket.sock_ops.tcp_option_trace.sampling_window_bytes}
+
+**标签**:
+
+`hot_update`
+
+**FQCN**:
+
+`inputs.ebpf.socket.sock_ops.tcp_option_trace.sampling_window_bytes`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    socket:
+      sock_ops:
+        tcp_option_trace:
+          sampling_window_bytes: 16384
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Unit | Bytes |
+| Range | [0, 1048576] |
+
+**详细描述**:
+
+控制 PID 注入之间的最小 TCP 负载间隔字节数。缺省为 16KB，与历史行为一致；值越小注入越频繁，值越大越稀疏。
+设置为0关闭采样窗口功能，对所有数据包注入。
 
 #### 调优 {#inputs.ebpf.socket.tunning}
 
@@ -3911,6 +4218,41 @@ inputs:
 但这可能会导致一些性能下降。此配置仅适用于 `BPF_MAP_TYPE_HASH` 类型的 bpf map。
 目前适用于 socket trace 和 uprobe Golang/OpenSSL trace 功能。禁用内存预分配大约会减少45M的内存占用。
 
+##### 启用fentry/fexit特性 {#inputs.ebpf.socket.tunning.fentry_enabled}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.socket.tunning.fentry_enabled`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    socket:
+      tunning:
+        fentry_enabled: false
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+使用 fentry/fexit 特性说明
+- 相比传统的 kprobes，fentry 和 fexit 程序提供了更高的性能和可用性，可带来约 5%–10% 的性能提升。
+- 部分 Linux 内核对该特性支持不够完善，可能导致内核 BUG 和节点崩溃。已知的 BUG 修复包括：
+  - TencentOS Linux kernel 5.4.119 的修复
+    [https://github.com/torvalds/linux/commit/c3d6324f841bab2403be6419986e2b1d1068d423](https://github.com/torvalds/linux/commit/c3d6324f841bab2403be6419986e2b1d1068d423)
+  - Alibaba Cloud Linux kernel 5.10.23 的修复
+    [https://github.com/gregkh/linux/commit/e21d2b92354b3cd25dd774ebb0f0e52ff04a7861](https://github.com/gregkh/linux/commit/e21d2b92354b3cd25dd774ebb0f0e52ff04a7861)
+- 内核建议：若要启用 fentry/fexit 特性，推荐使用 Linux kernel 5.10.28 及以上版本，以确保稳定性和性能。
+
 #### 预处理 {#inputs.ebpf.socket.preprocess}
 
 ##### 乱序重排（OOOR）缓冲区大小 {#inputs.ebpf.socket.preprocess.out_of_order_reassembly_cache_size}
@@ -3932,7 +4274,7 @@ inputs:
   ebpf:
     socket:
       preprocess:
-        out_of_order_reassembly_cache_size: 16
+        out_of_order_reassembly_cache_size: 256
 ```
 
 **模式**:
@@ -3984,7 +4326,39 @@ inputs:
 **详细描述**:
 
 配置后 deepflow-agent 将对指定应用协议的处理增加乱序重排过程。注意：（1）开启特性将消耗更多的内存，因此
-需关注 agent 内存用量；（2）如需对`gRPC`协议乱序重排，请配置`HTTP2`协议。
+需关注 agent 内存用量；（2）配置`HTTP2`或`gRPC`会全部开启这两个协议
+
+##### 乱序重排（OOOR）超时时间 {#inputs.ebpf.socket.preprocess.out_of_order_reassembly_timeout}
+
+**标签**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`inputs.ebpf.socket.preprocess.out_of_order_reassembly_timeout`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    socket:
+      preprocess:
+        out_of_order_reassembly_timeout: 100ms
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | duration |
+| Range | ['100ms', '1s'] |
+
+**详细描述**:
+
+OOOR 缓存的数据时间超时会直接输出, 可以根据采集器指标 `deepflow_agent_ebpf_collect.metrics.metrics.time_backtrack_max` 调整该参数。
+
+注意：增大该值会消耗更多的内存
 
 ##### 分段重组（SR）协议列表 {#inputs.ebpf.socket.preprocess.segmentation_reassembly_protocols}
 
@@ -4026,7 +4400,7 @@ inputs:
 注意：
 1. 该特性的生效的前提条件是`out_of_order_reassembly_protocols`开启并生效；
    - 支持协议：[https://www.deepflow.io/docs/zh/features/l7-protocols/overview/](https://www.deepflow.io/docs/zh/features/l7-protocols/overview/)
-2. 如需对`gRPC`协议乱序重排，请配置`HTTP2`协议。
+2. 配置`HTTP2`或`gRPC`会全部开启这两个协议
 
 ### File {#inputs.ebpf.file}
 
@@ -4072,6 +4446,12 @@ inputs:
 - 调用生命周期：仅采集调用生命周期内的文件 IO 事件。
 - 全部：采集所有的文件 IO 事件。
 
+说明：
+- 为了获取文件的完整路径，需要结合进程的挂载信息进行路径拼接。然而，一些进程在完成任务后会迅速退出，
+  此时我们处理其产生的文件读写数据时，可能已无法从 /proc/[pid]/mountinfo 中获取挂载信息，导致路径不
+  完整（缺少挂载点）。我们对于 50ms 以下生存期的进程，文件路径会缺少挂载点信息。对于长期运行的进程，
+  则不存在该问题。
+
 ##### 最小耗时 {#inputs.ebpf.file.io_event.minimal_duration}
 
 **标签**:
@@ -4103,6 +4483,36 @@ inputs:
 
 deepflow-agent 所采集的文件 IO 事件的时延下限阈值，操作系统中时延低于此阈值
 的文件 IO 事件将被忽略。
+
+##### 启用虚拟文件采集 {#inputs.ebpf.file.io_event.enable_virtual_file_collect}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.file.io_event.enable_virtual_file_collect`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    file:
+      io_event:
+        enable_virtual_file_collect: false
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+当设置为 true 时，deepflow-agent 将采集发生在虚拟文件系统上的文件
+I/O 事件（例如 /proc、/sys、/run 等由内核动态生成的伪文件系统）。
+当设置为 false 时，将不会采集虚拟文件系统上的文件 I/O 事件。
 
 ### Profile {#inputs.ebpf.profile}
 
@@ -4431,11 +4841,11 @@ inputs:
 | Key  | Value                        |
 | ---- | ---------------------------- |
 | Type | duration |
-| Range | [0, '1h'] |
+| Range | ['0ns', '1h'] |
 
 **详细描述**:
 
-低于'最小阻塞时间'的 Off-CPU 数据将被 deepflow-agent 忽略，'最小阻塞时间'设置为 '0' 表示
+低于'最小阻塞时间'的 Off-CPU 数据将被 deepflow-agent 忽略，'最小阻塞时间'设置为 '0ns' 表示
 采集所有的 Off-CPU 数据。由于 CPU 调度事件数量庞大（每秒可能超过一百万次），调小该参数将带来
 明显的资源开销，如果需要跟踪大时延的调度阻塞事件，建议调大该参数，以降低资源开销。另外，deepflow-agent
 不采集阻塞超过 1 小时的事件。
@@ -4536,7 +4946,105 @@ inputs:
 
 **详细描述**:
 
-采集器使用 LRU 缓存记录进程分配的地址，以避免内存使用失控。每个 LRU 条目大约占 80B 内存。
+采集器使用 LRU 缓存记录进程分配的地址，以避免内存使用失控。每个 LRU 条目大约占 32B 内存。
+
+##### 排序长度 {#inputs.ebpf.profile.memory.sort_length}
+
+**标签**:
+
+`hot_update`
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.memory.sort_length`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      memory:
+        sort_length: 16384
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [0, 65536] |
+
+**详细描述**:
+
+为了匹配 mallocs 和 frees，内存剖析会在处理前对数据按时间戳排序。
+该参数是排序数组的长度。
+配置该选项时先按说明调整 `sort_interval` 参数，在参考采集器性能统计 `deepflow_agent_ebpf_memory_profiler` 中
+`dequeued_by_length` 和 `dequeued_by_interval` 指标，在保证前者小于后者几倍的前提下适当调小该参数。
+
+##### 排序间隔 {#inputs.ebpf.profile.memory.sort_interval}
+
+**标签**:
+
+`hot_update`
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.memory.sort_interval`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      memory:
+        sort_interval: 1500ms
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | duration |
+| Range | ['1ns', '10s'] |
+
+**详细描述**:
+
+为了匹配 mallocs 和 frees，内存剖析会在处理前对数据按时间戳排序。
+该参数控制排序数组中第一个和最后一个元素之间的时间间隔的最大值。
+配置该选项可以参考采集器性能统计 `deepflow_agent_ebpf_memory_profiler` 中
+`time_backtracked` 指标，增大该参数使之为 0 即可。注意可能需要相应增大 `sort_length` 参数。
+
+##### 队列大小 {#inputs.ebpf.profile.memory.queue_size}
+
+**标签**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.memory.queue_size`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      memory:
+        queue_size: 32768
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [4096, 64000000] |
+
+**详细描述**:
+
+内存剖析组件内部的队列大小。
+配置该选项可以参考采集器性能统计 `deepflow_agent_ebpf_memory_profiler` 中
+`overwritten` 和 `pending` 指标，增大该配置使得前者为 0，后者不高于该配置即可。
 
 #### 预处理 {#inputs.ebpf.profile.preprocess}
 
@@ -4571,6 +5079,483 @@ inputs:
 发送数据之前压缩函数调用栈。压缩能够有效降低 agent 的内存开销、数据传输的带宽消耗、以及
 ingester 的 CPU 开销，但是 Agent 也会因此消耗更多的 CPU。测试表明，将deepflow-agent 自身的
 on-cpu 函数调用栈压缩，可以将带宽消耗降低 `x` 倍，但会使得 agent 额外消耗 `y%` 的 CPU。
+
+#### 语言特定剖析 {#inputs.ebpf.profile.languages}
+
+控制对哪些解释型语言进行剖析。禁用不使用的语言可以节省每个语言约 5-6 MB 内存。
+总内存占用：~17-20 MB（全部启用），~6.1 MB（仅 Python），~5.2 MB（仅 PHP），~6.4 MB（仅 Node.js）。
+
+##### 禁用 Python 剖析 {#inputs.ebpf.profile.languages.python_disabled}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.languages.python_disabled`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      languages:
+        python_disabled: false
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+禁用 Python 解释器剖析。禁用后将不采集 Python 进程的函数调用栈，
+可节省约 6.1 MB 内核内存（python_tstate_addr_map、python_unwind_info_map、python_offsets_map）。
+
+##### 禁用 PHP 剖析 {#inputs.ebpf.profile.languages.php_disabled}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.languages.php_disabled`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      languages:
+        php_disabled: false
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+禁用 PHP 解释器剖析。禁用后将不采集 PHP 进程的函数调用栈，
+可节省约 5.2 MB 内核内存（php_unwind_info_map、php_offsets_map）。
+
+##### 禁用 Node.js 剖析 {#inputs.ebpf.profile.languages.nodejs_disabled}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.languages.nodejs_disabled`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      languages:
+        nodejs_disabled: false
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+禁用 Node.js（V8）解释器剖析。禁用后将不采集 Node.js 进程的函数调用栈，
+可节省约 6.4 MB 内核内存（v8_unwind_info_map）。
+
+##### 禁用 Lua 剖析 {#inputs.ebpf.profile.languages.lua_disabled}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.languages.lua_disabled`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      languages:
+        lua_disabled: false
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+禁用 Lua 解释器剖析。禁用后将不采集 Lua 进程的函数调用栈，
+可节省约 13 MB 内核内存（lua_tstate_map、lua_lang_flags_map、lua_unwind_info_map、lua_offsets_map、luajit_offsets_map）。
+
+### 网络 {#inputs.ebpf.network}
+
+#### NIC optimization Enabled {#inputs.ebpf.network.nic_opt_enabled}
+
+**标签**:
+
+`hot_update`
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_opt_enabled`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_opt_enabled: false
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+是否启用网卡优化功能，用于提升多核环境下的网络包处理能力
+以及突发流量承载能力。
+
+开启后将综合进行以下优化：
+  - RSS 硬件队列数量配置
+  - RX ring 描述符数量调优
+  - 硬件中断与 CPU 亲和性绑定（IRQ 绑核）
+  - 可选的 XDP CPUMAP 软件重定向分发
+
+该优化主要解决 RSS 硬件无法基于封装报文内层头部
+（如 GRE、Double VLAN、VXLAN、ERSPAN）进行哈希分摊的问题，
+避免流量集中在单个 CPU 上造成过载和丢包。
+
+通过调整 RX ring 描述符数量，可提升突发流量场景下的
+接收缓存能力，降低 ring 满导致的丢包风险。
+
+在启用 XDP CPU Redirect 时，数据包会在接收后通过
+CPUMAP 在多个 CPU 核心之间进行软件层重分发，
+从而突破硬件 RSS 的能力限制，实现更均衡的负载分布。
+
+建议在以下场景开启该功能：
+  1）使用 tcpdump 抓包发现该接口流量主要为 GRE、
+     Double VLAN、VXLAN 等封装报文；
+  2）通过 `top`（按 1）观察各 CPU 软中断占用率时，
+     发现某一个 CPU 的 softirq 接近 100%，
+     而其他 CPU 软中断占用率明显偏低。
+
+为获得最佳性能，建议将中断 CPU 和 XDP 重定向 CPU
+配置在与物理网卡相同的 NUMA 节点上。
+
+#### 网卡优化配置 {#inputs.ebpf.network.nic_optimize}
+
+**标签**:
+
+`hot_update`
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - interface: ''
+        irq_cpu_list: ''
+        rss_channel_count: 0
+        rx_ring_size: 0
+        xdp_cpu_redirect: false
+        xdp_cpu_redirect_list: ''
+        xdp_queue_size: 2048
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | dict |
+
+**详细描述**:
+
+针对指定网卡接口进行性能优化配置。
+
+该功能通过调优 RSS 队列、中断绑核、RX ring 大小、
+以及可选的 XDP CPUMAP 重定向机制，提升多核扩展能力
+和突发流量承载能力。
+
+建议在以下场景开启：
+  - 接口流量主要为 GRE、Double VLAN、VXLAN、ERSPAN 等封装报文；
+  - 某个 CPU 的 softirq 占用率接近 100%，而其他 CPU 空闲。
+
+为了获得更好的性能，程序会自动停用 irqbalance 服务，以防止网卡中断在 CPU 之间迁移。
+
+可为多个接口分别配置优化策略。
+
+样例:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_opt_enabled: true
+      nic_optimize:
+      - interface: eth0
+        rx_ring_size: 4096
+        rss_channel_count: 2
+        irq_cpu_list: 1,2
+        xdp_cpu_redirect: true
+        xdp_queue_size: 2048
+        xdp_cpu_redirect_list: 4,5,6,7
+      - interface: eth1
+        rx_ring_size: 4096
+        rss_channel_count: 2
+        irq_cpu_list: 1,2
+        xdp_cpu_redirect: true
+        xdp_queue_size: 2048
+        xdp_cpu_redirect_list: 4,5,6,7
+```
+
+##### 网卡接口 {#inputs.ebpf.network.nic_optimize.interface}
+
+**标签**:
+
+<mark></mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize.interface`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - interface: ''
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | string |
+
+**详细描述**:
+
+需要进行优化的网卡接口名称。
+
+##### RX Ring 描述符数量 {#inputs.ebpf.network.nic_optimize.rx_ring_size}
+
+**标签**:
+
+<mark></mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize.rx_ring_size`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - rx_ring_size: 0
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+
+**详细描述**:
+
+网卡接收环（RX ring）的描述符数量。
+
+增大该值可提升突发流量场景下的缓存能力，
+降低因 ring 满导致的丢包风险。
+具体使用`ethtool -g <iface>` 查看当前配置，根据实际情况调整到合适的值。
+
+默认值为 0 表示保持原状忽略此项配置。
+
+##### RSS 队列数量 {#inputs.ebpf.network.nic_optimize.rss_channel_count}
+
+**标签**:
+
+<mark></mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize.rss_channel_count`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - rss_channel_count: 0
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+
+**详细描述**:
+
+RSS 硬件队列数量。
+数据包在物理网卡完成哈希后，将分发到指定数量的队列并触发中断。
+
+最大一般支持 16，且不要超过逻辑 CPU 核数。
+具体使用`ethtool -l <iface>` 查看当前配置，根据实际情况调整到合适的值。
+
+当启用 XDP CPU Redirect 时建议设置为 1。
+默认值为 0 表示保持原状忽略此项配置。
+
+##### 硬件中断 CPU 列表 {#inputs.ebpf.network.nic_optimize.irq_cpu_list}
+
+**标签**:
+
+<mark></mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize.irq_cpu_list`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - irq_cpu_list: ''
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | string |
+
+**详细描述**:
+
+用于处理网卡硬件中断的 CPU ID 或 CPU 列表。
+
+数量建议与 RSS 队列数量一致。
+若启用 XDP CPU Redirect，仅需指定一个 CPU。
+
+可设置为：
+  - 指定 CPU 列表（如 2,4,6）
+  - local（自动匹配本地 NUMA 节点 CPU）
+
+建议所选 CPU 与物理网卡位于同一 NUMA 节点。
+
+##### 启用 XDP CPU 重定向 {#inputs.ebpf.network.nic_optimize.xdp_cpu_redirect}
+
+**标签**:
+
+<mark></mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize.xdp_cpu_redirect`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - xdp_cpu_redirect: false
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+是否启用 XDP CPUMAP 重定向分发。
+
+用于解决硬件 RSS 无法对封装报文
+（如 Double VLAN、ERSPAN 等）进行均匀分摊，
+导致单核过载和丢包的问题。
+
+##### XDP 队列大小 {#inputs.ebpf.network.nic_optimize.xdp_queue_size}
+
+**标签**:
+
+<mark></mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize.xdp_queue_size`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - xdp_queue_size: 2048
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+
+**详细描述**:
+
+XDP CPUMAP 队列大小。
+
+取值范围：[512, 8192]，建议配置为 2 的幂。
+
+增大可提升突发流量承载能力，但会占用更多内存。
+
+##### XDP 重定向 CPU 列表 {#inputs.ebpf.network.nic_optimize.xdp_cpu_redirect_list}
+
+**标签**:
+
+<mark></mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize.xdp_cpu_redirect_list`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - xdp_cpu_redirect_list: ''
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | string |
+
+**详细描述**:
+
+XDP 重定向后用于处理数据包的 CPU 列表。
+
+填写样式如：4,6,8
 
 ### 调优 {#inputs.ebpf.tunning}
 
@@ -4637,6 +5622,46 @@ inputs:
 
 参与用户态数据处理的工作线程数量。实际最大值为主机 CPU 逻辑核心数。
 
+#### Kick 线程 Nice 值 {#inputs.ebpf.tunning.kick_kern_nice}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.tunning.kick_kern_nice`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    tunning:
+      kick_kern_nice: 0
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [-20, 19] |
+
+**详细描述**:
+
+控制每个 CPU 上 kick 线程使用的 Linux nice 值。
+
+这些线程会在周期性定时器到期后唤醒，并通过轻量级 syscall
+触发内核侧超时检查，将批量 eBPF 数据从缓冲区中推送出来。
+
+当“指标中心”中 `deepflow_tenant -> deepflow_agent_ebpf_collector`
+下的 `metrics.period_push_max_delay` 达到 199ms 时，需要关注这个
+配置项。这说明周期性 push 延迟已经触发超限标记，此时可以适当降低
+该配置项的取值，以提高 kick 线程的调度倾向。
+
+更小的 nice 值意味着更高的调度倾向，更大的 nice 值意味着更低的
+调度倾向。取值范围为 -20 到 19。负值可能需要 CAP_SYS_NICE 或
+足够的 RLIMIT_NICE。该配置仍然可能对其他负载产生影响。
+
 #### Perf Page 数量 {#inputs.ebpf.tunning.perf_pages_count}
 
 **标签**:
@@ -4667,6 +5692,7 @@ inputs:
 
 内核共享内存占用的页数。值为 `2^n (5 <= n <= 13)`。用于 perf 数据传输。
 如果值在 `2^n` 和 `2^(n+1)` 之间，将自动调整到最小值 `2^n`。
+页的大小为4KB。
 
 #### 内核环形队列大小 {#inputs.ebpf.tunning.kernel_ring_size}
 
@@ -5518,7 +6544,7 @@ inputs:
 **详细描述**:
 
 开关开启后，deepflow-agent 将开启外部数据的接收服务接口，以集成来自 Prometheus、
-Telegraf、OpenTelemetry 和 Skywalking 的数据。
+Telegraf、OpenTelemetry 和 Skywalking、Vector 的数据。
 
 ### 监听端口 {#inputs.integration.listen_port}
 
@@ -5895,308 +6921,313 @@ Vector 组件的具体配置，所有可用配置可在此链接中查找：[vec
 以下提供一份抓取 kubernetes 日志、宿主机指标及 kubernetes kubelet 指标的示例，并将这些数据发送到 DeepFlow-Agent。
 
 抓取主机指标
+`K8S_NODE_NAME_FOR_DEEPFLOW` 变量仅容器环境必须，非容器环境可以去掉
 ```yaml
-config:
-  sources:
-    host_metrics:
-      type: host_metrics
-      scrape_interval_secs: 10
-      namespace: node
-  transforms:
-    host_metrics_relabel:
-      type: remap
-      inputs:
-      - host_metrics
-      source: |
-        .tags.instance = "${K8S_NODE_IP_FOR_DEEPFLOW}"
-        .tags.host = "${K8S_NODE_NAME_FOR_DEEPFLOW}"
-        metrics_map = {
-          "boot_time": "boot_time_seconds",
-          "memory_active_bytes": "memory_Active_bytes",
-          "memory_available_bytes": "memory_MemAvailable_bytes",
-          "memory_buffers_bytes": "memory_Buffers_bytes",
-          "memory_cached_bytes": "memory_Cached_bytes",
-          "memory_free_bytes": "memory_MemFree_bytes",
-          "memory_swap_free_bytes": "memory_SwapFree_bytes",
-          "memory_swap_total_bytes": "memory_SwapTotal_bytes",
-          "memory_swap_used_bytes": "memory_SwapCached_bytes",
-          "memory_total_bytes": "memory_MemTotal_bytes",
-          "network_transmit_packets_drop_total": "network_transmit_drop_total",
-          "uptime": "uname_info",
-          "filesystem_total_bytes": "filesystem_size_bytes",
-        }
-        metric_name = get!(value: metrics_map, path: [.name])
-        if !is_null(metric_name) {
-          .name = metric_name
-        }
-        if .tags.collector == "filesystem" {
-          .tags.fstype = .tags.filesystem
-          del(.tags.filesystem)
-        }
-  sinks:
-    prometheus_remote_write:
-      type: prometheus_remote_write
-      inputs:
-      - host_metrics_relabel
-      endpoint: http://127.0.0.1:38086/api/v1/prometheus
-      healthcheck:
-        enabled: false
+sources:
+  host_metrics:
+    type: host_metrics
+    scrape_interval_secs: 10
+    namespace: node
+transforms:
+  host_process_filter:
+    type: filter
+    condition: '!starts_with(string!(.name), "process_")'
+    inputs:
+    - host_metrics
+  host_metrics_relabel:
+    type: remap
+    inputs:
+    - host_process_filter
+    source: |
+      .tags.instance = "${K8S_NODE_IP_FOR_DEEPFLOW}"
+      host_name, _ = get_env_var("K8S_NODE_NAME_FOR_DEEPFLOW")
+      if !is_empty(host_name) {
+        .tags.host = host_name
+      }
+      metrics_map = {
+        "boot_time": "boot_time_seconds",
+        "memory_active_bytes": "memory_Active_bytes",
+        "memory_available_bytes": "memory_MemAvailable_bytes",
+        "memory_buffers_bytes": "memory_Buffers_bytes",
+        "memory_cached_bytes": "memory_Cached_bytes",
+        "memory_free_bytes": "memory_MemFree_bytes",
+        "memory_swap_free_bytes": "memory_SwapFree_bytes",
+        "memory_swap_total_bytes": "memory_SwapTotal_bytes",
+        "memory_swap_used_bytes": "memory_SwapCached_bytes",
+        "memory_total_bytes": "memory_MemTotal_bytes",
+        "network_transmit_packets_drop_total": "network_transmit_drop_total",
+        "uptime": "uname_info",
+        "filesystem_total_bytes": "filesystem_size_bytes",
+      }
+      metric_name = get!(value: metrics_map, path: [.name])
+      if !is_null(metric_name) {
+        .name = metric_name
+      }
+      if .tags.collector == "filesystem" {
+        .tags.fstype = .tags.filesystem
+        del(.tags.filesystem)
+      }
+sinks:
+  prometheus_remote_write:
+    type: prometheus_remote_write
+    inputs:
+    - host_metrics_relabel
+    endpoint: http://127.0.0.1:38086/api/v1/prometheus
+    healthcheck:
+      enabled: false
 
 ```
 
 抓取 kubernetes 指标
 ```yaml
-config:
-  secret:
-    kube_token:
-      type: directory
-      path: /var/run/secrets/kubernetes.io/serviceaccount
-  sources:
-    cadvisor_metrics:
-      type: prometheus_scrape
-      endpoints:
-      - https://${K8S_NODE_IP_FOR_DEEPFLOW}:10250/metrics/cadvisor
-      auth:
-        strategy: bearer
-        token: SECRET[kube_token.token]
-      scrape_interval_secs: 10
-      scrape_timeout_secs: 10
-      honor_labels: true
-      instance_tag: instance
-      endpoint_tag: metrics_endpoint
-      tls:
-        verify_certificate: false
-    kubelet_metrics:
-      type: prometheus_scrape
-      endpoints:
-      - http://${K8S_NODE_IP_FOR_DEEPFLOW}:10250/metrics
-      auth:
-        strategy: bearer
-        token: SECRET[kube_token.token]
-      scrape_interval_secs: 10
-      scrape_timeout_secs: 10
-      honor_labels: true
-      instance_tag: instance
-      endpoint_tag: metrics_endpoint
-      tls:
-        verify_certificate: false
-    kube_state_metrics:
-      type: prometheus_scrape
-      endpoints:
-      - http://opensource-kube-state-metrics:8080/metrics
-      scrape_interval_secs: 10
-      scrape_timeout_secs: 10
-      honor_labels: true
-      instance_tag: instance
-      endpoint_tag: metrics_endpoint
-  transforms:
-    cadvisor_relabel_filter:
-      type: filter
-      inputs:
-      - cadvisor_metrics
-      condition: "!match(string!(.name), r'container_cpu_(cfs_throttled_seconds_total|load_average_10s|system_seconds_total|user_seconds_total)|container_fs_(io_current|io_time_seconds_total|io_time_weighted_seconds_total|reads_merged_total|sector_reads_total|sector_writes_total|writes_merged_total)|container_memory_(mapped_file|swap)|container_(file_descriptors|tasks_state|threads_max)|container_spec.*')"
-    kubelet_relabel_filter:
-      type: filter
-      inputs:
-      - kubelet_metrics
-      condition: "match(string!(.name), r'kubelet_cgroup_(manager_duration_seconds_bucket|manager_duration_seconds_count)|kubelet_node_(config_error|node_name)|kubelet_pleg_relist_(duration_seconds_bucket|duration_seconds_count|interval_seconds_bucket)|kubelet_pod_(start_duration_seconds_count|worker_duration_seconds_bucket|worker_duration_seconds_count)|kubelet_running_(container_count|containers|pod_count|pods)|kubelet_runtime_(operations_duration_seconds_bucket|perations_errors_total|operations_total)|kubelet_volume_stats_(available_bytes|capacity_bytes|inodes|inodes_used)|process_(cpu_seconds_total|resident_memory_bytes)|rest_client_(request_duration_seconds_bucket|requests_total)|storage_operation_(duration_seconds_bucket|duration_seconds_count|errors_total)|up|volume_manager_total_volumes')"
-    kube_state_relabel_filter:
-      type: filter
-      inputs:
-      - kube_state_metrics
-      condition: "!match(string!(.name), r'kube_endpoint_address_not_ready|kube_endpoint_address_available')"
-    common_relabel_config:
-      type: remap
-      inputs:
-      - cadvisor_relabel_filter
-      - kubelet_relabel_filter
-      - kube_state_relabel_filter
-      source: |-
-        if !is_null(.tags) && is_string(.tags.metrics_endpoint) {
-        .tags.metrics_path = parse_regex!(.tags.metrics_endpoint, r'https?:\/\/[^\/]+(?<path>\/.*)$').path
-        }
-  sinks:
-    prometheus_remote_write:
-      type: prometheus_remote_write
-      inputs:
-      - common_relabel_config
-      endpoint: http://127.0.0.1:38086/api/v1/prometheus
-      healthcheck:
-        enabled: false
+secret:
+  kube_token:
+    type: directory
+    path: /var/run/secrets/kubernetes.io/serviceaccount
+sources:
+  cadvisor_metrics:
+    type: prometheus_scrape
+    endpoints:
+    - https://${K8S_NODE_IP_FOR_DEEPFLOW}:10250/metrics/cadvisor
+    auth:
+      strategy: bearer
+      token: SECRET[kube_token.token]
+    scrape_interval_secs: 10
+    scrape_timeout_secs: 10
+    honor_labels: true
+    instance_tag: instance
+    endpoint_tag: metrics_endpoint
+    tls:
+      verify_certificate: false
+  kubelet_metrics:
+    type: prometheus_scrape
+    endpoints:
+    - https://${K8S_NODE_IP_FOR_DEEPFLOW}:10250/metrics
+    auth:
+      strategy: bearer
+      token: SECRET[kube_token.token]
+    scrape_interval_secs: 10
+    scrape_timeout_secs: 10
+    honor_labels: true
+    instance_tag: instance
+    endpoint_tag: metrics_endpoint
+    tls:
+      verify_certificate: false
+  kube_state_metrics:
+    type: prometheus_scrape
+    endpoints:
+    - http://opensource-kube-state-metrics:8080/metrics
+    scrape_interval_secs: 10
+    scrape_timeout_secs: 10
+    honor_labels: true
+    instance_tag: instance
+    endpoint_tag: metrics_endpoint
+transforms:
+  cadvisor_relabel_filter:
+    type: filter
+    inputs:
+    - cadvisor_metrics
+    condition: "!match(string!(.name), r'container_cpu_(cfs_throttled_seconds_total|load_average_10s|system_seconds_total|user_seconds_total)|container_fs_(io_current|io_time_seconds_total|io_time_weighted_seconds_total|reads_merged_total|sector_reads_total|sector_writes_total|writes_merged_total)|container_memory_(mapped_file|swap)|container_(file_descriptors|tasks_state|threads_max)')"
+  kubelet_relabel_filter:
+    type: filter
+    inputs:
+    - kubelet_metrics
+    condition: "match(string!(.name), r'kubelet_cgroup_(manager_duration_seconds_bucket|manager_duration_seconds_count)|kubelet_node_(config_error|node_name)|kubelet_pleg_relist_(duration_seconds_bucket|duration_seconds_count|interval_seconds_bucket)|kubelet_pod_(start_duration_seconds_count|worker_duration_seconds_bucket|worker_duration_seconds_count)|kubelet_running_(container_count|containers|pod_count|pods)|kubelet_runtime_(operations_duration_seconds_bucket|perations_errors_total|operations_total)|kubelet_volume_stats_(available_bytes|capacity_bytes|inodes|inodes_used)|process_(cpu_seconds_total|resident_memory_bytes)|rest_client_(request_duration_seconds_bucket|requests_total)|storage_operation_(duration_seconds_bucket|duration_seconds_count|errors_total)|up|volume_manager_total_volumes')"
+  kube_state_relabel_filter:
+    type: filter
+    inputs:
+    - kube_state_metrics
+    condition: "!match(string!(.name), r'kube_endpoint_address_not_ready|kube_endpoint_address_available')"
+  common_relabel_config:
+    type: remap
+    inputs:
+    - cadvisor_relabel_filter
+    - kubelet_relabel_filter
+    - kube_state_relabel_filter
+    source: |-
+      if !is_null(.tags) && is_string(.tags.metrics_endpoint) {
+      .tags.metrics_path = parse_regex!(.tags.metrics_endpoint, r'https?:\/\/[^\/]+(?<path>\/.*)$').path
+      }
+sinks:
+  prometheus_remote_write:
+    type: prometheus_remote_write
+    inputs:
+    - common_relabel_config
+    endpoint: http://127.0.0.1:38086/api/v1/prometheus
+    healthcheck:
+      enabled: false
 
 ```
 
 抓取 kubernetes 日志(以采集 DeepFlow Pod 日志为例，若需要采集其他 Pod 日志可修改 `extra_label_selector` 并加上具体条件)
 ```yaml
-config:
-  data_dir: /vector-log-checkpoint
-  sources:
-    kubernetes_logs:
-      self_node_name: ${K8S_NODE_NAME_FOR_DEEPFLOW}
-      type: kubernetes_logs
-      namespace_annotation_fields:
-        namespace_labels: ""
-      node_annotation_fields:
-        node_labels: ""
-      pod_annotation_fields:
-        pod_annotations: ""
-        pod_labels: ""
-      extra_label_selector: "app=deepflow,component!=front-end"
-    kubernetes_logs_frontend:
-      self_node_name: ${K8S_NODE_NAME_FOR_DEEPFLOW}
-      type: kubernetes_logs
-      namespace_annotation_fields:
-        namespace_labels: ""
-      node_annotation_fields:
-        node_labels: ""
-      pod_annotation_fields:
-        pod_annotations: ""
-        pod_labels: ""
-      extra_label_selector: "app=deepflow,component=front-end"
-  transforms:
-    multiline_kubernetes_logs:
-      type: reduce
-      inputs:
-        - kubernetes_logs
-      group_by:
-        - file
-        - stream
-      merge_strategies:
-        message: concat_newline
-      starts_when: match(string!(.message), r'^(.+=|\[|\[?\u001B\[[0-9;]*m|\[mysql\]\s|\{\".+\"|(::ffff:)?([0-9]{1,3}.){3}[0-9]{1,3}[\s\-]+(\[)?)?\d{4}[-\/\.]?\d{2}[-\/\.]?\d{2}[T\s]?\d{2}:\d{2}:\d{2}')
-      expire_after_ms: 2000
-      flush_period_ms: 500
-    flush_kubernetes_logs:
-     type: remap
-     inputs:
-       - multiline_kubernetes_logs
-     source: |-
-         .message = replace(string!(.message), r'\u001B\[([0-9]{1,3}(;[0-9]{1,3})*)?m', "")
-    remap_kubernetes_logs:
-      type: remap
-      inputs:
-      - flush_kubernetes_logs
-      - kubernetes_logs_frontend
-      source: |-
-          if is_string(.message) && is_json(string!(.message)) {
-              tags = parse_json(.message) ?? {}
-              ._df_log_type = tags._df_log_type
-              .org_id = to_int(tags.org_id) ?? 0
-              .user_id = to_int(tags.user_id) ?? 0
-              .message = tags.message || tags.msg
-              del(tags._df_log_type)
-              del(tags.org_id)
-              del(tags.user_id)
-              del(tags.message)
-              del(tags.msg)
-              .json = tags
-          }
-          if !exists(.level) {
-             if exists(.json) {
-                .level = to_string!(.json.level)
-                del(.json.level)
-             } else {
-               level_tags = parse_regex(.message, r'[\[\\<](?<level>(?i)INFOR?(MATION)?|WARN(ING)?|DEBUG?|ERROR?|TRACE|FATAL|CRIT(ICAL)?)[\]\\>]') ?? {}
-               if !exists(level_tags.level) {
-                  level_tags = parse_regex(.message, r'[\s](?<level>INFOR?(MATION)?|WARN(ING)?|DEBUG?|ERROR?|TRACE|FATAL|CRIT(ICAL)?)[\s]') ?? {}
-               }
-               if exists(level_tags.level) {
-                  level_tags.level = upcase(string!(level_tags.level))
-                  if level_tags.level == "INFORMATION" || level_tags.level == "INFOMATION" {
-                      level_tags.level = "INFO"
-                  }
-                  if level_tags.level == "WARNING" {
-                      level_tags.level = "WARN"
-                  }
-                  if level_tags.level == "DEBU" {
-                      level_tags.level = "DEBUG"
-                  }
-                  if level_tags.level == "ERRO" {
-                      level_tags.level = "ERROR"
-                  }
-                  if level_tags.level == "CRIT" || level_tags.level == "CRITICAL" {
-                      level_tags.level = "FATAL"
-                  }
-                  .level = level_tags.level
-               }
+data_dir: /vector-log-checkpoint
+sources:
+  kubernetes_logs:
+    self_node_name: ${K8S_NODE_NAME_FOR_DEEPFLOW}
+    type: kubernetes_logs
+    namespace_annotation_fields:
+      namespace_labels: ""
+    node_annotation_fields:
+      node_labels: ""
+    pod_annotation_fields:
+      pod_annotations: ""
+      pod_labels: ""
+    extra_label_selector: "app=deepflow,component!=front-end"
+  kubernetes_logs_frontend:
+    self_node_name: ${K8S_NODE_NAME_FOR_DEEPFLOW}
+    type: kubernetes_logs
+    namespace_annotation_fields:
+      namespace_labels: ""
+    node_annotation_fields:
+      node_labels: ""
+    pod_annotation_fields:
+      pod_annotations: ""
+      pod_labels: ""
+    extra_label_selector: "app=deepflow,component=front-end"
+transforms:
+  multiline_kubernetes_logs:
+    type: reduce
+    inputs:
+      - kubernetes_logs
+    group_by:
+      - file
+      - stream
+    merge_strategies:
+      message: concat_newline
+    starts_when: match(string!(.message), r'^(.+=|\[|\[?\u001B\[[0-9;]*m|\[mysql\]\s|\{\".+\"|(::ffff:)?([0-9]{1,3}.){3}[0-9]{1,3}[\s\-]+(\[)?)?\d{4}[-\/\.]?\d{2}[-\/\.]?\d{2}[T\s]?\d{2}:\d{2}:\d{2}')
+    expire_after_ms: 2000
+    flush_period_ms: 500
+  flush_kubernetes_logs:
+   type: remap
+   inputs:
+     - multiline_kubernetes_logs
+   source: |-
+       .message = replace(string!(.message), r'\u001B\[([0-9]{1,3}(;[0-9]{1,3})*)?m', "")
+  remap_kubernetes_logs:
+    type: remap
+    inputs:
+    - flush_kubernetes_logs
+    - kubernetes_logs_frontend
+    source: |-
+        if is_string(.message) && is_json(string!(.message)) {
+            tags = parse_json(.message) ?? {}
+            ._df_log_type = tags._df_log_type
+            .org_id = to_int(tags.org_id) ?? 0
+            .user_id = to_int(tags.user_id) ?? 0
+            .message = tags.message || tags.msg
+            del(tags._df_log_type)
+            del(tags.org_id)
+            del(tags.user_id)
+            del(tags.message)
+            del(tags.msg)
+            .json = tags
+        }
+        if !exists(.level) {
+           if exists(.json) {
+              .level = to_string!(.json.level)
+              del(.json.level)
+           } else {
+             level_tags = parse_regex(.message, r'[\[\\<](?<level>(?i)INFOR?(MATION)?|WARN(ING)?|DEBUG?|ERROR?|TRACE|FATAL|CRIT(ICAL)?)[\]\\>]') ?? {}
+             if !exists(level_tags.level) {
+                level_tags = parse_regex(.message, r'[\s](?<level>INFOR?(MATION)?|WARN(ING)?|DEBUG?|ERROR?|TRACE|FATAL|CRIT(ICAL)?)[\s]') ?? {}
              }
-          }
-          if !exists(._df_log_type) {
-              ._df_log_type = "system"
-          }
-          if !exists(.app_service) {
-              .app_service = .kubernetes.container_name
-          }
-  sinks:
-    http:
-      type: http
-      inputs: [remap_kubernetes_logs]
-      uri: http://127.0.0.1:38086/api/v1/log
-      encoding:
-        codec: json
+             if exists(level_tags.level) {
+                level_tags.level = upcase(string!(level_tags.level))
+                if level_tags.level == "INFORMATION" || level_tags.level == "INFOMATION" {
+                    level_tags.level = "INFO"
+                }
+                if level_tags.level == "WARNING" {
+                    level_tags.level = "WARN"
+                }
+                if level_tags.level == "DEBU" {
+                    level_tags.level = "DEBUG"
+                }
+                if level_tags.level == "ERRO" {
+                    level_tags.level = "ERROR"
+                }
+                if level_tags.level == "CRIT" || level_tags.level == "CRITICAL" {
+                    level_tags.level = "FATAL"
+                }
+                .level = level_tags.level
+             }
+           }
+        }
+        if !exists(._df_log_type) {
+            ._df_log_type = "system"
+        }
+        if !exists(.app_service) {
+            .app_service = .kubernetes.container_name
+        }
+sinks:
+  http:
+    type: http
+    inputs: [remap_kubernetes_logs]
+    uri: http://127.0.0.1:38086/api/v1/log
+    encoding:
+      codec: json
 
 ```
 
 使用 http_client 或者 socket 拨测一个远端服务
 ```yaml
-config:
-  sources:
-    http_client_dial:
-      type: http_client
-      endpoint: http://$HOST:$PORT
-      method: GET
-      scrape_interval_secs: 10
-      scrape_timeout_secs: 5
-    internal_metrics:
-      type: internal_metrics
-      scrape_interval_secs: 10
-      namespace: ${K8S_NAMESPACE_FOR_DEEPFLOW}
-    socket_dial_input:
-      type: demo_logs
-      interval: 10
-      format: shuffle
-      lines: [""]
-  transforms:
-    internal_metrics_relabel:
-      type: remap
-      inputs:
-      - internal_metrics
-      source: |-
-        .tags.instance = "${K8S_NODE_IP_FOR_DEEPFLOW}"
-    internal_metrics_dispatch:
-      type: route
-      inputs:
-      - internal_metrics_relabel
-      route:
-        http_client_dial_metrics: '.tags.component_id == "http_client_dial"'
-        socket_dial_metrics: '.tags.component_id == "socket_dial"'
-    http_client_dial_metrics:
-      type: filter
-      inputs:
-      - internal_metrics_dispatch.http_client_dial_metrics
-      condition: "match(string!(.name),r'http_client_.*')"
-    socket_dial_metrics:
-      type: filter
-      inputs:
-      - internal_metrics_dispatch.socket_dial_metrics
-      condition: "match(string!(.name),r'buffer.*')"
-  sinks:
-    socket_dial:
-      type: socket
-      inputs:
-      - socket_dial_input
-      address: $HOST:$PORT
-      mode: tcp
-      encoding:
-        codec: raw_message
-    prometheus_remote_write:
-      type: prometheus_remote_write
-      inputs:
-      - http_client_dial_metrics
-      - socket_dial_metrics
-      endpoint: http://127.0.0.1:38086/api/v1/prometheus
-      healthcheck:
-        enabled: false
+sources:
+  http_client_dial:
+    type: http_client
+    endpoint: http://$HOST:$PORT
+    method: GET
+    scrape_interval_secs: 10
+    scrape_timeout_secs: 5
+  internal_metrics:
+    type: internal_metrics
+    scrape_interval_secs: 10
+    namespace: ${K8S_NAMESPACE_FOR_DEEPFLOW}
+  socket_dial_input:
+    type: demo_logs
+    interval: 10
+    format: shuffle
+    lines: [""]
+transforms:
+  internal_metrics_relabel:
+    type: remap
+    inputs:
+    - internal_metrics
+    source: |-
+      .tags.instance = "${K8S_NODE_IP_FOR_DEEPFLOW}"
+  internal_metrics_dispatch:
+    type: route
+    inputs:
+    - internal_metrics_relabel
+    route:
+      http_client_dial_metrics: '.tags.component_id == "http_client_dial"'
+      socket_dial_metrics: '.tags.component_id == "socket_dial"'
+  http_client_dial_metrics:
+    type: filter
+    inputs:
+    - internal_metrics_dispatch.http_client_dial_metrics
+    condition: "match(string!(.name),r'http_client_.*')"
+  socket_dial_metrics:
+    type: filter
+    inputs:
+    - internal_metrics_dispatch.socket_dial_metrics
+    condition: "match(string!(.name),r'buffer.*')"
+sinks:
+  socket_dial:
+    type: socket
+    inputs:
+    - socket_dial_input
+    address: $HOST:$PORT
+    mode: tcp
+    encoding:
+      codec: raw_message
+  prometheus_remote_write:
+    type: prometheus_remote_write
+    inputs:
+    - http_client_dial_metrics
+    - socket_dial_metrics
+    endpoint: http://127.0.0.1:38086/api/v1/prometheus
+    healthcheck:
+      enabled: false
 
 ```
 
@@ -6462,6 +7493,35 @@ processors:
 
 设置 deepflow-agent 的 1-mini-meta-packet-to-pcap 队列大小。
 
+#### Sender 队列大小 {#processors.packet.pcap_stream.sender_queue_size}
+
+**标签**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.packet.pcap_stream.sender_queue_size`
+
+**默认值**:
+```yaml
+processors:
+  packet:
+    pcap_stream:
+      sender_queue_size: 8192
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [4096, 64000000] |
+
+**详细描述**:
+
+设置 deepflow-agent 的 2-pcap-batch-to-sender 队列大小。
+
 #### 每个 Flow 的缓冲区大小 {#processors.packet.pcap_stream.buffer_size_per_flow}
 
 **标签**:
@@ -6689,13 +7749,105 @@ processors:
 | Key  | Value                        |
 | ---- | ---------------------------- |
 | Type | duration |
-| Range | [0, '1d'] |
+| Range | ['0ns', '1d'] |
 
 **详细描述**:
 
 deepflow-agent 会周期性标记每一个<vpc, ip, protocol, port>四元组承载的应用协议类型，以加速
 后续数据的应用协议采集过程。为避免误判，应用协议类型的标记结果会周期性更新。该参数控制应用协议的更
 新周期。
+
+#### 推理白名单 {#processors.request_log.application_protocol_inference.inference_whitelist}
+
+**标签**:
+
+`hot_update`
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.inference_whitelist`
+
+**默认值**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      inference_whitelist:
+      - port_list:
+        - 15001
+        - 15006
+        process_name: envoy
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | dict |
+
+**详细描述**:
+
+应用协议端口白名单列表，目前仅支持 eBPF 流量。当 eBPF 数据在白名单列表中时，不会再使用应用表查询应用协议，
+对应的应用协议通过轮训目前所有支持的协议来获取，白名单数据过多会降低 eBPF 数据的处理性能。
+
+配置键：
+- process_name: 进程名称，不支持正则表达式
+- port_list: 端口白名单列表
+
+##### 进程名称 {#processors.request_log.application_protocol_inference.inference_whitelist.process_name}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.inference_whitelist.process_name`
+
+**默认值**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      inference_whitelist:
+      - process_name: ''
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | string |
+
+**详细描述**:
+
+进程名称
+
+##### 端口列表 {#processors.request_log.application_protocol_inference.inference_whitelist.port_list}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.inference_whitelist.port_list`
+
+**默认值**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      inference_whitelist:
+      - port_list: []
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+
+**详细描述**:
+
+端口列表
 
 #### 启用协议列表 {#processors.request_log.application_protocol_inference.enabled_protocols}
 
@@ -6837,6 +7989,316 @@ processors:
 在不同的 Oracle 版本中，ID 为 0x04 的响应会有不同的数据结构，如果环境中该响应数据的
 `影响行数`前有 1byte 的额外数据，请开启此开关。
 
+##### ISO8583 {#processors.request_log.application_protocol_inference.protocol_special_config.iso8583}
+
+###### 数据翻译 {#processors.request_log.application_protocol_inference.protocol_special_config.iso8583.translation_enabled}
+
+**标签**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.iso8583.translation_enabled`
+
+**默认值**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        iso8583:
+          translation_enabled: true
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+是否对解析后的数据进行查表翻译后展示。
+
+  - 支持翻译的字段列表:
+
+|  支持翻译的字段       | 示例（翻译前）|示例（翻译后）          | 备注         |
+|-----------------------|-------------- |----------------------- |--------------|
+| 0-报文类型标识符      | 0100          | 0100-授权类请求        |              |
+| 3-交易处理码          | 300000        | 300000-余额查询        |              |
+| 32-受理机构标识码     | 6100****      | 6100-中国邮政储蓄银行  | 翻译前4位    |
+| 39-应答码             | 00            | 00-承兑或交易成功      |              |
+| 49-交易货币代码       | 156           | 156-人民币元           |              |
+
+###### 卡号脱敏 {#processors.request_log.application_protocol_inference.protocol_special_config.iso8583.pan_obfuscate}
+
+**标签**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.iso8583.pan_obfuscate`
+
+**默认值**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        iso8583:
+          pan_obfuscate: true
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+是否对卡号脱敏。
+
+###### 提取字段 {#processors.request_log.application_protocol_inference.protocol_special_config.iso8583.extract_fields}
+
+**标签**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.iso8583.extract_fields`
+
+**默认值**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        iso8583:
+          extract_fields: 2,7,11,32,33
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | string |
+
+**详细描述**:
+
+提取字段展示在`数据原生标签`
+  - 配置样例: `extract_fields: 0,2-33`
+
+字段对照表:
+
+| 字段号 | 说明 |
+|--------|----------|
+| 0  | 报文类型标识符 |
+| 1  | 位图 |
+| 2  | 主账号 |
+| 3  | 交易处理码 |
+| 4  | 交易金额 |
+| 5  | 清算金额 |
+| 6  | 持卡人扣账金额 |
+| 7  | 交易传输时间 |
+| 9  | 清算汇率 |
+| 10 | 持卡人扣账汇率 |
+| 11 | 系统跟踪号 |
+| 12 | 受卡方所在地时间 |
+| 13 | 受卡方所在地日期 |
+| 14 | 卡有效期 |
+| 15 | 清算日期 |
+| 16 | 兑换日期 |
+| 18 | 商户类型 |
+| 19 | 商户国家代码 |
+| 22 | 服务点输入方式码 |
+| 23 | 卡序列号 |
+| 25 | 服务点条件码 |
+| 26 | 服务点 PIN 获取码 |
+| 28 | 交易费 |
+| 32 | 受理机构标识码 |
+| 33 | 发送机构标识码 |
+| 35 | 第二磁道数据 |
+| 36 | 第三磁道数据 |
+| 37 | 检索参考号 |
+| 38 | 授权标识应答码 |
+| 39 | 应答码 |
+| 41 | 受卡机终端标识码 |
+| 42 | 受卡方标识码 |
+| 43 | 受卡方名称地址 |
+| 44 | 附加响应数据 |
+| 45 | 第一磁道数据 |
+| 48 | 附加数据－私有 |
+| 49 | 交易货币代码 |
+| 50 | 清算货币代码 |
+| 51 | 持卡人账户货币代码 |
+| 52 | 个人标识码数据 |
+| 53 | 安全控制信息 |
+| 54 | 实际余额 |
+| 55 | IC 卡数据域 |
+| 56 | 附加信息 |
+| 57 | 附加交易信息 |
+| 59 | 明细查询数据 |
+| 60 | 自定义域 |
+| 61 | 持卡人身份认证信息 |
+| 62 | 交换中心数据 |
+| 63 | 金融网络数据 |
+| 70 | 网络管理信息码 |
+| 90 | 原始数据元 |
+| 96 | 报文安全码 |
+| 100 | 接收机构标识码 |
+| 102 | 账户标识 1 |
+| 103 | 账户标识 2 |
+| 104 | 附加信息 |
+| 113 | 附加信息 |
+| 116 | 附加信息 |
+| 117 | 附加信息 |
+| 121 | CUPS 保留 |
+| 122 | 受理方保留 |
+| 123 | 发卡方保留 |
+| 125 | 附加信息 |
+| 126 | 附加信息 |
+| 128 | 报文鉴别码 |
+
+##### WebSphereMQ {#processors.request_log.application_protocol_inference.protocol_special_config.web_sphere_mq}
+
+###### 解析 XML {#processors.request_log.application_protocol_inference.protocol_special_config.web_sphere_mq.parse_xml_enabled}
+
+**标签**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.web_sphere_mq.parse_xml_enabled`
+
+**默认值**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        web_sphere_mq:
+          parse_xml_enabled: true
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+是否解析 XML 数据内容。
+
+###### 解压数据包 {#processors.request_log.application_protocol_inference.protocol_special_config.web_sphere_mq.decompress_enabled}
+
+**标签**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.web_sphere_mq.decompress_enabled`
+
+**默认值**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        web_sphere_mq:
+          decompress_enabled: true
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+部分 web_sphere_mq 的消息中使用 zlib 压缩，开启此选项后，agent 在解析时会对数据包进行解压。
+
+###### 属性字段过滤器 {#processors.request_log.application_protocol_inference.protocol_special_config.web_sphere_mq.filter_attributes_enabled}
+
+**标签**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.web_sphere_mq.filter_attributes_enabled`
+
+**默认值**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        web_sphere_mq:
+          filter_attributes_enabled: true
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+开启此选项后，agent 在解析时 XML 仅保留如下字段，减少数据存储。
+- Document.ComConf.ConfInf.MT
+- Document.ComConf.ConfInf.MsgId
+- Document.ComConf.ConfInf.MsgPrcCd
+- Document.ComConf.ConfInf.MsgRefId
+- Document.ComConf.ConfInf.OrigSndDt
+- Document.ComConf.ConfInf.OrigSndr
+- Document.ComuCnfm.MsgId
+- Document.ComuCnfm.MsgProCd
+- Document.ComuCnfm.MsgRefId
+- Document.ComuCnfm.MsgTp
+- Document.ComuCnfm.OrigSndDt
+- Document.ComuCnfm.OrigSndr
+
+##### NetSign {#processors.request_log.application_protocol_inference.protocol_special_config.net_sign}
+
+###### 提取 Biz Data {#processors.request_log.application_protocol_inference.protocol_special_config.net_sign.extract_biz_data_enabled}
+
+**标签**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.net_sign.extract_biz_data_enabled`
+
+**默认值**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        net_sign:
+          extract_biz_data_enabled: false
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+是否将完整 bizData 字段提取到数据属性中。
+
 ##### MySQL {#processors.request_log.application_protocol_inference.protocol_special_config.mysql}
 
 ###### 解压 MySQL 数据包 {#processors.request_log.application_protocol_inference.protocol_special_config.mysql.decompress_payload}
@@ -6870,6 +8332,93 @@ processors:
 设置为 false 以关闭解压，提升性能。
 参考：[MySQL Source Code Documentation](https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_compression.html)
 
+###### 提取 Endpoint 开关 {#processors.request_log.application_protocol_inference.protocol_special_config.mysql.endpoint_disabled}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.mysql.endpoint_disabled`
+
+**默认值**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        mysql:
+          endpoint_disabled: true
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+关闭后不会提取 SQL 语句中的动作和表名放入 endpoint 中
+
+##### Grpc {#processors.request_log.application_protocol_inference.protocol_special_config.grpc}
+
+###### 开启解析 gRPC stream 数据 {#processors.request_log.application_protocol_inference.protocol_special_config.grpc.streaming_data_enabled}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.grpc.streaming_data_enabled`
+
+**默认值**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        grpc:
+          streaming_data_enabled: false
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+开启后所有 gRPC 数据包都认为是 `stream` 类型，并且会将 `data` 类型数据包上报，同时延迟计算的响应使用带有 `grpc-status` 字段的。
+
+#### 自定义协议解析 {#processors.request_log.application_protocol_inference.custom_protocols}
+
+**标签**:
+
+<mark></mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.custom_protocols`
+
+**默认值**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      custom_protocols: []
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | dict |
+
+**详细描述**:
+
+deprecated
+
 ### 过滤器 {#processors.request_log.filters}
 
 #### 端口号预过滤器 {#processors.request_log.filters.port_number_prefilters}
@@ -6897,12 +8446,14 @@ processors:
         FastCGI: 1-65535
         HTTP: 1-65535
         HTTP2: 1-65535
+        ISO8583: 1-65535
         Kafka: 1-65535
         MQTT: 1-65535
         Memcached: 11211
         MongoDB: 1-65535
         MySQL: 1-65535
         NATS: 1-65535
+        NetSign: 1-65535
         OpenWire: 1-65535
         Oracle: 1521
         PING: 1-65535
@@ -6914,6 +8465,7 @@ processors:
         SomeIP: 1-65535
         TLS: 443,6443
         Tars: 1-65535
+        WebSphereMQ: 1-65535
         ZMTP: 1-65535
         bRPC: 1-65535
 ```
@@ -6967,12 +8519,14 @@ processors:
         FastCGI: []
         HTTP: []
         HTTP2: []
+        ISO8583: []
         Kafka: []
         MQTT: []
         Memcached: []
         MongoDB: []
         MySQL: []
         NATS: []
+        NetSign: []
         OpenWire: []
         Oracle: []
         PING: []
@@ -6984,6 +8538,7 @@ processors:
         SomeIP: []
         TLS: []
         Tars: []
+        WebSphereMQ: []
         ZMTP: []
         bRPC: []
         gRPC: []
@@ -7175,7 +8730,7 @@ processors:
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -7250,7 +8805,7 @@ Upgrade from old version: `static_config.rrt-tcp-timeout`
 processors:
   request_log:
     timeouts:
-      tcp_request_timeout: 1800s
+      tcp_request_timeout: 300s
 ```
 
 **模式**:
@@ -7262,7 +8817,8 @@ processors:
 **详细描述**:
 
 deepflow-agent 采集 TCP 承载的应用调用时等待响应消息的最大时长，如果响应与请求之间的时间差超过
-该参数值，该次调用将被识别为超时。该参数需大于会话合并的 SLOT_TIME （10s），并小于 3600s。
+该参数值，该次调用将被识别为超时。该参数需大于配置 `processors.request_log.timeouts.session_aggregate`
+中 TCP 类型的超时时间（例如 HTTP2 默认值 120s），并小于 3600s。
 
 #### UDP 调用超时时间 {#processors.request_log.timeouts.udp_request_timeout}
 
@@ -7292,8 +8848,8 @@ processors:
 
 **详细描述**:
 
-deepflow-agent 采集 UDP 承载的应用调用时等待响应消息的最大时长，如果响应与请求之间的时间差超过
-该参数值，该次调用将被识别为超时。该参数需大于会话合并的 SLOT_TIME （10s），并小于 300s。
+deepflow-agent 采集 UDP 承载的应用调用时等待响应消息的最大时长，如果响应与请求之间的时间差超过该参数值，该次调用将被识别为超时。
+该参数需大于配置 `processors.request_log.timeouts.session_aggregate` 中 UDP 类型的超时时间（例如 DNS 默认值 15s），并小于 300s。
 
 #### 会话合并窗口时长 {#processors.request_log.timeouts.session_aggregate_window_duration}
 
@@ -7420,7 +8976,8 @@ processors:
 
 **详细描述**:
 
-设置应用的超时时间。
+设置应用的超时时间。TCP 类型的应用协议超时时间需要小于 `processors.request_log.timeouts.tcp_request_timeout`，
+UDP 类型的应用协议超时时间需要小于 `processors.request_log.timeouts.udp_request_timeout`。
 
 ### 标签提取 {#processors.request_log.tag_extraction}
 
@@ -7492,6 +9049,36 @@ processors:
 的结果填充到应用调用日志的`x_request_id`字段中，作为调用链追踪的特征值。
 如果指定多个值，优先级从前到后降低。插件重写的字段优先级最高。
 
+##### 多 TraceID 采集 {#processors.request_log.tag_extraction.tracing_tag.multiple_trace_id_collection}
+
+**标签**:
+
+`hot_update`
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.request_log.tag_extraction.tracing_tag.multiple_trace_id_collection`
+
+**默认值**:
+```yaml
+processors:
+  request_log:
+    tag_extraction:
+      tracing_tag:
+        multiple_trace_id_collection: true
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+- 配置为 `false` 时，根据配置 `APM TraceID` 采集到第一个匹配的 TraceID 就不继续采集。
+- 配置为 `true` 时，采集所有匹配到的 TraceID。
+
 ##### APM TraceID {#processors.request_log.tag_extraction.tracing_tag.apm_trace_id}
 
 **标签**:
@@ -7527,6 +9114,42 @@ processors:
 特征字段，中间用`,`分隔。
 如果指定多个值，优先级从前到后降低。插件重写的字段优先级最高。
 
+支持从如下 Header 中提取 trace id，其格式如下:
+- traceparent: 00-TRACEID-SPANID-01
+- sw3: SEGMENTID|SPANID|100|100|#IPPORT|#PARENT_ENDPOINT|#ENDPOINT|TRACEID|SAMPLING 
+- sw6: 1-TRACEID-SEGMENTID-3-5-2-IPPORT-ENTRYURI-PARENTURI
+- sw8: 1-TRACEID-SEGMENTID-3-PARENT_SERVICE-PARENT_INSTANCE-PARENT_ENDPOINT-IPPORT
+- uber-trace-id: TRACEID:SPANID:PARENTSPANID:FLAGS
+- b3: TRACEID-SPANID-1
+
+##### Copy APM TraceID {#processors.request_log.tag_extraction.tracing_tag.copy_apm_trace_id}
+
+**标签**:
+
+`hot_update`
+
+**FQCN**:
+
+`processors.request_log.tag_extraction.tracing_tag.copy_apm_trace_id`
+
+**默认值**:
+```yaml
+processors:
+  request_log:
+    tag_extraction:
+      tracing_tag:
+        copy_apm_trace_id: false
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+设置为 true 时，将会抄写 APM TraceID 至 attribute.apm_trace_id 字段中。
+
 ##### APM SpanID {#processors.request_log.tag_extraction.tracing_tag.apm_span_id}
 
 **标签**:
@@ -7561,6 +9184,14 @@ processors:
 的结果填充到应用调用日志的`span_id`字段中，作为调用链追踪的特征值。参数支持填写多个不同的
 特征字段，中间用`,`分隔。
 如果指定多个值，优先级从前到后降低。插件重写的字段优先级最高。
+
+支持从如下 Header 中提取 span id，其格式如下:
+- traceparent: 00-TRACEID-SPANID-01
+- sw3: SEGMENTID|SPANID|100|100|#IPPORT|#PARENT_ENDPOINT|#ENDPOINT|TRACEID|SAMPLING 
+- sw6: 1-TRACEID-SEGMENTID-3-5-2-IPPORT-ENTRYURI-PARENTURI
+- sw8: 1-TRACEID-SEGMENTID-3-PARENT_SERVICE-PARENT_INSTANCE-PARENT_ENDPOINT-IPPORT
+- uber-trace-id: TRACEID:SPANID:PARENTSPANID:FLAGS
+- b3: TRACEID-SPANID-1
 
 #### HTTP 端点 {#processors.request_log.tag_extraction.http_endpoint}
 
@@ -7815,6 +9446,33 @@ processors:
 
 字段名
 
+#### 自定义协议解析 {#processors.request_log.tag_extraction.custom_field_policies}
+
+**标签**:
+
+<mark></mark>
+
+**FQCN**:
+
+`processors.request_log.tag_extraction.custom_field_policies`
+
+**默认值**:
+```yaml
+processors:
+  request_log:
+    tag_extraction:
+      custom_field_policies: []
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | dict |
+
+**详细描述**:
+
+deprecated
+
 #### 脱敏协议列表 {#processors.request_log.tag_extraction.obfuscate_protocols}
 
 **标签**:
@@ -7856,6 +9514,134 @@ processors:
 脱敏字段主要包括：
 - 授权信息
 - 各类语句中的 value 信息
+
+#### 原始数据 {#processors.request_log.tag_extraction.raw}
+
+Control the extraction of raw data corresponding to the L7 logs
+
+##### 提取的请求头长度 {#processors.request_log.tag_extraction.raw.error_request_header}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.tag_extraction.raw.error_request_header`
+
+**默认值**:
+```yaml
+processors:
+  request_log:
+    tag_extraction:
+      raw:
+        error_request_header: 0
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [0, 16384] |
+
+**详细描述**:
+
+当设置为大于 0 的值时，对于状态异常的调用日志，自动采集请求 Header（截断到 $error_request_header 字节）到 attribute.request_header，
+因如下原因此功能仅建议临时使用：
+- 一方面直接存储 Header 有一定的敏感信息暴露风险，可能导致合规问题
+- 另一方面也会导致（目前仅 HTTP 协议）所有 Request Header 被缓存，直到等到解析到 Response 状态才能判断是否发送，消耗采集器资源
+
+##### 提取的请求头长度 {#processors.request_log.tag_extraction.raw.error_response_header}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.tag_extraction.raw.error_response_header`
+
+**默认值**:
+```yaml
+processors:
+  request_log:
+    tag_extraction:
+      raw:
+        error_response_header: 0
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [0, 16384] |
+
+**详细描述**:
+
+当设置为大于 0 的值时，对于状态异常的调用日志，自动采集响应 Header（截断到 $error_response_header 字节）到 attribute.response_header。
+
+##### 提取的响应头长度 {#processors.request_log.tag_extraction.raw.error_request_payload}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.tag_extraction.raw.error_request_payload`
+
+**默认值**:
+```yaml
+processors:
+  request_log:
+    tag_extraction:
+      raw:
+        error_request_payload: 0
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [0, 16384] |
+
+**详细描述**:
+
+当设置为大于 0 的值时，对于状态异常的调用日志，自动采集请求 Payload（截断到 $error_request_payload）到
+attribute.request_payload，因以下原因此功能仅建议临时使用：
+- 一方面直接存储 Payload 有一定的敏感信息暴露风险，可能导致合规问题
+- 另一方面也会导致（目前仅 HTTP 协议）所有 Request Payload 被缓存，直到等到解析到 Response 状态才能判断是否发送，
+  消耗采集器资源
+
+##### 提取的请求头长度 {#processors.request_log.tag_extraction.raw.error_response_payload}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.tag_extraction.raw.error_response_payload`
+
+**默认值**:
+```yaml
+processors:
+  request_log:
+    tag_extraction:
+      raw:
+        error_response_payload: 256
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [0, 16384] |
+
+**详细描述**:
+
+默认值为 256，表示采集异常响应 Payload 的前 256 字节，放到 attribute.response_payload 当设置为 0 时，表示不采集
+异常响应 Payload
 
 ### 调优 {#processors.request_log.tunning}
 
@@ -8121,6 +9907,12 @@ processors:
 deepflow-agent 有可能会错误的判断长流的方向，如果某个端口一定是服务端端口，
 可配置在此处避免误判断。
 
+服务端判定优先级从高到低为：
+- TCP Flags 中 SYN|ACK、GPID
+- L7 层解析
+- `server_ports` 配置 
+- Packet 计数（发送包数多的为服务端）
+
 ##### 云流量忽略 MAC {#processors.flow_log.conntrack.flow_generation.cloud_traffic_ignore_mac}
 
 **标签**:
@@ -8222,7 +10014,7 @@ processors:
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -8253,7 +10045,7 @@ TCP 状态机的建连状态超时时长。
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -8284,7 +10076,7 @@ Closing Reset 类型的 TCP 状态机超时。
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -8315,7 +10107,7 @@ Opening Reset 类型的 TCP 状态机超时。
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -8403,10 +10195,36 @@ processors:
 
 **详细描述**:
 
-FlowMap 中存储的最大并发 Flow 数量。该配置同时影响 RRT 缓存容量。
-例如：`rrt-cache-capacity` = `flow-count-limit`。当 `rrt-cache-capacity` 不足时，
-将无法计算 L7 的 RRT。当 `inputs.cbpf.common.capture_mode` 为 `物理网络镜像` 并且该配置值小于等于 65535 时，
-将会被强制设置为 u32::MAX。
+FlowMap 中存储的最大并发 Flow 数量。当 `inputs.cbpf.common.capture_mode` 为 `物理网络镜像` 并且该配置值小于等
+于 65535 时，将会被强制设置为 u32::MAX。
+
+#### RRT 缓存容量 {#processors.flow_log.tunning.rrt_cache_capacity}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.flow_log.tunning.rrt_cache_capacity`
+
+**默认值**:
+```yaml
+processors:
+  flow_log:
+    tunning:
+      rrt_cache_capacity: 16000
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [1024, 64000000] |
+
+**详细描述**:
+
+FlowMap 中 RRT Cache 表的容量。该表用于计算 RRT 延迟指标，过大会导致采集器内存占用高，过小会导致RRT指标缺失。
 
 #### 内存池大小 {#processors.flow_log.tunning.memory_pool_size}
 
@@ -9617,6 +11435,12 @@ outputs:
 开启此特性将增加 deepflow-agent 的 CPU 消耗。
 
 # 插件 {#plugins}
+
+插件支持
+同时匹配插件和自定义提取策略时，优先级为：
+1. 插件提取
+2. 自定义字段提取
+3. 采集器默认提取
 
 ## Wasm 插件列表 {#plugins.wasm_plugins}
 

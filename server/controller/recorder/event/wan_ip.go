@@ -108,11 +108,11 @@ func (i *WANIP) OnResourceBatchAdded(md *message.Metadata, msg interface{}) { //
 				if ok {
 					opts = append(opts, l3DeviceOpts...)
 				} else {
-					i.enqueueInstanceIfInsertIntoMySQLFailed(
+					i.enqueueInstanceIfInsertIntoMetadbFailed(
 						md,
 						item.Lcuuid,
 						podNodeInfo.DomainLcuuid,
-						eventapi.RESOURCE_EVENT_TYPE_ADD_IP,
+						eventapi.RESOURCE_EVENT_TYPE_ATTACH_IP,
 						deviceName,
 						deviceType,
 						deviceID,
@@ -130,11 +130,11 @@ func (i *WANIP) OnResourceBatchAdded(md *message.Metadata, msg interface{}) { //
 				if ok {
 					opts = append(opts, l3DeviceOpts...)
 				} else {
-					i.enqueueInstanceIfInsertIntoMySQLFailed(
+					i.enqueueInstanceIfInsertIntoMetadbFailed(
 						md,
 						item.Lcuuid,
 						podInfo.DomainLcuuid,
-						eventapi.RESOURCE_EVENT_TYPE_ADD_IP,
+						eventapi.RESOURCE_EVENT_TYPE_ATTACH_IP,
 						deviceName,
 						deviceType,
 						deviceID,
@@ -147,7 +147,7 @@ func (i *WANIP) OnResourceBatchAdded(md *message.Metadata, msg interface{}) { //
 
 		i.createInstanceAndEnqueue(md,
 			item.Lcuuid,
-			eventapi.RESOURCE_EVENT_TYPE_ADD_IP,
+			eventapi.RESOURCE_EVENT_TYPE_ATTACH_IP,
 			deviceName,
 			deviceType,
 			deviceID,
@@ -204,7 +204,7 @@ func (i *WANIP) OnResourceBatchDeleted(md *message.Metadata, msg interface{}) {
 
 		i.createInstanceAndEnqueue(md,
 			item.Lcuuid,
-			eventapi.RESOURCE_EVENT_TYPE_REMOVE_IP,
+			eventapi.RESOURCE_EVENT_TYPE_DETACH_IP,
 			deviceName,
 			deviceType,
 			deviceID,

@@ -24,7 +24,27 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
+
+// VIPMessageFactory VIP资源的消息工厂
+type VIPMessageFactory struct{}
+
+func (f *VIPMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedVIPs{}
+}
+
+func (f *VIPMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedVIP{}
+}
+
+func (f *VIPMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedVIPs{}
+}
+
+func (f *VIPMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedVIPFields{}
+}
 
 type VIP struct {
 	UpdaterBase[
@@ -32,36 +52,12 @@ type VIP struct {
 		*diffbase.VIP,
 		*metadbmodel.VIP,
 		metadbmodel.VIP,
-		*message.VIPAdd,
-		message.VIPAdd,
-		message.AddNoneAddition,
-		*message.VIPUpdate,
-		message.VIPUpdate,
-		*message.VIPFieldsUpdate,
-		message.VIPFieldsUpdate,
-		*message.VIPDelete,
-		message.VIPDelete,
-		message.DeleteNoneAddition]
+	]
 }
 
 func NewVIP(wholeCache *cache.Cache, cloudData []cloudmodel.VIP) *VIP {
 	updater := &VIP{
-		newUpdaterBase[
-			cloudmodel.VIP,
-			*diffbase.VIP,
-			*metadbmodel.VIP,
-			metadbmodel.VIP,
-			*message.VIPAdd,
-			message.VIPAdd,
-			message.AddNoneAddition,
-			*message.VIPUpdate,
-			message.VIPUpdate,
-			*message.VIPFieldsUpdate,
-			message.VIPFieldsUpdate,
-			*message.VIPDelete,
-			message.VIPDelete,
-			message.DeleteNoneAddition,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_VIP_EN,
 			wholeCache,
 			db.NewVIP().SetMetadata(wholeCache.GetMetadata()),
@@ -69,28 +65,27 @@ func NewVIP(wholeCache *cache.Cache, cloudData []cloudmodel.VIP) *VIP {
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
-	return updater
-}
+	updater.setDataGenerator(updater)
 
-func (p *VIP) getDiffBaseByCloudItem(cloudItem *cloudmodel.VIP) (diffBase *diffbase.VIP, exits bool) {
-	diffBase, exits = p.diffBaseData[cloudItem.Lcuuid]
-	return
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &VIPMessageFactory{})
+	}
+
+	return updater
 }
 
 func (p *VIP) generateDBItemToAdd(cloudItem *cloudmodel.VIP) (*metadbmodel.VIP, bool) {
 	dbItem := &metadbmodel.VIP{
 		IP:     cloudItem.IP,
 		VTapID: cloudItem.VTapID,
-		Domain: p.metadata.Domain.Lcuuid,
+		Domain: p.metadata.GetDomainLcuuid(),
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
-
 	return dbItem, true
 }
 
-func (p *VIP) generateUpdateInfo(diffBase *diffbase.VIP, cloudItem *cloudmodel.VIP) (*message.VIPFieldsUpdate, map[string]interface{}, bool) {
-	structInfo := new(message.VIPFieldsUpdate)
+func (p *VIP) generateUpdateInfo(diffBase *diffbase.VIP, cloudItem *cloudmodel.VIP) (types.UpdatedFields, map[string]interface{}, bool) {
+	structInfo := new(message.UpdatedVIPFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.IP != cloudItem.IP {
 		mapInfo["ip"] = cloudItem.IP

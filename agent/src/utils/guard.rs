@@ -14,16 +14,19 @@
  * limitations under the License.
  */
 
-use std::io::Read;
-use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::time::Instant;
 use std::{
     fs::{self, File},
+    io::Read,
+    path::Path,
     string::String,
-    sync::{Arc, Condvar, Mutex},
-    thread::{self, JoinHandle},
-    time::{Duration, UNIX_EPOCH},
+    sync::{
+        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering::Relaxed},
+        Arc, Condvar, Mutex,
+    },
+    thread::{self, sleep, JoinHandle},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use arc_swap::access::Access;
@@ -32,7 +35,10 @@ use chrono::prelude::*;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 use libc::malloc_trim;
 use log::{debug, error, info, warn};
+use num_enum::TryFromPrimitive;
+use strum_macros::Display;
 use sysinfo::{get_current_pid, Pid, ProcessExt, ProcessRefreshKind, System, SystemExt};
+use time::{format_description, OffsetDateTime};
 
 use super::process::{
     get_current_sys_memory_percentage, get_file_and_size_sum, get_memory_rss, get_thread_num,
@@ -44,8 +50,10 @@ use crate::common::{
 };
 use crate::config::handler::EnvironmentAccess;
 use crate::exception::ExceptionHandler;
+use crate::liveness::{self, ComponentId, ComponentSpec, LivenessHandle, LivenessRegistry};
 use crate::rpc::get_timestamp;
 use crate::trident::AgentState;
+use crate::utils::environment::get_disk_usage;
 #[cfg(target_os = "linux")]
 use crate::utils::environment::SocketInfo;
 use crate::utils::{cgroups::is_kernel_available_for_cgroups, environment::running_in_container};
@@ -128,8 +136,124 @@ impl SystemLoadGuard {
                 );
                 self.last_exceeded = get_timestamp(0);
                 self.exception_handler
-                    .set(Exception::SystemLoadCircuitBreaker);
+                    .set(Exception::SystemLoadCircuitBreaker, None);
             }
+        }
+    }
+}
+
+pub struct Feed {
+    timestamp: AtomicU64,
+    title: AtomicU16,
+}
+
+impl Default for Feed {
+    fn default() -> Self {
+        Self {
+            timestamp: AtomicU64::new(0),
+            title: AtomicU16::new(0),
+        }
+    }
+}
+
+impl std::fmt::Display for Feed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let datetime =
+            OffsetDateTime::from_unix_timestamp(self.timestamp().as_secs() as i64).unwrap();
+        let format =
+            format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second]").unwrap();
+
+        write!(f, "{}: {}", datetime.format(&format).unwrap(), self.title(),)
+    }
+}
+
+#[derive(Display, TryFromPrimitive)]
+#[repr(u32)]
+enum FeedTitle {
+    #[strum(serialize = "feed init ...")]
+    Init,
+    #[strum(serialize = "system_guard.refresh_process_specifics")]
+    SystemGuard,
+    #[strum(serialize = "system_load.check")]
+    SystemLoad,
+    #[strum(serialize = "get_file_and_size_sum")]
+    FileSize,
+    #[strum(serialize = "Self::release_log_files")]
+    ReleaseLog,
+    #[strum(serialize = "Self::check_cgroups")]
+    CheckCgroups,
+    #[strum(serialize = "Self::check_cpu1")]
+    CheckCpu1,
+    #[strum(serialize = "Self::check_cpu2")]
+    CheckCpu2,
+    #[strum(serialize = "malloc_trim")]
+    MallocTrim,
+    #[strum(serialize = "page_cache_reclaim_check")]
+    PageCache,
+    #[strum(serialize = "get_memory_rss")]
+    GetMemory,
+    #[strum(serialize = "get_current_sys_free_memory_percentage")]
+    SysFree,
+    #[strum(serialize = "get_thread_num")]
+    ThreadNum,
+    #[strum(serialize = "free_disk")]
+    FreeDisk,
+    #[strum(serialize = "exception")]
+    Exception,
+    #[strum(serialize = "SocketInfo::get")]
+    SocketInfo,
+    #[strum(serialize = "running.lock")]
+    RunningLock,
+    #[strum(serialize = "timer.wait_timeout")]
+    WaitTimeout,
+    #[strum(serialize = "watchdog_timeout")]
+    WatchdogTimeout,
+}
+
+impl Feed {
+    fn timestamp(&self) -> Duration {
+        let timestamp = self.timestamp.load(Relaxed);
+        Duration::from_secs(timestamp)
+    }
+
+    fn title(&self) -> String {
+        let title = self.title.load(Relaxed);
+
+        FeedTitle::try_from(title as u32).unwrap().to_string()
+    }
+
+    fn add(&self, title: FeedTitle) {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        self.timestamp.store(timestamp, Relaxed);
+        self.title.store(title as u16, Relaxed);
+    }
+
+    fn timeout(&self, t: Duration) -> (bool, Duration) {
+        if self.timestamp() == Duration::ZERO {
+            return (false, Duration::ZERO);
+        }
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let last = self.timestamp();
+        if now < last {
+            if self.title() == FeedTitle::WatchdogTimeout.to_string() {
+                error!("Watchdog thread timeout, but feed timestamp goes backwards twice, which is unexpected. This may be caused by the ntp or system clock going backwards. Restart deepflow-agent to avoid potential issues.");
+                crate::utils::clean_and_exit(-1);
+            } else {
+                warn!("Feed timestamp goes backwards first, which is unexpected. This may be caused by ntp or the system clock going backwards. ");
+                self.add(FeedTitle::WatchdogTimeout);
+            }
+            return (false, Duration::ZERO);
+        }
+
+        let interval = now - last;
+        if interval >= t {
+            (true, interval)
+        } else {
+            (false, Duration::ZERO)
         }
     }
 }
@@ -139,17 +263,26 @@ pub struct Guard {
     state: Arc<AgentState>,
     log_dir: String,
     thread: Mutex<Option<JoinHandle<()>>>,
+    thread_watchdog: Mutex<Option<JoinHandle<()>>>,
     running: Arc<(Mutex<bool>, Condvar)>,
+    running_watchdog: Arc<AtomicBool>,
     exception_handler: ExceptionHandler,
     cgroup_mount_path: String,
     is_cgroup_v2: bool,
-    memory_trim_disabled: bool,
     system: Arc<Mutex<System>>,
     pid: Pid,
     cgroups_disabled: bool,
+    liveness: LivenessHandle,
 }
 
 impl Guard {
+    fn liveness_timeout_ms(guard_interval: Duration) -> u64 {
+        guard_interval
+            .as_millis()
+            .saturating_mul(2)
+            .min(u64::MAX as u128) as u64
+    }
+
     pub fn new(
         config: EnvironmentAccess,
         state: Arc<AgentState>,
@@ -157,25 +290,36 @@ impl Guard {
         exception_handler: ExceptionHandler,
         cgroup_mount_path: String,
         is_cgroup_v2: bool,
-        memory_trim_enabled: bool,
         cgroups_disabled: bool,
+        liveness_registry: Option<LivenessRegistry>,
     ) -> Result<Self, &'static str> {
         let Ok(pid) = get_current_pid() else {
             return Err("get the process' pid failed: {}, deepflow-agent restart...");
         };
+        let liveness = liveness::register(
+            liveness_registry.as_ref(),
+            ComponentSpec {
+                id: ComponentId::new("guard", 0),
+                display_name: "guard".into(),
+                timeout_ms: Self::liveness_timeout_ms(config.load().guard_interval),
+                ..Default::default()
+            },
+        );
         Ok(Self {
             config,
             state,
             log_dir,
             thread: Mutex::new(None),
+            thread_watchdog: Mutex::new(None),
             running: Arc::new((Mutex::new(false), Condvar::new())),
+            running_watchdog: Arc::new(AtomicBool::new(false)),
             exception_handler,
             cgroup_mount_path,
             is_cgroup_v2,
-            memory_trim_disabled: !memory_trim_enabled,
             system: Arc::new(Mutex::new(System::new())),
             pid,
             cgroups_disabled,
+            liveness,
         })
     }
 
@@ -297,7 +441,7 @@ impl Guard {
         if sys_memory_limit != 0.0 {
             if current_memory_percentage < sys_memory_limit * 0.7 {
                 *last_exceeded = get_timestamp(0);
-                exception_handler.set(Exception::FreeMemExceeded);
+                exception_handler.set(Exception::FreeMemExceeded, None);
                 *under_sys_memory_limit = true;
                 error!(
                     "current system {:?} memory percentage is less than the 70% of sys_memory_limit, current system memory percentage={}%, sys_memory_limit={}%, deepflow-agent restart...",
@@ -306,7 +450,7 @@ impl Guard {
                 crate::utils::clean_and_exit(-1);
             } else if current_memory_percentage < sys_memory_limit {
                 *last_exceeded = get_timestamp(0);
-                exception_handler.set(Exception::FreeMemExceeded);
+                exception_handler.set(Exception::FreeMemExceeded, None);
                 *under_sys_memory_limit = true;
                 error!(
                     "current system {:?} memory percentage is less than sys_memory_limit, current system memory percentage={}%, sys_memory_limit={}%, set the agent to disabled",
@@ -326,6 +470,70 @@ impl Guard {
         } else {
             exception_handler.clear(Exception::FreeMemExceeded);
         }
+    }
+
+    fn check_free_disk(
+        percentage_trigger_threshold: u8,
+        absolute_trigger_threshold: u64,
+        directories: &Vec<String>,
+        exception_handler: &ExceptionHandler,
+    ) {
+        if percentage_trigger_threshold == 0 && absolute_trigger_threshold == 0 {
+            exception_handler.clear(Exception::FreeDiskCircuitBreaker);
+            return;
+        }
+
+        for directory in directories {
+            match get_disk_usage(&directory) {
+                Ok((total, free)) => {
+                    let free_percentage = free as f64 * 100.0 / total as f64;
+                    if free_percentage < percentage_trigger_threshold as f64
+                        || free < absolute_trigger_threshold
+                    {
+                        exception_handler.set(Exception::FreeDiskCircuitBreaker, None);
+                        return;
+                    }
+
+                    if free_percentage > percentage_trigger_threshold as f64 * 1.1
+                        && free as f64 > absolute_trigger_threshold as f64 * 1.1
+                    {
+                        exception_handler.clear(Exception::FreeDiskCircuitBreaker);
+                    }
+                }
+                Err(e) => {
+                    warn!("{}", e);
+                }
+            }
+        }
+    }
+
+    // CAUTION: keep this thread small and simple, DO NOT use any lock!
+    pub fn start_watchdog(&self, feed: Arc<Feed>) {
+        let config = self.config.clone();
+        let running = self.running_watchdog.clone();
+        let thread = thread::Builder::new()
+            .name("watchdog".to_owned())
+            .spawn(move || {
+                loop {
+                    if !running.swap(true, Relaxed) {
+                        break;
+                    }
+                    let guard_interval = config.load().guard_interval.as_secs();
+                    let (timeout, interval) = feed.timeout(Duration::from_secs(guard_interval << 1));
+                    if timeout {
+                        error!("The guard thread (circuit breakers) feeds the watchdog thread every {} seconds. Unfortunately, it has now been discovered that the feed has not been updated for over {} seconds. The location of the last feed is: {}, restart deepflow-agent ...", guard_interval, interval.as_secs(), feed);
+                        sleep(Duration::from_secs(1));
+                        std::process::exit(-1);
+                    }
+
+                    sleep(Duration::from_secs(1));
+                }
+                info!("guard watchdog exited");
+            })
+            .unwrap();
+
+        self.thread_watchdog.lock().unwrap().replace(thread);
+        info!("guard watchdog started");
     }
 
     pub fn start(&self) {
@@ -348,8 +556,6 @@ impl Guard {
         let mut under_sys_free_memory_limit = false; // Below the limit, it does not meet expectations
         let cgroup_mount_path = self.cgroup_mount_path.clone();
         let is_cgroup_v2 = self.is_cgroup_v2;
-        #[cfg(all(target_os = "linux", target_env = "gnu"))]
-        let memory_trim_disabled = self.memory_trim_disabled;
         let mut check_cgroup_result = true; // It is used to determine whether subsequent checks are required. If the first check fails, the check is stopped
         let system = self.system.clone();
         let pid: Pid = self.pid.clone();
@@ -359,21 +565,43 @@ impl Guard {
         let mut last_exceeded = get_timestamp(0);
         #[cfg(target_os = "linux")]
         let mut last_page_reclaim = Instant::now();
+        let feed = Arc::new(Feed::default());
+        let mut current_timeout_ms = Self::liveness_timeout_ms(config.load().guard_interval);
+
+        self.running_watchdog.store(true, Relaxed);
+        self.start_watchdog(feed.clone());
+        let liveness = self.liveness.clone();
 
         let thread = thread::Builder::new().name("guard".to_owned()).spawn(move || {
             let mut system_load = SystemLoadGuard::new(system.clone(), exception_handler.clone());
             #[cfg(target_os = "linux")]
             let mut last_over_max_sockets_limit = None;
+            let feed = feed.clone();
+
+            feed.add(FeedTitle::Init);
+            liveness.heartbeat();
+
             loop {
                 let config = config.load();
+                let timeout_ms = Self::liveness_timeout_ms(config.guard_interval);
+                if timeout_ms != current_timeout_ms {
+                    liveness.set_timeout_ms(timeout_ms);
+                    current_timeout_ms = timeout_ms;
+                }
                 let capture_mode = config.capture_mode;
                 let cpu_limit = config.max_millicpus;
                 let mut system_guard = system.lock().unwrap();
+                feed.add(FeedTitle::SystemGuard);
+                liveness.heartbeat();
                 if !system_guard.refresh_process_specifics(pid, ProcessRefreshKind::new().with_cpu()) {
                     warn!("refresh process with cpu failed");
                 }
                 drop(system_guard);
+                feed.add(FeedTitle::SystemLoad);
+                liveness.heartbeat();
                 system_load.check(config.system_load_circuit_breaker_threshold, config.system_load_circuit_breaker_recover, config.system_load_circuit_breaker_metric);
+                feed.add(FeedTitle::FileSize);
+                liveness.heartbeat();
                 match get_file_and_size_sum(&log_dir) {
                     Ok(file_and_size_sum) => {
                         let file_sizes_sum = file_and_size_sum.file_sizes_sum; // Total size of current log files (unit: B)
@@ -385,8 +613,10 @@ impl Guard {
                         if file_sizes_sum > config.log_file_size {
                             error!("log files' size is over log_file_size_limit, current: {}B, log_file_size_limit: {}B",
                                file_sizes_sum, config.log_file_size);
+                            feed.add(FeedTitle::ReleaseLog);
+                            liveness.heartbeat();
                             Self::release_log_files(file_and_size_sum, config.log_file_size);
-                            exception_handler.set(Exception::LogFileExceeded);
+                            exception_handler.set(Exception::LogFileExceeded, None);
                         } else {
                             // exception_handler.clear(Exception::LogFileExceeded);
                         }
@@ -399,12 +629,16 @@ impl Guard {
                 if !in_container && config.capture_mode != PacketCaptureType::Analyzer {
                     if cgroups_available && !cgroups_disabled {
                         if check_cgroup_result {
+                            feed.add(FeedTitle::CheckCgroups);
+                            liveness.heartbeat();
                             check_cgroup_result = Self::check_cgroups(cgroup_mount_path.clone(), is_cgroup_v2);
                             if !check_cgroup_result {
                                 warn!("check cgroups failed, limit cpu or memory without cgroups");
                             }
                         }
                         if !check_cgroup_result {
+                            feed.add(FeedTitle::CheckCpu1);
+                            liveness.heartbeat();
                             if !Self::check_cpu(system.clone(), pid.clone(), cpu_limit) {
                                 if over_cpu_limit {
                                     error!("cpu usage over cpu limit twice, deepflow-agent restart...");
@@ -419,6 +653,8 @@ impl Guard {
                             }
                         }
                     } else {
+                        feed.add(FeedTitle::CheckCpu2);
+                        liveness.heartbeat();
                         if !Self::check_cpu(system.clone(), pid.clone(), cpu_limit) {
                             if over_cpu_limit {
                                 error!("cpu usage over cpu limit twice, deepflow-agent restart...");
@@ -435,13 +671,17 @@ impl Guard {
                 }
 
                 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-                if !memory_trim_disabled {
+                if config.idle_memory_trimming {
+                    feed.add(FeedTitle::MallocTrim);
+                    liveness.heartbeat();
                     unsafe { let _ = malloc_trim(0); }
                 }
 
                 #[cfg(target_os = "linux")]
                 if last_page_reclaim.elapsed() >= Duration::from_secs(60) {
                     last_page_reclaim = Instant::now();
+                    feed.add(FeedTitle::PageCache);
+                    liveness.heartbeat();
                     let _ = crate::utils::cgroups::page_cache_reclaim_check(config.page_cache_reclaim_percentage);
                 }
 
@@ -453,6 +693,8 @@ impl Guard {
                 if capture_mode != PacketCaptureType::Analyzer {
                     let memory_limit = config.max_memory;
                     if memory_limit != 0 {
+                        feed.add(FeedTitle::GetMemory);
+                        liveness.heartbeat();
                         match get_memory_rss() {
                             Ok(memory_usage) => {
                                 if memory_usage >= memory_limit {
@@ -479,8 +721,12 @@ impl Guard {
                     }
                 }
 
+                feed.add(FeedTitle::SysFree);
+                liveness.heartbeat();
                 Self::check_sys_memory(config.sys_memory_limit as f64, config.sys_memory_metric, &mut under_sys_free_memory_limit, &mut last_exceeded, &exception_handler);
 
+                feed.add(FeedTitle::ThreadNum);
+                liveness.heartbeat();
                 match get_thread_num() {
                     Ok(thread_num) => {
                         let thread_limit = config.thread_threshold;
@@ -494,7 +740,7 @@ impl Guard {
                                 crate::utils::clean_and_exit(NORMAL_EXIT_WITH_RESTART);
                                 break;
                             }
-                            exception_handler.set(Exception::ThreadThresholdExceeded);
+                            exception_handler.set(Exception::ThreadThresholdExceeded, None);
                         } else {
                             exception_handler.clear(Exception::ThreadThresholdExceeded);
                         }
@@ -504,16 +750,42 @@ impl Guard {
                     }
                 }
 
+                if !in_container {
+                    feed.add(FeedTitle::FreeDisk);
+                    liveness.heartbeat();
+                    Self::check_free_disk(config.free_disk_circuit_breaker_percentage_threshold, config.free_disk_circuit_breaker_absolute_threshold,
+                    &config.free_disk_circuit_breaker_directories, &exception_handler);
+                }
+
+                feed.add(FeedTitle::Exception);
+                liveness.heartbeat();
                 if exception_handler.has(Exception::SystemLoadCircuitBreaker) {
-                    info!("Set the state to melt_down when the system load exceeds the threshold.");
+                    warn!("Set the state to melt_down when the system load exceeds the threshold.");
                     state.melt_down();
                 } else if exception_handler.has(Exception::FreeMemExceeded) {
-                    info!("Set the state to melt_down when the free memory exceeds the threshold.");
+                    warn!("Set the state to melt_down when the free memory exceeds the threshold.");
+                    state.melt_down();
+                } else if exception_handler.has(Exception::FreeDiskCircuitBreaker) {
+                    warn!("Set the state to melt_down when the free disk exceeds the threshold.");
+                    state.melt_down();
+                } else if is_kernel_meltdown() && exception_handler.has(Exception::KernelVersionCircuitBreaker) {
+                    warn!("Set the state to melt_down when the kernel version circuit breaker.");
                     state.melt_down();
                 } else {
+                    #[cfg(feature = "enterprise")]
+                    if exception_handler.has(Exception::KernelVersionCircuitBreaker) {
+                        // ebpf_meltdown and ebpf_uprobe_meltdown cannot block the main thread.
+                        if is_kernel_ebpf_meltdown() {
+                            warn!("Set the state to ebpf_melt_down when the kernel version circuit breaker.");
+                        } else if is_kernel_ebpf_uprobe_meltdown() {
+                            warn!("Set the state to ebpf_uprobe_melt_down when the kernel version circuit breaker.");
+                        }
+                    }
                     state.recover();
                 }
 
+                feed.add(FeedTitle::SocketInfo);
+                liveness.heartbeat();
                 #[cfg(target_os = "linux")]
                 match SocketInfo::get() {
                     Ok(SocketInfo { tcp, tcp6, udp, udp6 }) => {
@@ -547,16 +819,21 @@ impl Guard {
                     }
                 }
 
+                feed.add(FeedTitle::RunningLock);
+                liveness.heartbeat();
                 let (running, notifier) = &*running_state;
                 let mut rg = running.lock().unwrap();
                 if !*rg {
                     break;
                 }
+                feed.add(FeedTitle::WaitTimeout);
+                liveness.heartbeat();
                 rg = notifier.wait_timeout(rg, config.guard_interval).unwrap().0;
                 if !*rg {
                     break;
                 }
             }
+            liveness.pause();
             info!("guard exited");
         }).unwrap();
 
@@ -577,6 +854,40 @@ impl Guard {
 
         if let Some(thread) = self.thread.lock().unwrap().take() {
             let _ = thread.join();
+        }
+
+        self.running_watchdog.store(false, Relaxed);
+
+        if let Some(thread) = self.thread_watchdog.lock().unwrap().take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+cfg_if::cfg_if! {
+    if #[cfg(feature = "enterprise")] {
+        pub fn is_kernel_meltdown() -> bool {
+            enterprise_utils::kernel_version::is_kernel_meltdown()
+        }
+
+        pub fn is_kernel_ebpf_meltdown() -> bool {
+            enterprise_utils::kernel_version::is_kernel_ebpf_meltdown()
+        }
+
+        pub fn is_kernel_ebpf_uprobe_meltdown() -> bool {
+            enterprise_utils::kernel_version::is_kernel_ebpf_uprobe_meltdown()
+        }
+    } else {
+        pub fn is_kernel_meltdown() -> bool {
+            false
+        }
+
+        pub fn is_kernel_ebpf_meltdown() -> bool {
+            false
+        }
+
+        pub fn is_kernel_ebpf_uprobe_meltdown() -> bool {
+            false
         }
     }
 }

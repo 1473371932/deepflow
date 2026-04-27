@@ -27,12 +27,12 @@ import (
 
 type ChPodIngress struct {
 	SubscriberComponent[
-		*message.PodIngressAdd,
-		message.PodIngressAdd,
-		*message.PodIngressFieldsUpdate,
-		message.PodIngressFieldsUpdate,
-		*message.PodIngressDelete,
-		message.PodIngressDelete,
+		*message.AddedPodIngresses,
+		message.AddedPodIngresses,
+		*message.UpdatedPodIngress,
+		message.UpdatedPodIngress,
+		*message.DeletedPodIngresses,
+		message.DeletedPodIngresses,
 		metadbmodel.PodIngress,
 		metadbmodel.ChPodIngress,
 		IDKey,
@@ -42,12 +42,12 @@ type ChPodIngress struct {
 func NewChPodIngress() *ChPodIngress {
 	mng := &ChPodIngress{
 		newSubscriberComponent[
-			*message.PodIngressAdd,
-			message.PodIngressAdd,
-			*message.PodIngressFieldsUpdate,
-			message.PodIngressFieldsUpdate,
-			*message.PodIngressDelete,
-			message.PodIngressDelete,
+			*message.AddedPodIngresses,
+			message.AddedPodIngresses,
+			*message.UpdatedPodIngress,
+			message.UpdatedPodIngress,
+			*message.DeletedPodIngresses,
+			message.DeletedPodIngresses,
 			metadbmodel.PodIngress,
 			metadbmodel.ChPodIngress,
 			IDKey,
@@ -56,6 +56,7 @@ func NewChPodIngress() *ChPodIngress {
 		),
 	}
 	mng.subscriberDG = mng
+	mng.softDelete = true
 	return mng
 }
 
@@ -72,20 +73,15 @@ func (c *ChPodIngress) sourceToTarget(md *message.Metadata, source *metadbmodel.
 		Name:         sourceName,
 		PodClusterID: source.PodClusterID,
 		PodNsID:      source.PodNamespaceID,
-		TeamID:       md.TeamID,
-		DomainID:     md.DomainID,
-		SubDomainID:  md.SubDomainID,
+		TeamID:       md.GetTeamID(),
+		DomainID:     md.GetDomainID(),
+		SubDomainID:  md.GetSubDomainID(),
 	})
 	return
 }
 
 // onResourceUpdated implements SubscriberDataGenerator
-func (c *ChPodIngress) onResourceUpdated(sourceID int, fieldsUpdate *message.PodIngressFieldsUpdate, db *metadb.DB) {
-	updateInfo := make(map[string]interface{})
-	if fieldsUpdate.Name.IsDifferent() {
-		updateInfo["name"] = fieldsUpdate.Name.GetNew()
-	}
-	c.updateOrSync(db, IDKey{ID: sourceID}, updateInfo)
+func (c *ChPodIngress) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedPodIngress) {
 }
 
 // softDeletedTargetsUpdated implements SubscriberDataGenerator
